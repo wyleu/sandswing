@@ -8,10 +8,21 @@
     "location": "workshop"
   },
   "startup": {
-    "program": "pico_circuitp_8bell_scan_rs_long_midi_latch.py"
+    "program": "sandswing.py"
+  },
+  "pins": {
+    "sense": [0, 1, 2, 3],
+    "laser_pwm": [7, 8, 9, 10],
+    "neopixel": 16,
+    "adc_laser": [26, 27],
+    "adc_pt": 28,
+    "fitted": [0, 1]
+  },
+  "detection": {
+    "num_bells": 4
   },
   "output": {
-    "enabled_formats": [ "midi", "log"],
+    "enabled_formats": [ "midi", "log", "neopixel"],
     "abell": {
       "enabled": true,
       "com_port": false,
@@ -19,7 +30,13 @@
       "tx_pin": 0,
       "baud": 9600
     },
-    "midi": {
+   "neopixel": {
+      "pin": 16,
+      "brightness": 0.4,
+      "pixel_order": "GRB",
+      "status_color": [0, 80, 0]
+    }, 
+   "midi": {
       "enabled": true,
       "channel": 0,
       "note_base": 60,
