@@ -1,0 +1,39 @@
+{
+  "wifi": {
+    "ssid": "YOUR_SSID_HERE"
+  },
+  "output": {
+    "enabled_formats": ["console", "midi", "log"],
+    "midi": {
+      "enabled": true,
+      "channel": 0,
+      "note_base": 60,
+      "velocity": 100
+    },
+    "log": {
+      "enabled": true,
+      "filename_prefix": "bell_log_"
+    }
+  },
+  "startup": {
+    "program": "pico_circuitp_8bell_scan_rs_long_midi_latch.py"
+  },
+  "pins": {
+    "input_base": 14,
+    "output_base": 0,
+    "ir_led": 13,
+    "tx_led": 12,
+    "status_led": 22
+  },
+  "ir": {
+    "carrier_freq": 38000,
+    "duty_33": 21845
+  },
+  "detection": {
+    "mode": "latch_detect_with_middle",
+    "latch_timeout_ms": 100,
+    "min_middle_ms": 10,
+    "max_middle_ms": 80,
+    "scan_interval_ms": 10
+  }
+}

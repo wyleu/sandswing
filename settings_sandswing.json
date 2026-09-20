@@ -1,0 +1,100 @@
+{
+  "wifi": {
+    "ssid": "NOWRH81L",
+    "password": "w3JzkYiA9UNv"
+  },
+  "device": {
+    "name": "sandswing-bench",
+    "family": "sandswing",
+    "usb_manufacturer": "SandFarm",
+    "usb_product": "SandFarm sandswing-bench",
+    "usb_hid_keyboard": false,
+    "usb_drive": true,
+    "location": "clockroom",
+    "role": "swing_8x1_wip"
+   },
+  "startup": {
+    "program": "pico_circuitp_bell_scan_rs_long_midi_latch_neo.py"
+  },
+  "escapement": {
+    "pll_enabled": false,
+    "ticks_per_minute": 48,
+    "adc_alpha": 0.002,
+    "hysteresis": 2500,
+    "adc_read_interval": 0.015,
+    "report_interval": 60.0,
+    "summary_interval": 900.0,
+    "tick_adc_channel": 0,
+    "laser_on_level": 80,
+    "laser_flash_interval": 0.625
+  },
+  "hardware": {
+    "num_heads": 8,
+    "tick_head": 0,
+    "tick_adc_channel": 0,
+    "laser_via": "pwm_gpio",
+    "notes": "Dual optical sources + current sense – profile TBD"
+  },
+  "pins": {
+    "input_base": 5,
+    "output_base": 0,
+    "ir_led": 13,
+    "tx_led": 12,
+    "status_led": 22,
+    "neopixel": 15
+  },
+  "ir": {
+    "carrier_freq": 38000,
+    "duty_33": 21845
+  },
+  "detection": {
+    "num_bells": 4,
+    "mode": "latch_detect_with_middle",
+    "latch_timeout_ms": 100,
+    "min_middle_ms": 10,
+    "max_middle_ms": 80,
+    "scan_interval_ms": 10
+  },
+  "output": {
+    "enabled_formats": ["console", "midi", "log", "neopixel"],
+    "console": {
+      "enabled": true
+    },
+    "abell": {
+      "enabled": true,
+      "com_port": false,
+      "uart_id": 0,
+      "tx_pin": 0,
+      "baud": 9600
+    },
+    "midi": {
+      "enabled": true,
+      "channel": 0,
+      "note_base": 60,
+      "velocity": 100,
+      "note_duration_ms": 500
+    },
+    "log": {
+      "enabled": true,
+      "filename_prefix": "sandswing_",
+      "timestamp_format": "%Y%m%d_%H%M%S"
+    },
+    "test": {
+      "enabled": false,
+      "mode": "midi",
+      "interval_ms": 5000,
+      "midi": {
+        "note": 60,
+        "velocity": 100,
+        "duration_ms": 200
+      }
+    },
+    "neopixel": {
+      "enabled": true,
+      "brightness": 0.25,
+      "status_color": [0, 32, 0],
+      "bell_color": [64, 0, 0],
+      "pixel_order": "GRB"
+    }
+  }
+}

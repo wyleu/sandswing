@@ -1,0 +1,30 @@
+# CircuitPython / MicroPython
+settings.json          # contains WiFi SSID, possibly other secrets
+settings_sandsense.json
+settings_sandswing.json
+*.pyc
+__pycache__/
+.DS_Store
+*.log
+bell_log_*.txt         # runtime log files
+.code-workspace
+.vscode/
+.idea/
+
+# Optional – if you ever generate them
+*.mpy
+.Trash-1000/
+.fseventsd/
+.metadata_never_index
+boot_out.txt
+bell_log_*.txt
+sandswing_basic.txt
+sandswing_basic_quiet.txt
+sandswing_lineup.txt
+sandswing_live.txt
+sandswing_session.txt
+sandswing_threshold.txt
+session_lineup.txt
+_SANDSWING.py
+settings.toml
+sd/
