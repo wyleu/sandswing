@@ -1,4 +1,5 @@
 # CircuitPython / MicroPython
+src/settings.json
 settings.json          # contains WiFi SSID, possibly other secrets
 settings_sandsense.json
 settings_sandswing.json
@@ -28,3 +29,5 @@ session_lineup.txt
 _SANDSWING.py
 settings.toml
 sd/
+archive/
+firmware/
