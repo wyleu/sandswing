@@ -72,9 +72,13 @@ import math
 import board
 import wifi
 import farm_log
+
 from config_loader import load_config
 from farm_ws import connect_wifi, start_server, poll, send
-from pins_from_settings import load_pinmap, claim_lineup_hardware
+from pins_from_settings import load_pinmap
+
+from sand_status import from_sandswing
+from bell import Farm
 
 COLOR_A = (0, 64, 0)
 COLOR_B = (64, 0, 0)
@@ -84,12 +88,15 @@ cfg = load_config()
 cfg.banner()
 
 pinmap = load_pinmap(cfg)
-SENSE_GPS = pinmap["sense_gp"]
-LASER_GPS = pinmap["laser_gp"]
+
+farm = Farm.from_pinmap(pinmap)
+
+SENSE_GPS = pinmap.get("sense_gp") or pinmap.get("sense")
+LASER_GPS = pinmap.get("laser_gp") or pinmap.get("laser_pwm")
+
 FITTED = set(pinmap["fitted"])
 NUM = min(len(SENSE_GPS), len(LASER_GPS), cfg.get_int("detection.num_bells", 4))
 
-inputs, laser_pwms, adc_laser, adc_pt = claim_lineup_hardware(pinmap)
 
 SWEEP_STEPS = cfg.get_int("sensing.test.sweep_steps", 20)
 SETTLE_S = cfg.get_float("sensing.test.settle_s", 0.1)
@@ -100,39 +107,12 @@ BLOW_S = cfg.get_float("streams.bell.blow_s", 0.32)
 GAP_S = cfg.get_float("streams.bell.gap_s", 0.32)
 PERIOD = ROUNDS_N * BLOW_S + GAP_S
 neo_phase = [False] * NUM
-
-
-def laser_duty(ch, duty):
-    duty = max(0, min(65535, int(duty)))
-    for o in range(NUM):
-        laser_pwms[o].duty_cycle = duty if o == ch else 0
-
-
-def lasers_all_off():
-    for p in laser_pwms:
-        p.duty_cycle = 0
-
-
-def read_laser_current(ch):
-    if not adc_laser or ch >= len(adc_laser):
-        return None
-    try:
-        return adc_laser[ch].value
-    except Exception:
-        return None
-
-
-def read_pt_v():
-    if adc_pt is None:
-        return None
-    try:
-        return adc_pt.value
-    except Exception:
-        return None
-
-
-def read_pt(ch):
-    return not inputs[ch].value
+_last_line = ""
+_ch = 0
+_duty = 0
+_pt = None
+_changes = 0
+_pass = None
 
 
 neo = None
@@ -185,32 +165,59 @@ def neo_toggle_channel(ch):
     neo.show()
 
 
-def emit(msg):
-    print(msg)
-    farm_log.write(msg)
-
-
 farm_log.start(cfg)
 print("Optical lineup", "ch", NUM, "steps", SWEEP_STEPS, "fitted", sorted(FITTED))
 
 
+def emit(msg):
+    global _last_line
+    _last_line = str(msg)
+    print(msg)
+    farm_log.write(msg)
+
 def status_payload():
     ip = None
+    ssid = None
     try:
         ip = str(wifi.radio.ipv4_address)
     except Exception:
         pass
-    return {
+    try:
+        if wifi.radio.ap_info:
+            ssid = wifi.radio.ap_info.ssid
+    except Exception:
+        pass
+    phase = False
+    if _ch is not None and 0 <= _ch < len(neo_phase):
+        phase = neo_phase[_ch]
+    try:
+        ts = int(time.time())
+    except Exception:
+        ts = 0
+    return from_sandswing({
+        "id": cfg.device_name,
         "name": cfg.device_name,
-        "family": cfg.family,
-        "role": getattr(cfg, "role", None),
+        "family": getattr(cfg, "family", "sandswing"),
+        "role": getattr(cfg, "role", "swing"),
+        "location": getattr(cfg, "location", ""),
         "ip": ip,
+        "ssid": ssid,
         "mode": "rounds_jabber" if JABBER else "lineup",
-        "jabber": JABBER,
-        "num": NUM,
+        "channel": None if _ch is None else _ch + 1,
+        "laser_gp": LASER_GPS[_ch] if _ch is not None else None,
+        "sense_gp": SENSE_GPS[_ch] if _ch is not None else None,
+        "duty": _duty,
+        "duty_pct": int(100.0 * _duty / 65535.0) if _duty is not None else None,
+        "pt": _pt,
+        "changes": _changes,
+        "pass_totals": _pass,
         "fitted": sorted(FITTED),
-        "ws": True,
-    }
+        "neo_on": bool(neo),
+        "neo_phase": phase,
+        "last_line": _last_line,
+        "ts": ts,
+        "poll_hint_sec": 2,
+    })
 
 
 def emit_tape(bell, u, amp=1.0, quiet=False):
@@ -260,7 +267,8 @@ async def ws_poll_task():
         await asyncio.sleep(0.05)
 
 
-async def test_channel(ch):
+async def test_channel(bell):
+    ch = bell.index
     emit(
         "--- ch %d laser GP%d PT GP%d %s---"
         % (
@@ -270,26 +278,32 @@ async def test_channel(ch):
             "" if ch in FITTED else "(no head) ",
         )
     )
+    global _ch, _duty, _pt, _changes
+    _ch = ch
+    
     neo_select(ch)
-    last = read_pt(ch)
+    last = bell.pt()
     changes = 0
     curve = []
     for step in range(SWEEP_STEPS + 1):
         duty = int(65535 * step / SWEEP_STEPS)
         for _ in range(REPEATS):
-            laser_duty(ch, duty)
+            bell.laser(duty)
             await asyncio.sleep(SETTLE_S)
-            raw = read_pt(ch)
-            i_sense = read_laser_current(ch)
-            pt_v = read_pt_v()
+            raw = bell.pt()
+            _duty = duty
+            _pt = raw
+            _changes = changes
+            
+
+            i_sense = bell.analog()
             emit(
-                "ch %d duty=%5d (%3.0f%%) PT=%s PT_v=%s I=%s"
+                "ch %d duty=%5d (%3.0f%%) PT=%s I=%s"
                 % (
                     ch + 1,
                     duty,
                     100.0 * duty / 65535.0,
                     raw,
-                    pt_v if pt_v is not None else "n/a",
                     i_sense if i_sense is not None else "n/a",
                 )
             )
@@ -299,7 +313,7 @@ async def test_channel(ch):
                 neo_toggle_channel(ch)
                 emit("ch %d THRESHOLD duty=%d PT→%s" % (ch + 1, duty, raw))
             curve.append((duty, 1 if raw else 0))
-    lasers_all_off()
+    bell.laser_off()
     active = [d for d, s in curve if s]
     if active:
         emit("ch %d first_PT_True~%d changes=%d" % (ch + 1, active[0], changes))
@@ -309,12 +323,14 @@ async def test_channel(ch):
 
 
 async def lineup_loop():
-    lasers_all_off()
+    global _pass
+    farm.all_lasers_off()
     emit("LINEUP START %s %s" % (cfg.family, cfg.device_name))
     while True:
         totals = []
-        for ch in range(NUM):
-            totals.append(await test_channel(ch))
+        for bell in farm.fitted():
+            totals.append(await test_channel(bell))
+        _pass = totals
         emit("PASS %s" % (totals,))
 
 
@@ -331,7 +347,7 @@ try:
 except KeyboardInterrupt:
     print("Stopped")
 finally:
-    lasers_all_off()
+    farm.deinit()
     if neo:
         for i in range(len(neo)):
             neo[i] = (0, 0, 0)

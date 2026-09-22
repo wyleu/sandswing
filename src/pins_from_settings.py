@@ -135,14 +135,18 @@ def load_pinmap(cfg):
     adc_laser = list(raw.get("adc_laser") or [26, 27])
     adc_pt = raw.get("adc_pt", 28)
 
+    mux = raw.get("adc_mux") or {}
     return {
         "sense_gp": [int(x) for x in sense],
         "laser_gp": [int(x) for x in laser],
+        "sense": [int(x) for x in sense],
+        "laser_pwm": [int(x) for x in laser],
         "fitted": [int(x) for x in fitted],
         "neopixel_gp": neo,
         "adc_laser_gp": [int(x) for x in adc_laser],
         "adc_pt_gp": None if adc_pt is None else int(adc_pt),
-    }
+        "adc_mux": mux,
+}
 
 
 def claim_lineup_hardware(pinmap, existing_leds=None):
