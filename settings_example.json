@@ -1,28 +1,40 @@
 {
   "wifi": {
     "ssid": "NOWRH81L",
-    "password": "***********"
+    "password": "*******"
   },
-  "device": {
-    "name": "sandbells-pico",
-    "location": "workshop"
+"device": {
+  "name": "sandswing-pico",
+  "family": "sandswing",
+  "role": "swing",
+  "location": "workshop"
   },
   "startup": {
     "program": "sandswing.py"
   },
   "pins": {
     "sense": [0, 1, 2, 3],
-    "laser_pwm": [7, 8, 9, 10],
+    "laser_pwm": [8, 9, 10, 11],
     "neopixel": 16,
-    "adc_laser": [26, 27],
-    "adc_pt": 28,
+    "adc_mux": {
+    "common": 26,
+    "a": 17, "b": 18, "c": 19,
+    "inh": null,
+    "laser_y": [0, 1, 2, 3, 4, 5, 6, 7]
+    },
     "fitted": [0, 1]
   },
   "detection": {
     "num_bells": 4
   },
+  "wheel": {
+    "rest": "dark",
+    "pattern": [2, 1, 4],
+    "stand_hand": "after_four",
+    "stand_back": "after_two"
+  },
   "output": {
-    "enabled_formats": [ "midi", "log", "neopixel"],
+    "enabled_formats": [ "midi", "log", "neopixel","ws"],
     "abell": {
       "enabled": true,
       "com_port": false,
@@ -48,6 +60,7 @@
       "filename_prefix": "bell_log_",
       "timestamp_format": "%Y%m%d_%H%M%S"
     },
+    "output.ws": { "enabled": true },
     "test": {
       "enabled": false,
       "mode": "midi",
