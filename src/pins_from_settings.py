@@ -126,7 +126,7 @@ def load_pinmap(cfg):
         raw = data.get("pins", {}) if isinstance(data, dict) else {}
 
     sense = list(raw.get("sense") or [0, 1, 2, 3])
-    laser = list(raw.get("laser_pwm") or raw.get("drive") or [7, 8, 9, 10])
+    laser = list(raw.get("laser_pwm") or raw.get("drive") or [8, 9, 10, 11])
     if len(sense) != len(laser):
         raise ValueError("pins.sense and pins.laser_pwm must be the same length")
 
@@ -169,24 +169,26 @@ def claim_lineup_hardware(pinmap, existing_leds=None):
         pin.pull = digitalio.Pull.UP
         inputs.append(pin)
 
+
     lasers = []
     for gp in pinmap["laser_gp"]:
         lasers.append(pwmio.PWMOut(_gp(gp), frequency=1000, duty_cycle=0))
 
     adc_laser = []
-    for gp in pinmap["adc_laser_gp"]:
-        try:
-            adc_laser.append(analogio.AnalogIn(_gp(gp)))
-        except Exception as e:
-            print("ADC laser GP%d skip:" % gp, e)
-
     adc_pt = None
-    if pinmap["adc_pt_gp"] is not None:
-        try:
-            adc_pt = analogio.AnalogIn(_gp(pinmap["adc_pt_gp"]))
-        except Exception as e:
-            print("ADC PT skip:", e)
+    if not pinmap.get("adc_mux"):
+        for gp in pinmap["adc_laser_gp"]:
+            try:
+                adc_laser.append(analogio.AnalogIn(_gp(gp)))
+            except Exception as e:
+                print("ADC laser GP%d skip:" % gp, e)
+        if pinmap["adc_pt_gp"] is not None:
+            try:
+                adc_pt = analogio.AnalogIn(_gp(pinmap["adc_pt_gp"]))
+            except Exception as e:
+                print("ADC PT skip:", e)
 
     print("PINS sense", pinmap["sense_gp"], "laser", pinmap["laser_gp"],
           "neo", pinmap["neopixel_gp"], "fitted", pinmap["fitted"])
     return inputs, lasers, adc_laser, adc_pt
+

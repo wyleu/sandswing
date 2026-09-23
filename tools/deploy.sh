@@ -1,31 +1,56 @@
 #!/bin/bash
+# Stamp CIRCUITPY from ../src/. Does not nuke. lib/ only with --lib.
 set -euo pipefail
-SRC="$HOME/Code/Sandbells/sandswing/src"
-need=(boot.py code.py sandswing.py pins_from_settings.py
-      config_loader.py farm_log.py farm_ws.py settings.json)
 
-die() { echo "FAIL: $*"; exit 1; }
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SRC="$ROOT/src"
+LABEL="${PICO_LABEL:-CIRCUITPY}"
+WITH_LIB=0
+[[ "${1:-}" == "--lib" ]] && WITH_LIB=1
 
-[ -d "$SRC" ] || die "no $SRC"
-for f in "${need[@]}"; do
-  [ -f "$SRC/$f" ] || die "missing $SRC/$f"
-done
-[ -d "$SRC/lib" ] || die "missing $SRC/lib"
-command -v mpremote >/dev/null || die "mpremote not installed"
-[ -e /dev/ttyACM0 ] || [ -e /dev/ttyACM1 ] || die "no /dev/ttyACM* — plug Pico in (not BOOTSEL)"
-
-if ! mpremote connect auto exec "print('ping')" >/tmp/mp-ping.txt 2>&1; then
-  cat /tmp/mp-ping.txt
-  die "serial busy. Close Thonny, screen, and other mpremote."
+if [[ ! -d "$SRC" ]]; then
+  echo "no src dir: $SRC" >&2
+  exit 1
 fi
 
-echo "Copying…"
-for f in "${need[@]}"; do
-  echo "  $f"
-  mpremote connect auto cp "$SRC/$f" ":$f"
-done
-echo "  lib/"
-mpremote connect auto cp -r "$SRC/lib" :
-echo "Reset…"
-mpremote connect auto reset || true
-echo "OK —  mpremote connect auto"
+python3 -m json.tool "$SRC/settings.json" >/dev/null
+python3 -m py_compile \
+  "$SRC/boot.py" "$SRC/code.py" "$SRC/sandswing.py" \
+  "$SRC/pins_from_settings.py" "$SRC/bell.py" "$SRC/mux4051.py" \
+  "$SRC/sand_status.py" "$SRC/config_loader.py" \
+  "$SRC/farm_log.py" "$SRC/farm_ws.py"
+
+DEV="$(lsblk -npo NAME,LABEL | awk -v L="$LABEL" '$2==L {print $1; exit}')"
+if [[ -z "${DEV:-}" ]]; then
+  echo "no disk labelled $LABEL (plug the Pico, wait 3s)" >&2
+  lsblk -o NAME,LABEL,MOUNTPOINT
+  exit 1
+fi
+
+MP="$(lsblk -npo MOUNTPOINT "$DEV")"
+if [[ -z "${MP:-}" ]]; then
+  udisksctl mount -b "$DEV" >/dev/null
+  MP="$(lsblk -npo MOUNTPOINT "$DEV")"
+fi
+if [[ -z "${MP:-}" ]]; then
+  echo "could not mount $DEV" >&2
+  exit 1
+fi
+
+echo "stamp $SRC -> $MP ($DEV)"
+cp "$SRC/boot.py" "$SRC/code.py" "$SRC/sandswing.py" \
+   "$SRC/pins_from_settings.py" "$SRC/bell.py" "$SRC/mux4051.py" \
+   "$SRC/sand_status.py" "$SRC/config_loader.py" \
+   "$SRC/farm_log.py" "$SRC/farm_ws.py" \
+   "$SRC/settings.json" \
+   "$MP/"
+
+if [[ "$WITH_LIB" -eq 1 ]]; then
+  mkdir -p "$MP/lib"
+  cp -a "$SRC/lib/." "$MP/lib/"
+  echo "lib/ copied"
+fi
+
+sync
+udisksctl unmount -b "$DEV"
+echo "unmounted $DEV — mpremote connect auto, then Ctrl-D"

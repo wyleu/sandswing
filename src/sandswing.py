@@ -1,49 +1,41 @@
 """
 sandswing.py
 ============
-CircuitPython optical lineup + optional fake WebSocket "rounds" jabber
-for Raspberry Pi Pico 2 W.
+Optical lineup + optional WS rounds jabber. Pico 2 W / CircuitPython 10.0.3.
 
-HOW IT IS STARTED
-    CircuitPython always runs code.py.
-    code.py is the settings launcher. settings.json has:
-        "startup": { "program": "sandswing.py" }
-    The launcher should __import__("sandswing"), not exec().
-    This file must be named sandswing.py on CIRCUITPY (not code.py).
+START
+    CIRCUITPY runs code.py → settings.json "startup.program" → sandswing.py
+    Master: ~/Code/Sandbells/sandswing/src/sandswing.py
+    Stamp only on CIRCUITPY. Do not remount the USB disk in boot.py.
 
-WHAT THIS PROGRAM DOES
-    1. load_config(), farm_log, optional Wi-Fi + WebSocket.
-    2. Pins from settings.json via pins_from_settings.py (no input_base).
-    3. Sweep each laser PWM 0% → 100% while reading the matching
-       photodiode (active-low). Log duty, PT, optional ADC, edges.
-    4. NeoPixel GP16: pixel 0 = status, pixel n+1 = channel under test.
-    5. Optional synthetic rounds on WS if streams.bell.test_sweep
-       AND streams.bell.enabled. Does not fire lasers or sensors.
+DOES
+    Sweep one laser at a time 0–100% PWM.
+    Digital PT on sense[] (pull-up; PT True/False from Farm.pt()).
+    Analogue I via CD4051 (ADC0 GP26, ABC GP17/18/19), Farm.analog().
+    NeoPixel GP16: pixel 0 status, pixel ch+1 under test.
+    Optional WS jabber (does not drive lasers).
 
-WHAT THIS PROGRAM DOES NOT DO
-    - Real bell-blow detection / mapping WS bells 1–8 onto GP0–3
-    - Several lasers on at once
-    - ir_pwm / tx_led / status_led (old sandbells pins)
-    - create_hardware() (that double-claimed GP0/GP7)
-    - MIDI
-    - Writing the CIRCUITPY volume label
-    - Saving calibration back into settings.json
+DOES NOT
+    Real blow detection, MIDI, create_hardware(), ir_pwm/tx/status LEDs,
+    writing CIRCUITPY while the Pi has the volume mounted (log → serial).
 
-THIS LOOM (2026-09-20)
-    Sense (pull-up, PT = not pin.value):
-        ch0 GP0 HEAD    ch1 GP1 HEAD    ch2 GP2 empty    ch3 GP3 empty
-    Laser PWM 1 kHz:
-        ch0 GP7         ch1 GP8         ch2 GP9          ch3 GP10
-    If the "input 2" laser lights during software ch 4, that lead is on
-    GP10 not GP8 — put "laser_pwm": [7, 10, 9, 8] until the loom is fixed.
-    NeoPixel GP16. ADC laser GP26/27 (ch0/ch1 only). ADC PT GP28.
+LOOM (workshop 2026-09-23)
+    sense      [0, 1, 2, 3]     ch0/ch1 fitted
+    laser_pwm  [8, 9, 10, 11]   1 kHz PWM
+    neopixel   16
+    adc_mux    common=26  A=17 B=18 C=19
+               laser_y [0..7] → 4051 Y0..Y7 = laser current for ch 0..7
+    fitted     [0, 1]
 
-    Expect PASS [n, m, 0, 0] when both fitted heads see their beam.
+    Serial must show:
+      --- ch 1 laser GP8 PT GP0 ---
+      --- ch 2 laser GP9 PT GP1 ---
 
 REQUIRED ON CIRCUITPY
-    code.py  sandswing.py  pins_from_settings.py
-    config_loader.py  farm_log.py  farm_ws.py
-    settings.json  lib/  boot.py (pause before code.py)
+    boot.py code.py sandswing.py pins_from_settings.py
+    bell.py mux4051.py sand_status.py
+    config_loader.py farm_log.py farm_ws.py settings.json lib/
+
 
 settings.json PINS
     "pins": {
