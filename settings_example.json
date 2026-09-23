@@ -31,7 +31,10 @@
     "rest": "dark",
     "pattern": [2, 1, 4],
     "stand_hand": "after_four",
-    "stand_back": "after_two"
+    "stand_back": "after_two",
+    "stand_hold_ms": 350,
+    "t_ms": 2500,
+    "lost_mult": 1.5
   },
   "output": {
     "enabled_formats": [ "midi", "log", "neopixel","ws"],
