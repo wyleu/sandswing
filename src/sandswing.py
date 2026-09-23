@@ -63,7 +63,11 @@ import time
 import math
 import board
 import wifi
-import farm_log
+
+try:
+    import farm_log
+except ImportError:
+    farm_log = None
 
 from config_loader import load_config
 from farm_ws import connect_wifi, start_server, poll, send
@@ -156,8 +160,9 @@ def neo_toggle_channel(ch):
     neo[ch + 1] = COLOR_B if neo_phase[ch] else COLOR_A
     neo.show()
 
-
-farm_log.start(cfg)
+if farm_log:
+    farm_log.start(cfg)
+    
 print("Optical lineup", "ch", NUM, "steps", SWEEP_STEPS, "fitted", sorted(FITTED))
 
 
@@ -165,7 +170,8 @@ def emit(msg):
     global _last_line
     _last_line = str(msg)
     print(msg)
-    farm_log.write(msg)
+    if farm_log:   
+        farm_log.write(msg)
 
 def status_payload():
     ip = None
@@ -344,5 +350,9 @@ finally:
         for i in range(len(neo)):
             neo[i] = (0, 0, 0)
         neo.show()
-    farm_log.close()
+    if farm_log:
+        try:
+            farm_log.close()
+        except Exception:
+            pass
     print("Cleanup complete")
