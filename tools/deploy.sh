@@ -20,8 +20,9 @@ python3 -m py_compile \
   "$SRC/sand_status.py" "$SRC/config_loader.py" \
   "$SRC/farm_log.py" "$SRC/farm_ws.py"
 
-DEV="$(lsblk -npo NAME,LABEL | awk -v L="$LABEL" '$2==L {print $1; exit}')"
-if [[ -z "${DEV:-}" ]]; then
+if [[ -e /dev/disk/by-label/$LABEL ]]; then
+  DEV="$(readlink -f /dev/disk/by-label/$LABEL)"
+else
   echo "no disk labelled $LABEL (plug the Pico, wait 3s)" >&2
   lsblk -o NAME,LABEL,MOUNTPOINT
   exit 1
