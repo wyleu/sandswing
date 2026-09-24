@@ -1,11 +1,15 @@
 # sandswing
 
+![4-bell concentrator loom](docs/4%20bell%20concentrator.jpg)
+
 Optical lineup and stroke counting on a Raspberry Pi Pico 2 W (CircuitPython 10.0.3).
 
 GitHub: https://github.com/wyleu/sandswing
 Sister device: [sandsense](https://github.com/wyleu/sandsense)
 
 **CIRCUITPY is a stamp of `src/`. Edit on the Pi disk. Never nano the volume.**
+
+The photo is the bench concentrator: four optical channels, two heads fitted, lasers on one side of the frame and photodiodes on the other. Channel order on the loom is not assumed — `settings.json` `"pins"` is the map.
 
 ## Programs
 
@@ -17,9 +21,9 @@ Sister device: [sandsense](https://github.com/wyleu/sandsense)
 | `src/bell_machine.py` | Wheel FSM used by detect programs |
 | `src/code.py` | Reads `settings.json` `startup.program` and execs that file |
 
-`startup.program` is the switch. Default for bench work: `sandswing.py`. Funeral practice: `toll_detect.py`.
+`startup.program` is the switch. Bench: `sandswing.py`. Funeral practice: `toll_detect.py`.
 
-Historic `pico_circuitp_*` sketches lived at the repo root. They are in git history and may exist in a local ignored `archive/`. They are not deployed.
+Historic `pico_circuitp_*` sketches are in git history and may sit in ignored `archive/`. They are not deployed.
 
 ## Hardware (Sep 2026 loom)
 
@@ -33,6 +37,44 @@ Historic `pico_circuitp_*` sketches lived at the repo root. They are in git hist
 
 Pins come from `settings.json` → `pins` via `pins_from_settings.py`. No `input_base` arithmetic.
 
+## State model (`bell_machine.py` + `toll_detect.py`)
+
+This is a **stroke machine**, not a full-circle ringing model. There is no handstroke/backstroke pair, no stand, no 2-1-4 hunt. One falling edge on head A and one on head B, close together, is **one blow**.
+
+```
+        idle / gap
+            |
+            |  first head falling (A or B)
+            v
+        pending (remember which head, timestamp)
+            |
+            |  other head falling, dt < STROKE_MAX_MS
+            v
+        STROKE  -->  increment count, classify tenor/treble
+            |
+            |  both heads quiet for STROKE_MAX_MS
+            v
+        idle / gap   (next first-head starts a new stroke)
+```
+
+Definitions used on the bench:
+
+| Name | Meaning |
+|------|---------|
+| Head A | Fitted channel 0 (GP0 sense / GP7 laser unless remapped) |
+| Head B | Fitted channel 1 |
+| Stroke | A then B, or B then A, both edges inside `STROKE_MAX_MS` (default 4000 ms) |
+| Gap | No completing edge within `STROKE_MAX_MS` — pending is dropped, next edge starts a new stroke |
+| Tenor-ish | A before B (order is a wiring convention; swap in settings if the room disagrees) |
+| Treble-ish | B before A |
+| `stroke_count` | Completed pairs only. A lone head never counts |
+
+`toll_detect.py` holds lasers at a fixed duty (`pins.laser_hold_duty` or 40%), samples the two PTs, and calls `on_head_a_falling` / `on_head_b_falling` on active-low edges. It prints `stroke_count` and last `dt_ms`. It does not sweep, does not MIDI, does not write `bell_log_*` unless `farm_log` is on the board and enabled.
+
+`bell_detect.py` is a later, richer FSM (mux address, stand pin, 2-1-4). Do not point `startup.program` at it for the funeral job.
+
+Lineup (`sandswing.py`) does **not** use this machine. It ramps one laser at a time so you can see a PT and a NeoPixel. Use it to aim; use toll to count.
+
 ## Host tree
 
 ```
@@ -40,6 +82,7 @@ sandswing/
   src/                 # only this is copied to the Pico
   tools/deploy.sh
   tools/files.txt      # copy list (no farm_log.py by default)
+  docs/                # README photo and notes
   firmware/            # UF2 + nuke, gitignored
   archive/             # local only, gitignored
   logs/                # serial captures on the Pi
@@ -51,7 +94,7 @@ sandswing/
 
 ## Deploy (keep the Pico current)
 
-Volume must be labelled `CIRCUITPY` (or `PICO_LABEL=...`). Thonny closed. Settings edited only under `src/`.
+Volume labelled `CIRCUITPY` (or `PICO_LABEL=...`). Thonny closed. Settings edited only under `src/`.
 
 ```bash
 cd ~/Code/Sandbells/sandswing
@@ -64,7 +107,7 @@ tools/deploy.sh --settings   # also copy settings.json
 tools/deploy.sh --settings --lib   # wiped board / new UF2
 ```
 
-`tools/files.txt` is the list. Logging on the Pico is off unless you add `farm_log.py` to that list. Lineup and toll print to the REPL; capture on the Pi.
+`tools/files.txt` is the list. Logging on the Pico is off unless you add `farm_log.py`. Capture serial on the Pi.
 
 ## Confirm host == Pico
 
@@ -73,9 +116,9 @@ git rev-parse --short HEAD
 mpremote connect /dev/ttyACM0 fs cat :build_info.py
 ```
 
-Both must show the same short hash. Serial after Ctrl-D should print `CIRCUITPY <hash>` from `code.py`.
+Same short hash. Serial after Ctrl-D should print `CIRCUITPY <hash>` from `code.py`.
 
-Dirty `src/` still copies, but the stamp is the last commit. Clean tree + deploy + matching hash = current.
+Dirty `src/` still copies; the stamp is the last commit. Clean tree + deploy + matching hash = current.
 
 ## Serial and logs (Pi, not Pico)
 
@@ -85,13 +128,11 @@ mpremote connect /dev/ttyACM0
 # Enter, then Ctrl-D to reboot
 ```
 
-Capture:
-
 ```bash
 mpremote connect /dev/ttyACM0 cat | tee logs/session-$(date +%Y%m%d-%H%M).txt
 ```
 
-If ACM0 is busy: `ls /dev/ttyACM*` and use ACM1. Ctrl-C ends the tee only.
+If ACM0 is busy: `ls /dev/ttyACM*` and use ACM1.
 
 ## Switch lineup ↔ toll
 
@@ -110,3 +151,7 @@ Do not edit it. BOOTSEL → `firmware/flash_nuke.uf2` → BOOTSEL → `firmware/
 ## CircuitPython
 
 Pico 2 W **10.0.3**. Refresh `lib/` only after a UF2 change (`--lib`).
+
+## GitHub and the photo
+
+Commit `docs/4 bell concentrator.jpg` (or rename to `docs/concentrator.jpg` and fix the image line) so the README picture renders on GitHub. Spaces in the filename work if the URL is escaped as above.
