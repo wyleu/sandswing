@@ -47,10 +47,20 @@
     },
    "neopixel": {
       "pin": 16,
+      "mode": "test",
+      "test": { "idle": [0, 64, 0], "reflect": [64, 0, 0], "status": [16, 16, 16] },
+      "perf": {
+          "parked": [0, 64, 0],
+          "hand": [0, 0, 64],
+          "back": [64, 0, 0],
+          "moving": [64, 64, 0],
+          "pending": [0, 64, 64],
+          "fault": [64, 0, 64]
+          },
       "brightness": 0.4,
       "pixel_order": "GRB",
       "status_color": [0, 80, 0]
-    }, 
+   },
    "midi": {
       "enabled": true,
       "channel": 0,
