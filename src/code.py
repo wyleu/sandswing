@@ -33,7 +33,11 @@ except Exception as e:
     midi_channel = 0
     enabled_formats = ["log"]
     
-
+try:
+    import build_info
+    print("CIRCUITPY", build_info.GIT, build_info.BUILT)
+except Exception:
+    print("CIRCUITPY unstamped")
 
 print("WiFi SSID:", wifi_ssid)
 print("MIDI channel:", midi_channel)

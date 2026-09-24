@@ -31,3 +31,4 @@ settings.toml
 sd/
 archive/
 firmware/
+src/build_info.py

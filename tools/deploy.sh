@@ -13,12 +13,27 @@ if [[ ! -d "$SRC" ]]; then
   exit 1
 fi
 
+HASH="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf 'GIT="%s"\nBUILT="%s"\n' "$HASH" "$DATE" > "$SRC/build_info.py"
+echo "build $HASH $DATE"
+
+LIST="$ROOT/tools/files.txt"
+mapfile -t FILES < <(grep -v '^[[:space:]]*#' "$LIST" | grep -v '^[[:space:]]*$')
+
+for f in "${FILES[@]}" build_info.py; do
+  if [[ ! -f "$SRC/$f" ]]; then
+    echo "missing $SRC/$f" >&2
+    exit 1
+  fi
+done
+
+PY=()
+for f in "${FILES[@]}"; do
+  [[ "$f" == *.py ]] && PY+=("$SRC/$f")
+done
+python3 -m py_compile "$SRC/build_info.py" "${PY[@]}"
 python3 -m json.tool "$SRC/settings.json" >/dev/null
-python3 -m py_compile \
-  "$SRC/boot.py" "$SRC/code.py" "$SRC/sandswing.py" \
-  "$SRC/pins_from_settings.py" "$SRC/bell.py" "$SRC/mux4051.py" \
-  "$SRC/sand_status.py" "$SRC/config_loader.py" \
-  "$SRC/farm_log.py" "$SRC/farm_ws.py"
 
 if [[ -e /dev/disk/by-label/$LABEL ]]; then
   DEV="$(readlink -f /dev/disk/by-label/$LABEL)"
@@ -38,13 +53,10 @@ if [[ -z "${MP:-}" ]]; then
   exit 1
 fi
 
-echo "stamp $SRC -> $MP ($DEV)"
-cp "$SRC/boot.py" "$SRC/code.py" "$SRC/sandswing.py" \
-   "$SRC/pins_from_settings.py" "$SRC/bell.py" "$SRC/mux4051.py" \
-   "$SRC/sand_status.py" "$SRC/config_loader.py" \
-   "$SRC/farm_log.py" "$SRC/farm_ws.py" \
-   "$SRC/settings.json" \
-   "$MP/"
+echo "stamp $SRC -> $MP ($DEV) $HASH"
+for f in "${FILES[@]}" build_info.py; do
+  cp "$SRC/$f" "$MP/$f"
+done
 
 if [[ "$WITH_LIB" -eq 1 ]]; then
   mkdir -p "$MP/lib"
