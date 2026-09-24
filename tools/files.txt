@@ -1,6 +1,5 @@
 boot.py
 code.py
-settings.json
 pins_from_settings.py
 config_loader.py
 farm_ws.py

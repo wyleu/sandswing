@@ -13,6 +13,12 @@ if [[ ! -d "$SRC" ]]; then
   exit 1
 fi
 
+if [[ "${1:-}" == "--settings" ]] || [[ "${2:-}" == "--settings" ]]; then
+  python3 -m json.tool "$SRC/settings.json" >/dev/null
+  cp "$SRC/settings.json" "$MP/settings.json"
+  echo "settings.json copied"
+fi
+
 HASH="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf 'GIT="%s"\nBUILT="%s"\n' "$HASH" "$DATE" > "$SRC/build_info.py"
