@@ -2,90 +2,104 @@
 
 ![4-bell concentrator loom](docs/4%20bell%20concentrator.jpg)
 
-Optical lineup and stroke counting on a Raspberry Pi Pico 2 W (CircuitPython 10.0.3).
+Optical lineup, laser-head detection, and stroke counting on a Raspberry Pi Pico 2 W (CircuitPython 10.0.3).
 
 GitHub: https://github.com/wyleu/sandswing
 Sister device: [sandsense](https://github.com/wyleu/sandsense)
 
 **CIRCUITPY is a stamp of `src/`. Edit on the Pi disk. Never nano the volume.**
 
-The photo is the bench concentrator: four optical channels, two heads fitted, lasers on one side of the frame and photodiodes on the other. Channel order on the loom is not assumed — `settings.json` `"pins"` is the map.
+The photo is the bench concentrator: four optical channels, heads fitted on 0, 1 and 2, lasers on one side of the frame and photodiodes on the other. Channel order is not assumed. `settings.json` `"pins"` is the map, and `head_present.py` checks it.
 
 ## Programs
 
 | File | Job |
-|------|-----|
+| --- | --- |
 | `src/sandswing.py` | Optical lineup: sweep laser PWM, read PT, NeoPixel |
-| `src/toll_detect.py` | Funeral / slow-toll stroke counter (two heads) |
+| `src/head_present.py` | Fitted-head check: pulse each laser, read its mux port |
+| `src/laser_sense.py` | Bench ramp that produced the map and the duty curve |
+| `src/toll_detect.py` | Funeral / slow-toll stroke counter |
 | `src/bell_detect.py` | Skeleton for mux / stand-pin / 2-1-4 (not the funeral program) |
 | `src/bell_machine.py` | Wheel FSM used by detect programs |
 | `src/code.py` | Reads `settings.json` `startup.program` and execs that file |
 
-`startup.program` is the switch. Bench: `sandswing.py`. Funeral practice: `toll_detect.py`.
+`startup.program` is the switch. Bench lineup: `sandswing.py`. Head check: `head_present.py`. Funeral practice: `toll_detect.py`.
 
 Historic `pico_circuitp_*` sketches are in git history and may sit in ignored `archive/`. They are not deployed.
 
-## Hardware (Sep 2026 loom)
+## Hardware (measured Oct 2026)
 
 | Function | GP |
-|----------|-----|
-| Sense (active-low PT) | 0, 1, 2, 3 (heads on 0 and 1) |
-| Laser PWM 1 kHz | 7, 8, 9, 10 |
+| --- | --- |
+| Sense (active-low PT) | 0, 1, 2, 3 |
+| Laser PWM 1 kHz | ch0 GP8, ch1 GP9, ch2 GP10, ch3 GP7 |
+| Laser-current mux | 4051 Y0–Y3, Z to GP26 |
+| Mux address A, B, C | GP19, GP18, GP17 |
 | NeoPixel | 16 |
-| ADC laser I (optional) | 26, 27 |
-| ADC PT (optional) | 28 |
+| 4051 Z pull-down | 100 kΩ to GND |
 
 Pins come from `settings.json` → `pins` via `pins_from_settings.py`. No `input_base` arithmetic.
+
+Laser current, not the phototransistor, is how a head is known to be fitted. Confirmed on the bench:
+
+| Channel | Laser | Mux port | State |
+| --- | --- | --- | --- |
+| 0 | GP8 | 0 | head |
+| 1 | GP9 | 1 | head |
+| 2 | GP10 | 2 | head |
+| 3 | GP7 | 3 | empty |
+
+With 100 kΩ on Z, an empty port and a resting head both read about 500–900 counts. Presence is the step when that laser is pulsed at full duty: a fitted head moves about +8000, an empty port stays under +200. Duty 40960 misses channel 1, whose knee is later, so the presence pulse is 65535. Below about half duty the sense current is still on the floor; above the step it is flat near 9100. Do not treat PWM duty as proportional to current.
+
+`head_present.fitted()` is the startup check. A tower program should keep the returned list and not treat any other laser output as a bell.
 
 ## State model (`bell_machine.py` + `toll_detect.py`)
 
 This is a **stroke machine**, not a full-circle ringing model. There is no handstroke/backstroke pair, no stand, no 2-1-4 hunt. One falling edge on head A and one on head B, close together, is **one blow**.
 
 ```
-        idle / gap
-            |
-            |  first head falling (A or B)
-            v
-        pending (remember which head, timestamp)
-            |
-            |  other head falling, dt < STROKE_MAX_MS
-            v
-        STROKE  -->  increment count, classify tenor/treble
-            |
-            |  both heads quiet for STROKE_MAX_MS
-            v
-        idle / gap   (next first-head starts a new stroke)
+idle / gap
+|
+| first head falling (A or B)
+v
+pending (remember which head, timestamp)
+|
+| other head falling, dt < STROKE_MAX_MS
+v
+STROKE --> increment count, classify tenor/treble
+|
+| both heads quiet for STROKE_MAX_MS
+v
+idle / gap (next first-head starts a new stroke)
 ```
 
-Definitions used on the bench:
-
 | Name | Meaning |
-|------|---------|
-| Head A | Fitted channel 0 (GP0 sense / GP7 laser unless remapped) |
-| Head B | Fitted channel 1 |
+| --- | --- |
+| Head A | Fitted channel 0 (GP8 laser, mux 0) |
+| Head B | Fitted channel 1 (GP9 laser, mux 1) |
 | Stroke | A then B, or B then A, both edges inside `STROKE_MAX_MS` (default 4000 ms) |
-| Gap | No completing edge within `STROKE_MAX_MS` — pending is dropped, next edge starts a new stroke |
-| Tenor-ish | A before B (order is a wiring convention; swap in settings if the room disagrees) |
+| Gap | No completing edge within `STROKE_MAX_MS` — pending is dropped |
+| Tenor-ish | A before B (wiring convention; swap in settings if the room disagrees) |
 | Treble-ish | B before A |
 | `stroke_count` | Completed pairs only. A lone head never counts |
 
-`toll_detect.py` holds lasers at a fixed duty (`pins.laser_hold_duty` or 40%), samples the two PTs, and calls `on_head_a_falling` / `on_head_b_falling` on active-low edges. It prints `stroke_count` and last `dt_ms`. It does not sweep, does not MIDI, does not write `bell_log_*` unless `farm_log` is on the board and enabled.
+`toll_detect.py` holds lasers at a fixed duty, samples the PTs, and calls `on_head_a_falling` / `on_head_b_falling` on active-low edges. It prints `stroke_count` and last `dt_ms`. It does not sweep and does not speak MIDI.
 
-`bell_detect.py` is a later, richer FSM (mux address, stand pin, 2-1-4). Do not point `startup.program` at it for the funeral job.
+`bell_detect.py` is a later, richer FSM. Do not point `startup.program` at it for the funeral job.
 
-Lineup (`sandswing.py`) does **not** use this machine. It ramps one laser at a time so you can see a PT and a NeoPixel. Use it to aim; use toll to count.
+Lineup (`sandswing.py`) does **not** use this machine. It ramps one laser at a time so you can see a PT and a NeoPixel. Use it to aim. Use `head_present.py` to see which heads are fitted. Use toll to count.
 
 ## Host tree
 
 ```
 sandswing/
-  src/                 # only this is copied to the Pico
+  src/            # only this is copied to the Pico
   tools/deploy.sh
-  tools/files.txt      # copy list (no farm_log.py by default)
-  docs/                # README photo and notes
-  firmware/            # UF2 + nuke, gitignored
-  archive/             # local only, gitignored
-  logs/                # serial captures on the Pi
+  tools/files.txt # copy list (no farm_log.py by default)
+  docs/           # README photo and notes
+  firmware/       # UF2 + nuke, gitignored
+  archive/        # local only, gitignored
+  logs/           # serial captures on the Pi
 ```
 
 `src/settings.json` is gitignored (Wi-Fi password). Keep `src/settings.example.json` in git with pins and `startup.program`, no secret.
@@ -134,7 +148,7 @@ mpremote connect /dev/ttyACM0 cat | tee logs/session-$(date +%Y%m%d-%H%M).txt
 
 If ACM0 is busy: `ls /dev/ttyACM*` and use ACM1.
 
-## Switch lineup ↔ toll
+## Switch program
 
 In `src/settings.json`:
 
@@ -142,7 +156,7 @@ In `src/settings.json`:
 "startup": { "program": "sandswing.py" }
 ```
 
-or `"toll_detect.py"`. Then `tools/deploy.sh --settings`.
+or `"toll_detect.py"`, or `"head_present.py"`. Then `tools/deploy.sh --settings`.
 
 ## When the volume is trash (`?` names, read-only, Errno 5)
 
