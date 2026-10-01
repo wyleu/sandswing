@@ -1,6 +1,6 @@
 # CircuitPython / MicroPython
 src/settings.json
-settings.json          # contains WiFi SSID, possibly other secrets
+settings.json   
 settings_sandsense.json
 settings_sandswing.json
 *.pyc
