@@ -23,15 +23,14 @@ try:
     test_enabled    = config["output"]["test"]["enabled"]
     startup_program = config["startup"]["program"]
 
-
-
 except Exception as e:
     print("Could not load settings.json → using defaults")
     print(e)
-    # fallback values
     wifi_ssid = "NOWRH81L"
     midi_channel = 0
-    enabled_formats = ["log"]
+    enabled_formats = []
+    test_enabled = False
+    startup_program = "laser_sense.py"
     
 try:
     import build_info
