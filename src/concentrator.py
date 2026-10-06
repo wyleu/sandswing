@@ -109,6 +109,7 @@ class Concentrator:
             self.tower.set_fitted(i, i in fitted)
         self.last_false = [None] * self.n
         self.edge_at = [None] * self.n
+        self._prev_held = [False] * self.n
         self._ran = False
         print(
             "concentrator sense", self.sense_gps,
@@ -124,13 +125,17 @@ class Concentrator:
         self.tower.report(index, kind, return_held)
 
     def poll_sense(self):
+        """Active-low sense, pull-up. True return means the reflector is in the beam.
+
+        A falling edge opens a ring window. A second edge inside it is a
+        blow report. A return held with no edge is STOOD, not an edge.
+        """
         now = time.monotonic()
-        if not hasattr(self, "_prev_held"):
-            self._prev_held = [False] * self.n
         for i, pin in enumerate(self.inputs):
             held = not pin.value
             became = held and not self._prev_held[i]
-            if became:
+            self._prev_held[i] = held
+            if became and self.last_false[i] is not None:
                 self.edge_at[i] = now
                 print("ch %d EDGE" % (i + 1))
             if not held:
@@ -142,9 +147,10 @@ class Concentrator:
                 kind = RINGING
             elif held:
                 kind = STOOD
-            if held != self._prev_held[i]:
-                print("ch %d %s kind=%s" % (i + 1, "HELD" if held else "CLEAR", kind))
-            self._prev_held[i] = held
+            if became:
+                print("ch %d HELD kind=%s" % (i + 1, kind))
+            elif not held and self.edge_at[i] is not None:
+                print("ch %d CLEAR" % (i + 1))
             self.tower.report(i, kind, held)
 
     def maybe_test(self):
