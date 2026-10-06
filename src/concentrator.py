@@ -132,8 +132,10 @@ class Concentrator:
         """
         now = time.monotonic()
         for i, pin in enumerate(self.inputs):
+            prev = self._prev_held[i]
             held = not pin.value
-            became = held and not self._prev_held[i]
+            became = held and not prev
+            released = (not held) and prev
             self._prev_held[i] = held
             if became and self.last_false[i] is not None:
                 self.edge_at[i] = now
@@ -149,7 +151,7 @@ class Concentrator:
                 kind = STOOD
             if became:
                 print("ch %d HELD kind=%s" % (i + 1, kind))
-            elif not held and self.edge_at[i] is not None:
+            elif released:
                 print("ch %d CLEAR" % (i + 1))
             self.tower.report(i, kind, held)
 
