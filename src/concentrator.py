@@ -163,6 +163,11 @@ class Concentrator:
             elif released:
                 print("ch %d CLEAR" % (i + 1))
           
+            if held and i not in self.fitted:
+                self.fitted.add(i)
+                self.tower.set_fitted(i, True)
+                print("ch %d fitted" % (i + 1))         
+        
             self.tower.report(i, kind, held)
             if i in self.fitted and not held:
                 if now - self.high_since[i] > 2:
