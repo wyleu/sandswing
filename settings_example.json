@@ -10,7 +10,11 @@
     "location": "workshop"
   },
   "startup": {
-    "program": "sandswing.py"
+    "program": "concentrator.py"
+  },
+  "test": {
+  "program": "sandswing.py",
+  "enter": "watchdog"
   },
   "pins": {
     "sense": [0, 1, 2, 3],
