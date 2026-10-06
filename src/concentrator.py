@@ -104,6 +104,7 @@ class Concentrator:
         )
         self.tower = TowerWatch(self.n, status_pixel=pixel)
         fitted = set(pinmap.get("fitted", []))
+        
         for i in range(self.n):
             self.tower.set_fitted(i, i in fitted)
         self.last_false = [None] * self.n
@@ -123,16 +124,15 @@ class Concentrator:
         self.tower.report(index, kind, return_held)
 
     def poll_sense(self):
-        """Active-low sense, pull-up. True return means the reflector is in the beam.
-
-        A falling edge opens a ring window. A second edge inside it is a
-        blow report. A return held with no edge is STOOD, not an edge.
-        """
         now = time.monotonic()
+        if not hasattr(self, "_prev_held"):
+            self._prev_held = [False] * self.n
         for i, pin in enumerate(self.inputs):
             held = not pin.value
-            if held and self.last_false[i] is not None:
+            became = held and not self._prev_held[i]
+            if became:
                 self.edge_at[i] = now
+                print("ch %d EDGE" % (i + 1))
             if not held:
                 self.last_false[i] = now
                 if self.tower.test_mark[i]:
@@ -142,6 +142,9 @@ class Concentrator:
                 kind = RINGING
             elif held:
                 kind = STOOD
+            if held != self._prev_held[i]:
+                print("ch %d %s kind=%s" % (i + 1, "HELD" if held else "CLEAR", kind))
+            self._prev_held[i] = held
             self.tower.report(i, kind, held)
 
     def maybe_test(self):

@@ -208,6 +208,19 @@ class TowerWatch:
         self._show(GREEN)
 
     def _show(self, colour):
+        if colour == getattr(self, "_colour", None):
+            return
+        self._colour = colour
+        names = {
+            RED: "red boot",
+            GREEN: "green active",
+            AMBER: "amber ringing_down",
+            BLUE: "blue inactive",
+            WHITE: "white tick",
+            MAGENTA: "magenta marked",
+            CYAN: "cyan test",
+        }
+        print("tower", names.get(colour, colour), self.tower)
         if self.status is None:
             return
         self.status[0] = colour
