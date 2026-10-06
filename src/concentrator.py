@@ -107,13 +107,18 @@ class Concentrator:
                 auto_write=False,
             )
         self.tower = TowerWatch(self.n, status_pixel=self.strip)
-        fitted = set(pinmap.get("fitted", []))
-        
-        for i in range(self.n):
-            self.tower.set_fitted(i, i in fitted)
+        self.strip.fill((0, 0, 0))
+        self.strip.show()
+        self.fitted = set()
+        for i, pin in enumerate(self.inputs):
+            if not pin.value:
+                self.fitted.add(i)
+                self.tower.set_fitted(i, True)
+        print("fitted sockets", [i + 1 for i in sorted(self.fitted)])
         self.last_false = [None] * self.n
         self.edge_at = [None] * self.n
         self._prev_held = [False] * self.n
+        self.high_since = [time.monotonic()] * self.n
         self._ran = False
         print(
             "concentrator sense", self.sense_gps,
@@ -157,8 +162,18 @@ class Concentrator:
                 print("ch %d HELD kind=%s" % (i + 1, kind))
             elif released:
                 print("ch %d CLEAR" % (i + 1))
+          
             self.tower.report(i, kind, held)
-            self.strip[i + 1] = (0, 40, 0) if (held or kind != IDLE) else (0, 0, 0)
+            if i in self.fitted and not held:
+                if now - self.high_since[i] > 2:
+                    self.fitted.discard(i)
+                    self.tower.set_fitted(i, False)
+                    self.strip[i + 1] = (0, 0, 0)
+                else:
+                    self.strip[i + 1] = (40, 0, 0)
+            else:
+                self.high_since[i] = now
+                self.strip[i + 1] = (0, 0, 0)
         self.strip.show()
         
     def maybe_test(self):

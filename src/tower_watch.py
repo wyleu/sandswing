@@ -63,7 +63,7 @@ FLASH_S = 0.15
 
 RED = (48, 0, 0)
 GREEN = (0, 48, 0)
-AMBER = (48, 24, 0)
+AMBER = (24, 48, 0)
 BLUE = (0, 0, 48)
 WHITE = (32, 32, 32)
 MAGENTA = (48, 0, 48)
