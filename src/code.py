@@ -15,22 +15,22 @@ try:
     with open(CONFIG_FILE, "rb") as f:
         config = json.load(f)
 
-    # Access examples
-    wifi_ssid       = config["wifi"]["ssid"]
-    midi_channel    = config["output"]["midi"]["channel"]
-    output_conf     = config["output"]
-    enabled_formats = config["output"]["enabled_formats"]
-    test_enabled    = config["output"]["test"]["enabled"]
-    startup_program = config["startup"]["program"]
+    wifi_ssid = config.get("wifi", {}).get("ssid", "")
+    midi = config.get("output", {}).get("midi", {})
+    midi_channel = midi.get("channel", None)
+    output_conf = config.get("output", {})
+    enabled_formats = output_conf.get("enabled_formats", [])
+    test_enabled = output_conf.get("test", {}).get("enabled", False)
+    startup_program = config.get("startup", {}).get("program")
 
 except Exception as e:
     print("Could not load settings.json → using defaults")
     print(e)
-    wifi_ssid = "NOWRH81L"
-    midi_channel = 0
+    wifi_ssid = ""
+    midi_channel = None
     enabled_formats = []
     test_enabled = False
-    startup_program = "laser_sense.py"
+    startup_program = None
     
 try:
     import build_info
