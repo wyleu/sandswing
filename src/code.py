@@ -88,7 +88,7 @@ if start_file:
         with open(start_file, "r") as f:
             code = f.read()
         
-        exec(code, globals(), locals())
+        exec(code, globals())
         print(f"→ {start_file} completed (or running in background)")
     
     except SyntaxError as e:
