@@ -49,6 +49,7 @@ import time
 
 import board
 import digitalio
+import neopixel
 
 from tower_watch import (
     TowerWatch,
@@ -99,10 +100,13 @@ class Concentrator:
         self.sense_gps = pinmap["sense_gp"]
         self.inputs = _claim_sense(self.sense_gps)
         self.n = len(self.sense_gps)
-        pixel = status_pixel(
-            getattr(board, "GP%d" % pinmap["neopixel_gp"]), n=1
-        )
-        self.tower = TowerWatch(self.n, status_pixel=pixel)
+        self.strip = neopixel.NeoPixel(
+                getattr(board, "GP%d" % pinmap["neopixel_gp"]),
+                self.n + 1,
+                brightness=0.3,
+                auto_write=False,
+            )
+        self.tower = TowerWatch(self.n, status_pixel=self.strip)
         fitted = set(pinmap.get("fitted", []))
         
         for i in range(self.n):
@@ -154,7 +158,9 @@ class Concentrator:
             elif released:
                 print("ch %d CLEAR" % (i + 1))
             self.tower.report(i, kind, held)
-
+            self.strip[i + 1] = (0, 40, 0) if (held or kind != IDLE) else (0, 0, 0)
+        self.strip.show()
+        
     def maybe_test(self):
         marked = self.tower.marked()
         if not marked or self._ran:
