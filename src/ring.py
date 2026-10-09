@@ -121,10 +121,10 @@ class Ring:
             pin.direction = digitalio.Direction.OUTPUT
             pin.value = False
             self.addr.append(pin)
-        adc_gp = pinmap.get("adc_pt_gp")
-        if adc_gp is None:
-            adc_gp = mux.get("common", 26)
+            
+        adc_gp = mux.get("common", 26)
         self.adc = analogio.AnalogIn(getattr(board, "GP%d" % adc_gp))
+        print("presence ADC GP%d" % adc_gp)
 
     def _select(self, port):
         for bit in range(len(self.addr)):
@@ -230,6 +230,8 @@ def main():
     app = Ring(load_settings())
     try:
         app.loop()
+    except KeyboardInterrupt:
+        print("Stopped")
     finally:
         app.close()
 

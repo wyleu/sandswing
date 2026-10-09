@@ -23,7 +23,7 @@ LOOM (workshop 2026-09-23)
     sense      [0, 1, 2, 3]     ch0/ch1 fitted
     laser_pwm  [8, 9, 10, 11]   1 kHz PWM
     neopixel   16
-    adc_mux    common=26  A=17 B=18 C=19
+    adc_mux    common=26  A=19 B=18 C=17
                laser_y [0..7] → 4051 Y0..Y7 = laser current for ch 0..7
     fitted     [0, 1]
 
@@ -40,7 +40,7 @@ REQUIRED ON CIRCUITPY
 settings.json PINS
     "pins": {
       "sense": [0, 1, 2, 3],
-      "laser_pwm": [7, 8, 9, 10],
+      "laser_pwm": [8, 9, 10, 11],
       "neopixel": 16,
       "adc_laser": [26, 27],
       "adc_pt": 28,
