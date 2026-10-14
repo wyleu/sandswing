@@ -1,18 +1,14 @@
 """
 board_pico.py
 =============
-Standalone loopback test for the Pico + 4051 board.
+Loopback test for the Pico board.
 
-Uses pins_from_settings.py so all GP numbers come from settings.json.
-No arithmetic, no hard-coded bases.
+Digital: sense[0..7] ↔ laser_pwm[0..7]
+Analogue: first four ADC pins from the pinmap (current-sense mux common + extras)
 
-Digital loopback (36-way connector):
-  sense GP → laser_pwm GP   (or the pairs you define in settings)
-
-Analogue loopback:
-  first 4 ADC channels (adc_laser + adc_pt as available)
-
-NeoPixel (neopixel_gp) shows progress; pixel 6 is overall status.
+NeoPixel (GP16):
+  pixel 0–7  = channel under test
+  pixel 6    = overall result (green = pass, red = fail)
 """
 
 import time
@@ -50,7 +46,7 @@ def gp(n):
     return getattr(board, "GP%d" % int(n))
 
 def test_digital():
-    print("Digital loopback (sense ↔ laser_pwm)")
+    print("Digital loopback")
     ok = True
     pairs = list(zip(SENSE, LASER))
     for i, (in_n, out_n) in enumerate(pairs):
