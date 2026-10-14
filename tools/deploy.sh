@@ -1,22 +1,21 @@
 #!/bin/bash
 # Stamp CIRCUITPY from ../src/. Does not nuke. lib/ only with --lib.
+# Optional --settings copies settings.json as well.
 set -euo pipefail
-
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/src"
 LABEL="${PICO_LABEL:-CIRCUITPY}"
 WITH_LIB=0
-[[ "${1:-}" == "--lib" ]] && WITH_LIB=1
+WITH_SETTINGS=0
+
+for arg in "$@"; do
+  [[ "$arg" == "--lib" ]] && WITH_LIB=1
+  [[ "$arg" == "--settings" ]] && WITH_SETTINGS=1
+done
 
 if [[ ! -d "$SRC" ]]; then
   echo "no src dir: $SRC" >&2
   exit 1
-fi
-
-if [[ "${1:-}" == "--settings" ]] || [[ "${2:-}" == "--settings" ]]; then
-  python3 -m json.tool "$SRC/settings.json" >/dev/null
-  cp "$SRC/settings.json" "$MP/settings.json"
-  echo "settings.json copied"
 fi
 
 HASH="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -26,7 +25,6 @@ echo "build $HASH $DATE"
 
 LIST="$ROOT/tools/files.txt"
 mapfile -t FILES < <(grep -v '^[[:space:]]*#' "$LIST" | grep -v '^[[:space:]]*$')
-
 for f in "${FILES[@]}" build_info.py; do
   if [[ ! -f "$SRC/$f" ]]; then
     echo "missing $SRC/$f" >&2
@@ -63,6 +61,11 @@ echo "stamp $SRC -> $MP ($DEV) $HASH"
 for f in "${FILES[@]}" build_info.py; do
   cp "$SRC/$f" "$MP/$f"
 done
+
+if [[ "$WITH_SETTINGS" -eq 1 ]]; then
+  cp "$SRC/settings.json" "$MP/settings.json"
+  echo "settings.json copied"
+fi
 
 if [[ "$WITH_LIB" -eq 1 ]]; then
   mkdir -p "$MP/lib"
