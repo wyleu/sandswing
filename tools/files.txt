@@ -10,3 +10,4 @@ bell_detect.py
 bell.py
 mux4051.py
 sand_status.py
+board_pico.py
