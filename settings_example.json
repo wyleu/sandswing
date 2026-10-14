@@ -22,11 +22,21 @@
     "neopixel": 16,
     "adc_mux": {
       "common": 26,
-      "a": 19,
-      "b": 18,
-      "c": 17,
+      "a": 18,
+      "b": 19,
+      "c": 20,
       "inh": null,
       "laser_y": [0, 1, 2, 3, 4, 5, 6, 7]
+    },
+    "threshold_mux": {
+      "common": 27,
+      "a": 18,
+      "b": 19,
+      "c": 20,
+      "inh": null,
+      "y": [0, 1, 2, 3, 4, 5, 6, 7],
+      "pwm_gp": 28,
+      "note": "PWM-filtered threshold path;"
     },
     "fitted": [0, 1]
   },
