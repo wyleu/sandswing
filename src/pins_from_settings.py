@@ -134,6 +134,7 @@ def load_pinmap(cfg):
     neo = int(raw.get("neopixel", 16))
     adc_laser = list(raw.get("adc_laser") or [26, 27])
     adc_pt = raw.get("adc_pt", 28)
+    threshold = raw.get("threshold_mux") or {}
 
     mux = raw.get("adc_mux") or {}
     return {
@@ -146,6 +147,7 @@ def load_pinmap(cfg):
         "adc_laser_gp": [int(x) for x in adc_laser],
         "adc_pt_gp": None if adc_pt is None else int(adc_pt),
         "adc_mux": mux,
+        "threshold_mux": threshold,
 }
 
 
