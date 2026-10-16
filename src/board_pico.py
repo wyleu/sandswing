@@ -97,6 +97,7 @@ def test_digital():
     print("Digital loopback")
     ok = True
     for i, (in_n, out_n) in enumerate(zip(SENSE, LASER)):
+        # print("GP%d in GP%d " % (out_n, in_n))
         neo_clear()
         neo[i % 8] = (0, 0, 64)
         neo.show()
@@ -110,8 +111,11 @@ def test_digital():
                 out.value = val
                 time.sleep(0.01)
                 if inp.value != val:
-                    print("  FAIL out GP%d in GP%d expected %s" % (out_n, in_n, val))
+                    print("  FAIL %s out GP%d in GP%d expected %s got %s" % (val, out_n, in_n, val, inp.value))
                     ok = False
+                else:
+                    pass
+                    # print("  PASS %s out GP%d in GP%d expected %s got %s" % (val, out_n, in_n, val, inp.value))
             out.deinit()
             inp.deinit()
         except Exception as e:
