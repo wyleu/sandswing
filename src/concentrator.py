@@ -59,6 +59,7 @@ from tower_watch import (
     IDLE,
 )
 from pins_from_settings import load_pinmap
+from head_probe import scan_heads
 
 CONFIG_FILE = "settings.json"
 RING_WINDOW_S = 0.4
@@ -66,6 +67,7 @@ SETTLE_S = 0.3
 REST_NEW = (4, 0, 0)    # green
 REST_OLD = (0, 0, 4)    # blue
 RESPONSE = (0, 48, 0)    # red
+LOOP_BACK = (48,48, 0)   #cyan
 OFF = (0, 0, 0)
 
 
@@ -98,48 +100,61 @@ def heartbeat(strip, on):
 
 class Concentrator:
     def __init__(self, cfg):
-        pinmap = load_pinmap(cfg)
-        test = cfg.get("test", {})
+        self.cfg = cfg
+        self.pinmap = load_pinmap(cfg)
+        self._check_test_contract()
+        self.sense_gps = self.pinmap["sense_gp"]
+        self.n = len(self.sense_gps)          # set n first
+        self._setup_sense()          # now claim the sense pins for the rest of the run
+        self._setup_strip()
+        self._setup_tower()
+        self._probe_heads()          # probe claims and releases its own pins
+        self._init_edge_state()
+        print("heads", self.head)
+
+    def _check_test_contract(self):
+        test = self.cfg.get("test", {})
         enter = test.get("enter", "watchdog")
         if enter != "watchdog":
             raise ValueError("test.enter must be 'watchdog', got %r" % (enter,))
         self.test_program = test.get("program", "sandswing.py")
-        self.pinmap = pinmap
-        self.sense_gps = pinmap["sense_gp"]
+
+    def _setup_sense(self):
+        self.sense_gps = self.pinmap["sense_gp"]
         self.inputs = _claim_sense(self.sense_gps)
         self.n = len(self.sense_gps)
+
+    def _setup_strip(self):
         self.strip = neopixel.NeoPixel(
-                getattr(board, "GP%d" % pinmap["neopixel_gp"]),
-                self.n + 2,
-                brightness=0.3,
-                auto_write=False,
-            )
-        self.tower = TowerWatch(self.n, status_pixel=self.strip)
+            getattr(board, "GP%d" % self.pinmap["neopixel_gp"]),
+            self.n + 2,
+            brightness=0.3,
+            auto_write=False,
+        )
         self.strip.fill((0, 0, 0))
         self.strip.show()
+
+    def _setup_tower(self):
+        self.tower = TowerWatch(self.n, status_pixel=self.strip)
+
+    def _probe_heads(self):
+        from head_probe import scan_heads
+        self.head = scan_heads(self.pinmap, self.cfg, self.inputs)
         self.fitted = set()
-        for i, pin in enumerate(self.inputs):
-            if not pin.value:
+        for i, kind in enumerate(self.head):
+            if kind in ("old", "new", "lb"):
                 self.fitted.add(i)
-                self.tower.set_fitted(i, True)             
-        self.head = [None] * self.n
+                self.tower.set_fitted(i, True)
+            print("ch %d %s" % (i + 1, kind))
+
+    def _init_edge_state(self):
         self._still_since = [time.monotonic()] * self.n
         self._still_held = [not pin.value for pin in self.inputs]
-        for i in self.fitted:
-            self.head[i] = "old"   # fitted at boot means it was already low
-
-        print("fitted sockets", [i + 1 for i in sorted(self.fitted)])
         self.last_false = [None] * self.n
         self.edge_at = [None] * self.n
         self._prev_held = [False] * self.n
         self.high_since = [time.monotonic()] * self.n
         self._ran = False
-        print(
-            "concentrator sense", self.sense_gps,
-            "neo", pinmap["neopixel_gp"],
-            "test", self.test_program,
-        )
-        print("heads", self.head)
 
     def gps_day(self):
         """Call when the GPS clock head announces the day boundary."""
@@ -206,8 +221,11 @@ class Concentrator:
 
     def _pixel(self, i, held):
         kind = self.head[i]
-        if kind is None:
+        if kind is None or kind == "empty":
             self.strip[i + 1] = OFF
+            return
+        if kind == "lb":
+            self.strip[i + 1] = LOOP_BACK
             return
         resting_held = kind == "old"
         if held != resting_held:
