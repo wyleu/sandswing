@@ -47,10 +47,19 @@ those inputs before the test program runs.
 
 import time
 
+import asyncio
 import board
 import digitalio
 import neopixel
+import wifi
 
+try:
+    import farm_log
+except ImportError:
+    farm_log = None
+
+
+from config_loader import load_config
 from tower_watch import (
     TowerWatch,
     status_pixel,
@@ -59,7 +68,10 @@ from tower_watch import (
     IDLE,
 )
 from pins_from_settings import load_pinmap
+from farm_ws import connect_wifi, start_server, poll, send
+import farm_ws
 from head_probe import scan_heads
+from sand_status import from_concentrator
 
 CONFIG_FILE = "settings.json"
 RING_WINDOW_S = 0.4
@@ -70,6 +82,10 @@ RESPONSE = (0, 48, 0)    # red
 LOOP_BACK = (4,4, 0)     #cyan
 OFF = (0, 0, 0)
 
+server = None
+
+cfg = load_config()
+cfg.banner()
 
 def load_settings():
     import json
@@ -96,7 +112,42 @@ def _release(pins):
 
 def heartbeat(strip, on):
     strip[-1] = (8, 8, 8) if on else (0, 0, 0)
+    
+def setup_net():
+    if not connect_wifi(cfg):
+        emit("No WiFi – lineup still runs")
+        return
+    import wifi
+    for _ in range(20):
+        ip = wifi.radio.ipv4_address
+        if ip is not None:
+            break
+        time.sleep(0.25)
+    print("IP", ip)
+    if ip is None:
+        emit("No IP – server not started")
+        return
+    
 
+
+if farm_log:
+    farm_log.start(cfg)
+
+def emit(msg):
+    global _last_line
+    _last_line = str(msg)
+    print(msg)
+    if farm_log:   
+        farm_log.write(msg)
+        
+async def ws_poll_task():
+    n = 0
+    while True:
+        farm_ws.poll()
+        n += 1
+        if n % 50 == 0:
+            print("poll", n, "server", farm_ws._server is not None)
+        await asyncio.sleep(0.05)
 
 class Concentrator:
     def __init__(self, cfg):
@@ -155,6 +206,21 @@ class Concentrator:
         self._prev_held = [False] * self.n
         self.high_since = [time.monotonic()] * self.n
         self._ran = False
+        
+    def status_payload(self):
+        print("status hit")
+        return from_concentrator({
+            "id": self.cfg.get("device", {}).get("name"),
+            "name": self.cfg.get("device", {}).get("name"),
+            "family": self.cfg.get("device", {}).get("family"),
+            "role": self.cfg.get("device", {}).get("role"),
+            "location": self.cfg.get("device", {}).get("location"),
+            "ip": str(wifi.radio.ipv4_address),
+            "ssid": self.cfg.get("wifi", {}).get("ssid"),
+            "heads": list(self.head),
+            "ts": time.time(),
+        })
+
 
     def gps_day(self):
         """Call when the GPS clock head announces the day boundary."""
@@ -284,15 +350,25 @@ class Concentrator:
 
 
 async def main():
-    app = Concentrator(load_settings())
+    setup_net()
+    app = Concentrator(cfg)
+    start_server(cfg, app.status_payload)
     try:
         await asyncio.gather(
             app.sense_task(),
             app.status_task(),
+            ws_poll_task(),
         )
     finally:
         app.strip.fill((0, 0, 0))
         app.strip.show()
+        
+        if farm_log:
+            try:
+                farm_log.close()
+            except Exception:
+                pass
+        print("Cleanup complete")
 
 if __name__ == "__main__" or __name__ == "<module>":
     asyncio.run(main())

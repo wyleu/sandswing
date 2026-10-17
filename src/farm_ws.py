@@ -59,24 +59,19 @@ def start_server(cfg, payload_fn):
 
         @server.route(path_status, GET)
         def status_route(request: Request):
+            print("status route")
+            try:
+                body = json.dumps(_payload_fn())
+                print("status body", len(body))
+            except Exception as e:
+                print("status payload error", e)
+                body = '{"error":"payload"}'
             return Response(
                 request,
-                body=json.dumps(_payload_fn()),
+                body=body,
                 content_type="application/json",
                 headers={"Access-Control-Allow-Origin": "*"},
             )
-
-        @server.route(path_ws, GET)
-        def ws_route(request: Request):
-            global _ws
-            if _ws is not None:
-                try:
-                    _ws.close()
-                except Exception:
-                    pass
-            _ws = Websocket(request)
-            print("WS client connected")
-            return _ws
 
         host = str(wifi.radio.ipv4_address)
         server.start(host=host, port=port)

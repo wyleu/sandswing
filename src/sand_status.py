@@ -332,3 +332,31 @@ def from_sandswing(facts):
         summary=summary,
         poll_hint_sec=f.get("poll_hint_sec") or 2,
     )
+def from_concentrator(facts):
+    f = facts or {}
+    ip = f.get("ip")
+    net_level = "error" if not ip else "ok"
+    heads = f.get("heads") or []
+    items = []
+    for i, kind in enumerate(heads):
+        items.append(item("ch%d" % (i + 1), "Channel %d" % (i + 1), kind))
+    sections = [
+        section("network", "Network", [
+            item("ip", "IP", ip, net_level),
+            item("ssid", "WiFi", f.get("ssid")),
+        ], net_level),
+        section("heads", "Heads", items, "ok"),
+    ]
+    return document(
+        device_id=f.get("id") or "concentrator",
+        name=f.get("name") or "concentrator",
+        sections=sections,
+        role=f.get("role") or "concentrator",
+        family=f.get("family") or "sandswing",
+        host=ip or "",
+        instance=f.get("location") or "",
+        ts=f.get("ts") or 0,
+        level=net_level,
+        summary="heads " + " ".join(str(h) for h in heads),
+        poll_hint_sec=f.get("poll_hint_sec") or 2,
+    )
