@@ -141,12 +141,8 @@ def emit(msg):
         farm_log.write(msg)
         
 async def ws_poll_task():
-    n = 0
     while True:
         farm_ws.poll()
-        n += 1
-        if n % 50 == 0:
-            print("poll", n, "server", farm_ws._server is not None)
         await asyncio.sleep(0.05)
 
 class Concentrator:
@@ -161,6 +157,7 @@ class Concentrator:
         self._setup_tower()
         self._probe_heads()          # probe claims and releases its own pins
         self._init_edge_state()
+        self._prev_tower = self.tower.tower
         print("heads", self.head)
 
     def _check_test_contract(self):
@@ -208,7 +205,6 @@ class Concentrator:
         self._ran = False
         
     def status_payload(self):
-        print("status hit")
         return from_concentrator({
             "id": self.cfg.get("device", {}).get("name"),
             "name": self.cfg.get("device", {}).get("name"),
@@ -218,6 +214,7 @@ class Concentrator:
             "ip": str(wifi.radio.ipv4_address),
             "ssid": self.cfg.get("wifi", {}).get("ssid"),
             "heads": list(self.head),
+            "tower": self.tower.tower,          # "active" | "ringing_down" | "inactive"
             "ts": time.time(),
         })
 
@@ -328,6 +325,11 @@ class Concentrator:
         print("exec", name, "marked", marked)
         with open(name, "r") as f:
             exec(f.read(), {"__name__": "__test__"})
+            
+
+    def rescan(self):
+        self._probe_heads()
+        print("rescan", self.head)
 
     def loop(self):
         while True:
@@ -336,10 +338,14 @@ class Concentrator:
             self.maybe_test()
             time.sleep(0.02)
             
-    async def sense_task(self):
+            
+    async def sense_task(self):  # or loop()
         while True:
             self.poll_sense()
             self.tower.poll()
+            if self.tower.tower == "inactive" and self._prev_tower != "inactive":
+                self.rescan()
+            self._prev_tower = self.tower.tower
             self.maybe_test()
             await asyncio.sleep(0.02)
 

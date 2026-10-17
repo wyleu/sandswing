@@ -337,15 +337,22 @@ def from_concentrator(facts):
     ip = f.get("ip")
     net_level = "error" if not ip else "ok"
     heads = f.get("heads") or []
+    tower = f.get("tower") or "unknown"
+    tower_level = "ok" if tower == "active" else ("warn" if tower == "ringing_down" else "unknown")
+
     items = []
     for i, kind in enumerate(heads):
         items.append(item("ch%d" % (i + 1), "Channel %d" % (i + 1), kind))
+
     sections = [
         section("network", "Network", [
             item("ip", "IP", ip, net_level),
             item("ssid", "WiFi", f.get("ssid")),
         ], net_level),
         section("heads", "Heads", items, "ok"),
+        section("tower", "Tower", [
+            item("state", "State", tower, tower_level),
+        ], tower_level),
     ]
     return document(
         device_id=f.get("id") or "concentrator",

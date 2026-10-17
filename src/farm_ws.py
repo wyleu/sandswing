@@ -59,10 +59,8 @@ def start_server(cfg, payload_fn):
 
         @server.route(path_status, GET)
         def status_route(request: Request):
-            print("status route")
             try:
                 body = json.dumps(_payload_fn())
-                print("status body", len(body))
             except Exception as e:
                 print("status payload error", e)
                 body = '{"error":"payload"}'
