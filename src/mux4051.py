@@ -8,7 +8,8 @@ def _gp(n):
     return getattr(board, "GP%d" % n)
 
 class Mux4051:
-    def __init__(self, common, a, b, c, inh=None, settle_s=0.001):
+    def __init__(self, common, a, b, c, y, inh=None, settle_s=0.001):
+        print("Mux4051", common, a, b, c, y)
         self.adc = analogio.AnalogIn(_gp(common))
         self.a = digitalio.DigitalInOut(_gp(a)); self.a.switch_to_output()
         self.b = digitalio.DigitalInOut(_gp(b)); self.b.switch_to_output()

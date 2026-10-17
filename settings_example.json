@@ -16,6 +16,10 @@
   "program": "sandswing.py",
   "enter": "watchdog"
   },
+  "probe": {
+    "present_delta": 2000,
+    "lb_delta": 1000
+  },
   "pins": {
     "sense": [0, 1, 2, 3],
     "laser_pwm": [8, 9, 10, 11],
@@ -35,8 +39,9 @@
       "c": 20,
       "inh": null,
       "y": [0, 1, 2, 3, 4, 5, 6, 7],
-      "pwm_gp": 28,
-      "note": "PWM-filtered threshold path;"
+      "pwm_gp": 21,
+      "sense_gp": 28,
+      "note": "PWM on GP21, filtered threshold read on GP28;"
     },
     "fitted": [0, 1]
   },

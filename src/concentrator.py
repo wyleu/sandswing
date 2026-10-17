@@ -67,10 +67,10 @@ from tower_watch import (
     STOOD,
     IDLE,
 )
-from pins_from_settings import load_pinmap
+from pins_from_settings import load_pinmap, claim_threshold, claim_muxes
 from farm_ws import connect_wifi, start_server, poll, send
 import farm_ws
-from head_probe import scan_heads
+from head_probe import scan_heads, MID, _gp
 from sand_status import from_concentrator
 
 CONFIG_FILE = "settings.json"
@@ -155,6 +155,10 @@ class Concentrator:
         self._setup_sense()          # now claim the sense pins for the rest of the run
         self._setup_strip()
         self._setup_tower()
+        self.laser_mux, self.thr_mux = claim_muxes(self.pinmap)
+        # thr path
+        self.thr_pwm, self.thr_sense, self.thr_mux = claim_threshold(self.pinmap)
+        
         self._probe_heads()          # probe claims and releases its own pins
         self._init_edge_state()
         self._prev_tower = self.tower.tower
@@ -353,7 +357,7 @@ class Concentrator:
         while True:
             # existing status / WS send
             await asyncio.sleep(0.1)
-
+            
 
 async def main():
     setup_net()
@@ -368,7 +372,6 @@ async def main():
     finally:
         app.strip.fill((0, 0, 0))
         app.strip.show()
-        
         if farm_log:
             try:
                 farm_log.close()
