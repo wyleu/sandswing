@@ -64,10 +64,10 @@ from head_probe import scan_heads
 CONFIG_FILE = "settings.json"
 RING_WINDOW_S = 0.4
 SETTLE_S = 0.3
-REST_NEW = (4, 0, 0)    # green
-REST_OLD = (0, 0, 4)    # blue
+REST_NEW = (4, 0, 0)     # green
+REST_OLD = (0, 0, 4)     # blue
 RESPONSE = (0, 48, 0)    # red
-LOOP_BACK = (48,48, 0)   #cyan
+LOOP_BACK = (4,4, 0)     #cyan
 OFF = (0, 0, 0)
 
 
@@ -269,15 +269,30 @@ class Concentrator:
             self.tower.poll()
             self.maybe_test()
             time.sleep(0.02)
+            
+    async def sense_task(self):
+        while True:
+            self.poll_sense()
+            self.tower.poll()
+            self.maybe_test()
+            await asyncio.sleep(0.02)
+
+    async def status_task(self):
+        while True:
+            # existing status / WS send
+            await asyncio.sleep(0.1)
 
 
-def main():
+async def main():
     app = Concentrator(load_settings())
     try:
-        app.loop()
+        await asyncio.gather(
+            app.sense_task(),
+            app.status_task(),
+        )
     finally:
         app.strip.fill((0, 0, 0))
         app.strip.show()
 
 if __name__ == "__main__" or __name__ == "<module>":
-    main()
+    asyncio.run(main())
