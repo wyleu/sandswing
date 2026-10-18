@@ -17,7 +17,7 @@ def test_loopback_threshold_path_classifies():
 
 @case
 def test_loopback_broken_switch_is_fault():
-    tower, bells, plant = rig(plug_a={1}, plug_b={1}, ron_ratio=0.6)
+    tower, bells, plant = rig(plug_a={1}, plug_b={1}, ron_ratio=0.3)   # below bench-tuned LB_RATIO_MIN 0.5
     r = loopback_test.LoopbackSelfTest(tower).threshold_loopback(bells[1])
     assert not r["ok"] and r["plug"] is None, r
 
