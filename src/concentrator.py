@@ -318,7 +318,10 @@ class Concentrator:
         for i, pin in enumerate(self.inputs):
             kind, held = self._channel(i, pin, now)
         self.ring.poll()
-        self._paint(int(now * 2) % 2)
+
+        tpm = (self.cfg.get("escapement", {}) or {}).get("tpm", 48)
+        period = 120.0 / tpm                 # one pulse per two clock beats
+        self._paint((now % period) < 0.2 * period)
 
     def _paint(self, beat_on):
         tripped = self.ring.tripped()
@@ -326,7 +329,8 @@ class Concentrator:
                      for c in range(4))
         activity = {"active": "ringing", "ringing_down": "ringing_down"}.get(
             self.tower.tower, "heartbeat")
-        right = self.status_slot.colour
+        right = None if self.tower.tower == "inactive" else self.status_slot.colour
+        
         if activity == "heartbeat" and self.guard.panel_state():
             # last boot was a watchdog reset: LED6 blinks magenta with the
             # heartbeat until acknowledged or a clean day (watchdog.ack_after_s)
