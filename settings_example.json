@@ -42,8 +42,7 @@
       "pwm_gp": 21,
       "sense_gp": 28,
       "note": "PWM on GP21, filtered threshold read on GP28;"
-    },
-    "fitted": [0, 1]
+    }
   },
   "sensing": {
     "test": {

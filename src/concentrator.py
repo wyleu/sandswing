@@ -8,41 +8,35 @@ settings.json -> startup.program. This file does not replace the launcher.
 
 It owns the tower. tower_watch.py decides active, ringing-down, inactive,
 the day-tick, the test marks, and the status colour. This file feeds it
-head reports and, only after a mark, runs the test program named in
-settings.json -> test.program.
+head reports.
+
+It is the root: it builds every object and hands each one what it needs.
+Leaf modules never import each other's internals.
+
+Flow
+----
+1. Startup tests: PWM slice check (tower_build, before any claim),
+   socket survey/classify (socket_survey -> channel_gate), loopback
+   self-test, time sync (sntp_pico, if Wi-Fi and time.ntp_ips).
+2. Settle, then ring: ring.Ring holds the heads' lasers on and sends MIDI.
+3. On every tower-inactive transition: survey again, settle, ring again.
+The old test-program exec (settings test.program) is gone; see RETIRE.md.
 
 settings.json
 -------------
-  "startup": { "program": "concentrator.py" },
-  "test":    { "program": "sandswing.py", "enter": "watchdog" }
-
-enter must be "watchdog". Any other value is refused. A boot does not
-drop into the threshold step.
-
-Test program contract
----------------------
-sandswing.py remains the threshold step. Preferred: it exposes
-
-    def run(marked):
-        ...
-
-and does not call asyncio.run at import. marked is a list of head
-indexes. Until that exists, this file execs the named file once, on the
-first mark, and will not exec it again after a clean return.
+  "startup": { "program": "concentrator.py" }
 
 Status
 ------
-Pixel 0 of the NeoPixel is the tower. Colours are set only by
-tower_watch.py. This file does not paint the status pixel.
-Channel pixels belong to the test program.
+Six panel LEDs, one function: panel.panel_frame.  LED6 shows the colour
+tower_watch.py decides (it paints a StatusSlot, not the strip).  The
+same frame goes to the strip and to the ws payload.
 
 Pins
 ----
-The pin list comes from pins_from_settings.load_pinmap. This file does
-not read "pins" itself, and it does not call claim_lineup_hardware.
-That claim takes the laser PWMs as well as the sense inputs. The test
-program needs the lasers, so this file claims sense only, and releases
-those inputs before the test program runs.
+The pin list comes from pins_from_settings.load_pinmap. A/B/C, GP26,
+GP21 and GP28 are claimed once by tower_build/mux_select; sense inputs
+and lasers once here, for the whole run.
 """
 
 import time
@@ -67,20 +61,26 @@ from tower_watch import (
     STOOD,
     IDLE,
 )
-from pins_from_settings import load_pinmap, claim_threshold, claim_muxes
+from pins_from_settings import load_pinmap
 from farm_ws import connect_wifi, start_server, poll, send
 import farm_ws
-from head_probe import scan_heads, MID, _gp
-from sand_status import from_concentrator
+from tower_build import build_from_pins
+from connector_boards import DEFAULT_BOARDS
+from socket_survey import SocketSurvey, survey_all
+from channel_gate import ChannelGate
+from threshold_refresh import refresher_from_cfg
+from ring import Ring, open_midi
+import panel
+import report
+from board_pins import release
 
 CONFIG_FILE = "settings.json"
 RING_WINDOW_S = 0.4
 SETTLE_S = 0.3
-REST_NEW = (4, 0, 0)     # green
-REST_OLD = (0, 0, 4)     # blue
-RESPONSE = (0, 48, 0)    # red
-LOOP_BACK = (4,4, 0)     #cyan
-OFF = (0, 0, 0)
+# survey kind -> the head names this file and sand_status already use
+HEAD_NAME = {"head_new": "new", "head_old": "old", "loopback": "lb",
+             "empty": "empty", "no_board": "empty", "fault": "fault",
+             "unknown": "unknown"}
 
 server = None
 
@@ -110,13 +110,10 @@ def _release(pins):
         except Exception:
             pass
 
-def heartbeat(strip, on):
-    strip[-1] = (8, 8, 8) if on else (0, 0, 0)
-    
 def setup_net():
     if not connect_wifi(cfg):
         emit("No WiFi – lineup still runs")
-        return
+        return None
     import wifi
     for _ in range(20):
         ip = wifi.radio.ipv4_address
@@ -126,8 +123,23 @@ def setup_net():
     print("IP", ip)
     if ip is None:
         emit("No IP – server not started")
-        return
-    
+        return None
+    return ip
+
+
+def setup_sntp(ip):
+    """SntpClock on the GPS servers by IP (spec T4), or None."""
+    t = cfg.get("time", {}) or {}
+    ips = t.get("ntp_ips") or []
+    if ip is None or not ips:
+        emit("No time sync (no IP or no time.ntp_ips)")
+        return None
+    import socketpool
+    from sntp_pico import SntpClock
+    opts = dict((k, t[k]) for k in ("interval_s", "burst", "max_slew_ppm",
+                                    "step_ms", "ring_sample") if k in t)
+    return SntpClock(socketpool.SocketPool(wifi.radio), ips, **opts)
+
 
 
 if farm_log:
@@ -149,27 +161,28 @@ class Concentrator:
     def __init__(self, cfg):
         self.cfg = cfg
         self.pinmap = load_pinmap(cfg)
-        self._check_test_contract()
         self.sense_gps = self.pinmap["sense_gp"]
         self.n = len(self.sense_gps)          # set n first
+        self.link = "no_wifi"
+        self.sntp = None                      # set by main() if time sync is up
         self._setup_sense()          # now claim the sense pins for the rest of the run
         self._setup_strip()
         self._setup_tower()
-        self.laser_mux, self.thr_mux = claim_muxes(self.pinmap)
-        # thr path
-        self.thr_pwm, self.thr_sense, self.thr_mux = claim_threshold(self.pinmap)
-        
-        self._probe_heads()          # probe claims and releases its own pins
+        self._setup_mux()            # one A/B/C owner; PWM slice check first
+        self._setup_lasers()
+        self.gate = ChannelGate(self.n)
+        self.survey = SocketSurvey(self.mux)
+        self.refresher = refresher_from_cfg(self.mux, self.bells,
+                                            self.pinmap["raw"].get("threshold_mux") or {},
+                                            gate=self.gate)
+        self.ring = Ring(self.inputs, self.lasers, midi=open_midi())
+        self._probe_heads()          # survey borrows the tower selection
+        self.selftest = self.survey.run(self._populated())   # startup only
+        print("selftest ok=%s" % self.selftest["ok"])
         self._init_edge_state()
         self._prev_tower = self.tower.tower
+        self._start_ring()
         print("heads", self.head)
-
-    def _check_test_contract(self):
-        test = self.cfg.get("test", {})
-        enter = test.get("enter", "watchdog")
-        if enter != "watchdog":
-            raise ValueError("test.enter must be 'watchdog', got %r" % (enter,))
-        self.test_program = test.get("program", "sandswing.py")
 
     def _setup_sense(self):
         self.sense_gps = self.pinmap["sense_gp"]
@@ -177,9 +190,11 @@ class Concentrator:
         self.n = len(self.sense_gps)
 
     def _setup_strip(self):
+        # TODO(hardware): pixel_order. The old colour comments ((4,0,0)
+        # "green") suggest the strip is RGB while neopixel assumes GRB.
         self.strip = neopixel.NeoPixel(
             getattr(board, "GP%d" % self.pinmap["neopixel_gp"]),
-            self.n + 2,
+            panel.PANEL_N,
             brightness=0.3,
             auto_write=False,
         )
@@ -187,17 +202,52 @@ class Concentrator:
         self.strip.show()
 
     def _setup_tower(self):
-        self.tower = TowerWatch(self.n, status_pixel=self.strip)
+        self.status_slot = panel.StatusSlot()     # LED6 colour, via panel
+        self.tower = TowerWatch(self.n, status_pixel=self.status_slot)
+
+    def _setup_mux(self):
+        # self.mux is the 4051 select Tower (self.tower stays tower_watch).
+        self.mux, self.bells = build_from_pins(self.pinmap["raw"])
+        for w in self.mux.warnings:
+            emit("pins: " + w)
+        drive = self.bells[0].drive if self.bells else None
+        self.thr_pwm = drive.pwm if drive else None      # GP21, threshold_mux.pwm_hz
+        self.thr_sense = drive.back if drive else None   # GP28 monitor
+
+    def _setup_lasers(self):
+        pins = self.mux.pins
+        self.lasers = [pins.pwm_out(gp, frequency=self.pinmap["laser_hz"], duty_cycle=0)
+                       for gp in self.pinmap["laser_gp"]]
+        for b in self.bells:
+            b.laser = self.lasers[b.index]
+            b.sense_pin = self.inputs[b.index]
+
+    def _boards(self):
+        return self.pinmap["raw"].get("connector_boards") or DEFAULT_BOARDS
+
+    def _populated(self):
+        boards = self._boards()
+        on = [c for bd in boards if bd.get("present") is not False for c in bd["channels"]]
+        return [b for b in self.bells if b.index in on]
 
     def _probe_heads(self):
-        from head_probe import scan_heads
-        self.head = scan_heads(self.pinmap, self.cfg, self.inputs)
+        self.ring.stop()                          # lasers off, notes off
+        rep = survey_all(self.survey, self.bells, self.gate, self._boards())
+        self.kinds = dict((c, r["kind"]) for c, r in rep.items())
+        self.gate.enforce(self.bells)
+        self.head = [HEAD_NAME.get(self.kinds.get(i, "unknown"), "unknown")
+                     for i in range(self.n)]
         self.fitted = set()
         for i, kind in enumerate(self.head):
             if kind in ("old", "new", "lb"):
                 self.fitted.add(i)
                 self.tower.set_fitted(i, True)
             print("ch %d %s" % (i + 1, kind))
+
+    def _start_ring(self):
+        """Settle, then ring.  TODO(spec C4): settle from measured delays."""
+        time.sleep(SETTLE_S)
+        self.ring.start(self.kinds)   # TODO(spec section 6): per-head laser_duty
 
     def _init_edge_state(self):
         self._still_since = [time.monotonic()] * self.n
@@ -206,10 +256,14 @@ class Concentrator:
         self.edge_at = [None] * self.n
         self._prev_held = [False] * self.n
         self.high_since = [time.monotonic()] * self.n
-        self._ran = False
+        self.frame = panel.panel_frame({}, self.link)
         
     def status_payload(self):
-        return from_concentrator({
+        parts = {"mux": report.part(self.mux), "gate": report.part(self.gate),
+                 "refresh": report.part(self.refresher),
+                 "ring": report.part(self.ring),
+                 "sync": report.part(self.sntp, "boot_record")}
+        return report.build({
             "id": self.cfg.get("device", {}).get("name"),
             "name": self.cfg.get("device", {}).get("name"),
             "family": self.cfg.get("device", {}).get("family"),
@@ -219,8 +273,8 @@ class Concentrator:
             "ssid": self.cfg.get("wifi", {}).get("ssid"),
             "heads": list(self.head),
             "tower": self.tower.tower,          # "active" | "ringing_down" | "inactive"
-            "ts": time.time(),
-        })
+            "ts": time.time(),                 # TODO(spec T13): utc_ms from sntp
+        }, parts, panel.payload(self.frame))
 
 
     def gps_day(self):
@@ -237,9 +291,18 @@ class Concentrator:
         now = time.monotonic()
         for i, pin in enumerate(self.inputs):
             kind, held = self._channel(i, pin, now)
-            self._pixel(i, held)
-        heartbeat(self.strip, int(now * 2) % 2)
-        self.strip.show()
+        self.ring.poll()
+        self._paint(int(now * 2) % 2)
+
+    def _paint(self, beat_on):
+        tripped = self.ring.tripped()
+        kinds = dict((c, "response" if c in tripped else self.kinds.get(c, "unknown"))
+                     for c in range(4))
+        activity = {"active": "ringing", "ringing_down": "ringing_down"}.get(
+            self.tower.tower, "heartbeat")
+        self.frame = panel.panel_frame(kinds, self.link, activity, beat_on,
+                                       right=self.status_slot.colour)
+        panel.paint(self.strip, self.frame)
         
     def _settle(self, i, held, now):
         if held != self._still_held[i]:
@@ -286,60 +349,39 @@ class Concentrator:
         self._settle(i, held, now)
         return kind, held
 
-    def _pixel(self, i, held):
-        kind = self.head[i]
-        if kind is None or kind == "empty":
-            self.strip[i + 1] = OFF
-            return
-        if kind == "lb":
-            self.strip[i + 1] = LOOP_BACK
-            return
-        resting_held = kind == "old"
-        if held != resting_held:
-            self.strip[i + 1] = RESPONSE
-        elif kind == "new":
-            self.strip[i + 1] = REST_NEW
-        else:
-            self.strip[i + 1] = REST_OLD
-            
-    def maybe_test(self):
-        marked = self.tower.marked()
-        if not marked or self._ran:
-            return
-        self.tower.mark_test_running(True)
-        _release(self.inputs)
-        self.inputs = []
-        try: 
-            self._run_test(marked)
-        finally:
-            self.tower.mark_test_running(False)
-            self._ran = True
-
-    def _run_test(self, marked):
-        name = self.test_program
-        try:
-            mod_name = name[:-3] if name.endswith(".py") else name
-            mod = __import__(mod_name)
-            run = getattr(mod, "run", None)
-            if run is not None:
-                run(marked)
-                return
-        except Exception as e:
-            print("test import:", e)
-        print("exec", name, "marked", marked)
-        with open(name, "r") as f:
-            exec(f.read(), {"__name__": "__test__"})
-            
-
     def rescan(self):
         self._probe_heads()
+        self._start_ring()
         print("rescan", self.head)
+
+    def _tower_step(self):
+        """After tower.poll(): clock view, rescan on going inactive, gate."""
+        ringing = self.tower.tower in ("active", "ringing_down")
+        if self.sntp is not None:
+            self.sntp.set_ringing(ringing)        # spec T20
+        if self.tower.tower == "inactive" and self._prev_tower != "inactive":
+            self.rescan()
+        self._prev_tower = self.tower.tower
+        self.gate.enforce(self.bells)
+
+    def close(self):
+        """Release everything this file and tower_build claimed."""
+        import mux_select
+        self.ring.stop()
+        release(self.lasers)
+        release(self.inputs)
+        if self.thr_pwm is not None:
+            release([self.thr_pwm])
+        mux_select.reset_registry()
+        self.strip.fill((0, 0, 0))
+        self.strip.show()
+        release([self.strip])
 
     def loop(self):
         while True:
             self.poll_sense()
             self.tower.poll()
-            self.maybe_test()
+            self._tower_step()
             time.sleep(0.02)
             
             
@@ -347,10 +389,7 @@ class Concentrator:
         while True:
             self.poll_sense()
             self.tower.poll()
-            if self.tower.tower == "inactive" and self._prev_tower != "inactive":
-                self.rescan()
-            self._prev_tower = self.tower.tower
-            self.maybe_test()
+            self._tower_step()
             await asyncio.sleep(0.02)
 
     async def status_task(self):
@@ -360,18 +399,19 @@ class Concentrator:
             
 
 async def main():
-    setup_net()
+    ip = setup_net()
     app = Concentrator(cfg)
+    app.link = "wifi_only" if ip else "no_wifi"   # TODO: ws_client from farm_ws
+    app.sntp = setup_sntp(ip)
     start_server(cfg, app.status_payload)
+    tasks = [app.sense_task(), app.status_task(), ws_poll_task(),
+             app.refresher.run()]
+    if app.sntp is not None:
+        tasks.append(app.sntp.run())
     try:
-        await asyncio.gather(
-            app.sense_task(),
-            app.status_task(),
-            ws_poll_task(),
-        )
+        await asyncio.gather(*tasks)
     finally:
-        app.strip.fill((0, 0, 0))
-        app.strip.show()
+        app.close()
         if farm_log:
             try:
                 farm_log.close()
@@ -379,5 +419,9 @@ async def main():
                 pass
         print("Cleanup complete")
 
-if __name__ == "__main__" or __name__ == "<module>":
+def run():
     asyncio.run(main())
+
+
+if __name__ == "__main__" or __name__ == "<module>":
+    run()

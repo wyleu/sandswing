@@ -1,0 +1,63 @@
+# hw.py -- run a scenario in a fresh process with the fake CircuitPython
+# modules (fakes/: board, digitalio, analogio, pwmio, neopixel, wifi raise
+# ValueError('GPxx in use') on a double claim) in front of a src tree.
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+NEXT_SRC = os.path.join(os.path.dirname(HERE), "src")
+SETTINGS = os.path.join(HERE, "data", "settings_current.json")
+
+
+def spawn(test_file, scenario, settings_edit=None, src=NEXT_SRC, extra_src=None):
+    d = tempfile.mkdtemp(prefix="ssn_")
+    s = json.load(open(SETTINGS))
+    if settings_edit == "no_common":
+        s["pins"]["threshold_mux"].pop("common", None)
+    json.dump(s, open(os.path.join(d, "settings.json"), "w"))
+    args = [sys.executable, test_file, "--child", scenario, src, extra_src or ""]
+    p = subprocess.run(args, cwd=d, capture_output=True, text=True, timeout=300)
+    shutil.rmtree(d, ignore_errors=True)
+    line = [l for l in p.stdout.splitlines() if l.startswith("@@")]
+    if not line:
+        return {"ok": False, "exc": "no result: " + p.stderr[-1500:]}
+    return json.loads(line[-1][2:])
+
+
+def child_setup(src, extra_src=""):
+    import time
+    time.sleep = lambda s: None
+    sys.path[:0] = [os.path.join(HERE, "fakes"), os.path.join(HERE, "fakes", "stubs"), src]
+    if extra_src:
+        sys.path.insert(3, extra_src)
+    import _fake_hw
+    return _fake_hw
+
+
+def child_finish(out, fh):
+    counts = {}
+    for gp, kind in fh.history:
+        counts[gp] = counts.get(gp, 0) + 1
+    out["claims"] = counts
+    out["errors"] = ["GP%d %s (held as %s)" % e for e in fh.errors]
+    out["gp27"] = 27 in counts
+    print("@@" + json.dumps(out))
+
+
+results = []
+
+
+def check(name, cond, detail=""):
+    results.append(bool(cond))
+    print("  %s  %s%s" % ("ok  " if cond else "FAIL", name,
+                          "" if cond else "  -- " + str(detail)[:600]))
+
+
+def finish():
+    n_fail = results.count(False)
+    print("\n%d passed, %d failed" % (len(results) - n_fail, n_fail))
+    sys.exit(1 if n_fail else 0)

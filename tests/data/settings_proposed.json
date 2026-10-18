@@ -1,0 +1,229 @@
+{
+  "_note": "PROPOSED by review 2026-10-18 (not deployed). Draft select_groups format; legacy code would need the draft loader. Password masked.",
+  "wifi": {
+    "ssid": "",
+    "password": "******"
+  },
+  "device": {
+    "name": "sandswing-pico",
+    "location": "workshop"
+  },
+  "startup": {
+    "program": "concentrator.py"
+  },
+  "test": {
+    "program": "sandswing.py",
+    "enter": "tower_mark",
+    "_enter_alias": "watchdog (legacy name; not the hardware watchdog)",
+    "must_return": true
+  },
+  "probe": {
+    "presence_pulse_duty": 65535,
+    "laser_expected_ma": 5.0,
+    "present_frac_of_expected": 0.4,
+    "loopback_duty": 32768,
+    "loopback_ratio_min": 0.93,
+    "loopback_load_min": 0.75,
+    "loopback_load_max": 0.92,
+    "_lb_alias": "lb_delta replaced by ratio/load bands; 'lb' kept as alias for 'loopback' in results",
+    "_todo": "set laser_expected_ma from a metered head (5 mA stated vs ~25-27 mA bench estimate)"
+  },
+  "pins": {
+    "sense": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "laser_pwm": [
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "laser_pwm_hz": 1000,
+    "_pwm_slice_note": "RP2350 PWM: slice=(gp>>1)&7, channel A=even/B=odd. Lasers GP8-15 = slices 4A,4B,5A,5B,6A,6B,7A,7B (1 kHz). Threshold GP21 = 2B (20 kHz). Same slice+channel = one output; frequency is per slice. Checked at startup by check_pwm_slices.",
+    "neopixel": 16,
+    "neopixel_count": 6,
+    "select_groups": {
+      "tower": {
+        "a": 18,
+        "b": 19,
+        "c": 20,
+        "inh": null,
+        "settle_us": 1000
+      }
+    },
+    "adc_mux": {
+      "select": "tower",
+      "common": 26,
+      "y": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    },
+    "threshold_mux": {
+      "select": "tower",
+      "pwm_gp": 21,
+      "pwm_hz": 20000,
+      "_pwm_note": "Threshold PWM about 20 kHz, scope-tested by the user (raised from 1 kHz; REPL test script lost). This is the ONE threshold PWM frequency setting: pins_from_settings.py:226 and head_probe.py:8 still hard-code 1 kHz and should read it. GP21 replaced GP28: GP28 is slice 6A, the same output as bell 5's laser GP12. GP28 is now only the analog monitor (sense_gp). Do not move pwm_gp back to 28.",
+      "sense_gp": 28,
+      "y": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "rc": {
+        "r1": 10000,
+        "c1": 1e-07,
+        "r2": 10000,
+        "c2": 1e-06
+      },
+      "hold_c": 1e-07,
+      "readback_tol": 1024,
+      "settle_counts": 16,
+      "refresh": {
+        "tol_v": 0.005,
+        "bias_a": 2.5e-08,
+        "dwell_s": 0.001,
+        "always": true,
+        "interval_s": null,
+        "_note": "Two processes: a fast refresh loop re-writes each channel's current target (dwell_s per channel); a slow, infrequent update changes the targets as background light drifts. interval_s = max gap between refreshes of one channel, from the user's scope droop tests (authoritative; fill in). null -> datasheet estimate 100 nF x tol_v / bias_a = 20 ms, cross-check only."
+      }
+    },
+    "connector_boards": [
+      {
+        "name": "conn1",
+        "channels": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "present": true
+      },
+      {
+        "name": "conn2",
+        "channels": [
+          4,
+          5,
+          6,
+          7
+        ],
+        "present": false
+      }
+    ],
+    "_population_note": "No 'fitted' list: socket population is detected at boot by the socket classifier / loopback self-test. connector_boards only says which boards exist (1-4 fitted, 5-8 absent)."
+  },
+  "sensing": {
+    "test": {
+      "sweep_steps": 20,
+      "settle_s": 0.1,
+      "sweep_repeats": 2
+    }
+  },
+  "wheel": {
+    "rest": "dark",
+    "pattern": [
+      2,
+      1,
+      4
+    ],
+    "stand_hand": "after_four",
+    "stand_back": "after_two",
+    "stand_hold_ms": 350,
+    "t_ms": 2500,
+    "lost_mult": 1.5
+  },
+  "output": {
+    "neopixel": {
+      "pin": 16,
+      "pixel_order": "GRB",
+      "brightness": 0.4,
+      "test": {
+        "idle": [
+          0,
+          64,
+          0
+        ],
+        "reflect": [
+          64,
+          0,
+          0
+        ],
+        "status": [
+          16,
+          16,
+          16
+        ]
+      },
+      "perf": {
+        "parked": [
+          0,
+          64,
+          0
+        ],
+        "hand": [
+          0,
+          0,
+          64
+        ],
+        "back": [
+          64,
+          0,
+          0
+        ],
+        "moving": [
+          64,
+          64,
+          0
+        ],
+        "pending": [
+          0,
+          64,
+          64
+        ],
+        "fault": [
+          64,
+          0,
+          64
+        ]
+      }
+    },
+    "abell": {
+      "enabled": false,
+      "uart_id": 1,
+      "tx_pin": 22
+    },
+    "ws": {
+      "enabled": true,
+      "_note": "needs the /ws route restored in farm_ws.py (removed in 4bb04aa)"
+    },
+    "midi": {
+      "enabled": false,
+      "_note": "concentrator.py sends no MIDI"
+    },
+    "log": {
+      "enabled": false
+    }
+  }
+}
