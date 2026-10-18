@@ -33,7 +33,7 @@
       "laser_y": [0, 1, 2, 3, 4, 5, 6, 7]
     },
     "threshold_mux": {
-      "common": 27,
+      "pwm_hz": 20000,
       "a": 18,
       "b": 19,
       "c": 20,
@@ -42,8 +42,7 @@
       "pwm_gp": 21,
       "sense_gp": 28,
       "note": "PWM on GP21, filtered threshold read on GP28;"
-    },
-    "fitted": [0, 1]
+    }
   },
   "sensing": {
     "test": {

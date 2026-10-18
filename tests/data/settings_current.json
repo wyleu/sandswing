@@ -1,0 +1,175 @@
+{
+  "_note": "Transcribed from the mentor's paste 2026-10-18. Password masked. wifi.ssid and the neopixel test/perf colour values were not given: ssid left blank, colour maps copied from settings_example.json (verify).",
+  "wifi": {
+    "ssid": "",
+    "password": "******"
+  },
+  "device": {
+    "name": "sandswing-pico",
+    "location": "workshop"
+  },
+  "startup": {
+    "program": "concentrator.py"
+  },
+  "test": {
+    "program": "sandswing.py",
+    "enter": "watchdog"
+  },
+  "probe": {
+    "present_delta": 2000,
+    "lb_delta": 1000
+  },
+  "pins": {
+    "sense": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "laser_pwm": [
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "neopixel": 16,
+    "adc_mux": {
+      "common": 26,
+      "a": 18,
+      "b": 19,
+      "c": 20,
+      "inh": null,
+      "y": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    },
+    "threshold_mux": {
+      "common": 27,
+      "a": 18,
+      "b": 19,
+      "c": 20,
+      "inh": null,
+      "y": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "pwm_gp": 21,
+      "sense_gp": 28
+    },
+    "fitted": [
+      0,
+      1
+    ]
+  },
+  "sensing": {
+    "test": {
+      "sweep_steps": 20,
+      "settle_s": 0.1,
+      "sweep_repeats": 2
+    }
+  },
+  "wheel": {
+    "rest": "dark",
+    "pattern": [
+      2,
+      1,
+      4
+    ],
+    "stand_hand": "after_four",
+    "stand_back": "after_two",
+    "stand_hold_ms": 350,
+    "t_ms": 2500,
+    "lost_mult": 1.5
+  },
+  "output": {
+    "neopixel": {
+      "pin": 16,
+      "pixel_order": "GRB",
+      "brightness": 0.4,
+      "test": {
+        "idle": [
+          0,
+          64,
+          0
+        ],
+        "reflect": [
+          64,
+          0,
+          0
+        ],
+        "status": [
+          16,
+          16,
+          16
+        ]
+      },
+      "perf": {
+        "parked": [
+          0,
+          64,
+          0
+        ],
+        "hand": [
+          0,
+          0,
+          64
+        ],
+        "back": [
+          64,
+          0,
+          0
+        ],
+        "moving": [
+          64,
+          64,
+          0
+        ],
+        "pending": [
+          0,
+          64,
+          64
+        ],
+        "fault": [
+          64,
+          0,
+          64
+        ]
+      }
+    },
+    "abell": {
+      "enabled": false,
+      "uart_id": 1,
+      "tx_pin": 22
+    },
+    "ws": {
+      "enabled": true
+    },
+    "midi": {
+      "enabled": true
+    },
+    "log": {
+      "enabled": false
+    }
+  }
+}
