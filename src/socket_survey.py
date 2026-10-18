@@ -57,6 +57,8 @@ class SocketSurvey(LoopbackSelfTest):
             dn = bool(p.value)
             p.pull = old
         m["pull_follow"] = up and not dn
+        m["sense_hi"] = up and dn     # held high by the board's 4.7k pull-up
+
         return m
 
     def classify(self, bell, expected_ma=5.0):

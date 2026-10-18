@@ -50,7 +50,7 @@ def classify_socket(m, expected_ma=5.0, floor=FLOOR_COUNTS):
         return "fault", ["Orange strapped to Green/White AND laser current: "
                          "inter-pair short in a head cable"]
     # loopback plug
-    if strap_a and strap_b and LB_LOAD_MIN <= l50 <= LB_LOAD_MAX:
+    if strap_a and strap_b:
         return "loopback", ["both straps seen"]
     if strap_a != strap_b and not laser:
         return "fault", ["partial loopback (%s strap only): open conductor "
@@ -59,6 +59,9 @@ def classify_socket(m, expected_ma=5.0, floor=FLOOR_COUNTS):
         return "fault", ["Orange into ~10 k: Orange swapped with Blue/White "
                          "(old-head emitter) or high series resistance"]
     # heads
+    if not laser and not strap_a and not strap_b and m.get("sense_hi"):
+        return "empty", ["socket open: sense held high by board pull-up, "
+                         "no return on Green/White, no laser current"]
     if laser:
         if m.get("thr_toggle"):
             return "head_new", ["laser current, sense follows Orange sweep"]

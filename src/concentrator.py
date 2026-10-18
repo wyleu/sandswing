@@ -251,7 +251,12 @@ class Concentrator:
             if kind in ("old", "new", "lb"):
                 self.fitted.add(i)
                 self.tower.set_fitted(i, True)
+
             print("ch %d %s" % (i + 1, kind))
+            r = rep.get(i, {})
+            if kind != "empty":
+                print("   why", r.get("why"))
+                print("   m  ", r.get("m"))
 
     def _start_ring(self):
         """Settle, then ring.  TODO(spec C4): settle from measured delays."""

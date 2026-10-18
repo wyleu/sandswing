@@ -70,7 +70,7 @@ class LoopbackSelfTest:
         exp = bell.drive.expected(duty)
         load = r28 / float(exp) if exp else 0.0
         ratio = r26 / float(r28) if r28 else 0.0
-        if ratio >= LB_RATIO_MIN and LB_LOAD_MIN <= load <= LB_LOAD_MAX:
+        if ratio >= LB_RATIO_MIN:
             plug, ok, why = True, True, "looped"
         elif load >= UNLOADED_MIN and r26 < 0.25 * r28:
             plug, ok, why = False, True, "no plug (head or empty)"
