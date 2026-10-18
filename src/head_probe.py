@@ -7,11 +7,9 @@ import analogio
 
 PWM_FREQ = 1000
 PULSE = 32768
-MID = 32768
 SETTLE_S = 0.05
-CLASS_S = 0.02
-PRESENT_DELTA = 5000
-LB_DELTA = 10000
+CLASS_S = 0.25
+MID = 32768
 
 def _gp(n):
     return getattr(board, "GP%d" % int(n))
@@ -44,63 +42,89 @@ def _select(a, b, c, y):
     b.value = bool(y & 2)
     c.value = bool(y & 4)
 
+def _laser_present(laser, adc, present_delta):
+    laser.duty_cycle = 0
+    time.sleep(SETTLE_S)
+    dark = adc.value
+    laser.duty_cycle = PULSE
+    time.sleep(SETTLE_S)
+    lit = adc.value
+    laser.duty_cycle = 0
+    return dark, lit, (lit - dark) >= present_delta
+
+def _deltas(cfg):
+    p = (cfg or {}).get("probe", {})
+    return int(p.get("present_delta", 2000)), int(p.get("lb_delta", 1000))
+
+def _classify_held(sense_pin, laser):
+    laser.duty_cycle = 0
+    time.sleep(CLASS_S)
+    low = not sense_pin.value
+    print("  sense low=%s" % low)
+    return "old" if low else "new"
+
+def _thr_loopback(thr_gp, adc):
+    thr = pwmio.PWMOut(_gp(thr_gp), frequency=PWM_FREQ, duty_cycle=MID)
+    try:
+        time.sleep(SETTLE_S)
+        dark = adc.value
+        thr.duty_cycle = MID
+        time.sleep(SETTLE_S)
+        lit = adc.value
+        return dark, lit, lit - dark
+    finally:
+        _release(thr)
+
 def scan_heads(pinmap, cfg, sense_pins):
-    """Probe every channel. sense_pins is the list already claimed by concentrator.
-    Returns a list of 'empty'/'old'/'new'/'lb'.
+    """Probe every channel. sense_pins already claimed by concentrator.
+    Returns 'empty'/'old'/'new'/'lb'.
+
+    NOTE: threshold_mux.pwm_gp (GP28) shares PWM slice 6A with laser GP12
+    (channel 5). Do not hold thr_pwm while claiming a laser.
+    Long-term: move threshold PWM to GP21/GP22. For now thr_pwm is
+    created only for the loopback test, after the laser is released.
     """
+    
+    present_delta, lb_delta = _deltas(cfg)
     sense_gps = list(pinmap.get("sense_gp") or [])
     laser_gps = list(pinmap.get("laser_gp") or [])
     n = min(len(sense_gps), len(laser_gps), len(sense_pins))
     mux = (cfg or {}).get("pins", {}).get("adc_mux", {})
     thr = (cfg or {}).get("pins", {}).get("threshold_mux", {})
     ys = mux.get("laser_y") or list(range(8))
+    thr_gp = thr.get("pwm_gp", 28)
     results = ["empty"] * n
-    addr = adc = thr_pwm = None
+    addr = adc = None
     try:
         addr = _claim_addr(mux)
         if addr is None:
             return results
         a, b, c = addr
         adc = analogio.AnalogIn(_gp(mux.get("common", 26)))
-        thr_pwm = pwmio.PWMOut(_gp(thr.get("pwm_gp", 28)), frequency=PWM_FREQ, duty_cycle=0)
         for i in range(n):
             y = ys[i] if i < len(ys) else i
             laser = None
             try:
-                try:
-                    laser = pwmio.PWMOut(_gp(laser_gps[i]), frequency=PWM_FREQ, duty_cycle=0)
-                except Exception as e:
-                    print("ch %d laser skip: %s" % (i + 1, e))
-                    results[i] = "empty"
-                    continue
                 _select(a, b, c, y)
-                thr_pwm.duty_cycle = 0
-                time.sleep(SETTLE_S)
-                dark = adc.value
-                laser.duty_cycle = PULSE
-                time.sleep(SETTLE_S)
-                lit = adc.value
-                laser.duty_cycle = 0
-                present = (lit - dark) >= PRESENT_DELTA
+#                 td, tl, rise = _thr_loopback(thr_gp, adc)
+#                 print("ch %d thr dark=%d lit=%d rise=%d" % (i + 1, td, tl, rise))
+#                 if rise >= lb_delta:
+#                     results[i] = "lb"
+#                     continue
+                print("ch %d laser GP%d" % (i + 1, laser_gps[i]))
+                laser = pwmio.PWMOut(_gp(laser_gps[i]), frequency=PWM_FREQ, duty_cycle=0)
+                dark, lit, present = _laser_present(laser, adc, present_delta)
                 print("ch %d dark=%d lit=%d" % (i + 1, dark, lit))
                 if present:
-                    time.sleep(CLASS_S)
-                    held = not sense_pins[i].value
-                    results[i] = "old" if held else "new"
-                    continue
-                thr_pwm.duty_cycle = MID
-                time.sleep(SETTLE_S)
-                v = adc.value
-                thr_pwm.duty_cycle = 0
-                time.sleep(SETTLE_S)
-                print("ch %d thr=%d rise=%d" % (i + 1, v, v - dark))
-                if (v - dark) >= LB_DELTA:
-                    results[i] = "lb"
+                    results[i] = _classify_held(sense_pins[i], laser)
+            except Exception as e:
+                print("ch %d skip: %s" % (i + 1, e))
+                results[i] = "empty"
             finally:
                 _release(laser)
                 time.sleep(0.02)
     finally:
-        _release(thr_pwm, adc)
+        _release(adc)
         if addr:
             _release(*addr)
     return results

@@ -101,6 +101,8 @@ import digitalio
 import pwmio
 import analogio
 
+from mux4051 import Mux4051
+
 
 def _gp(n):
     return getattr(board, "GP%d" % int(n))
@@ -134,7 +136,18 @@ def load_pinmap(cfg):
     neo = int(raw.get("neopixel", 16))
     adc_laser = list(raw.get("adc_laser") or [26, 27])
     adc_pt = raw.get("adc_pt", 28)
-    threshold = raw.get("threshold_mux") or {}
+    
+    thr = raw.get("threshold_mux") or {}
+    thr_clean = {
+        "common": int(thr.get("common", 27)),
+        "a": int(thr.get("a", 18)),
+        "b": int(thr.get("b", 19)),
+        "c": int(thr.get("c", 20)),
+        "inh": thr.get("inh"),
+        "y": [int(x) for x in thr.get("y", list(range(8)))],
+        "pwm_gp": int(thr.get("pwm_gp", 21)),
+        "sense_gp": int(thr.get("sense_gp", 28)),
+    }
 
     mux = raw.get("adc_mux") or {}
     return {
@@ -147,7 +160,7 @@ def load_pinmap(cfg):
         "adc_laser_gp": [int(x) for x in adc_laser],
         "adc_pt_gp": None if adc_pt is None else int(adc_pt),
         "adc_mux": mux,
-        "threshold_mux": threshold,
+        "threshold_mux": thr_clean,
 }
 
 
@@ -194,3 +207,50 @@ def claim_lineup_hardware(pinmap, existing_leds=None):
           "neo", pinmap["neopixel_gp"], "fitted", pinmap["fitted"])
     return inputs, lasers, adc_laser, adc_pt
 
+def claim_threshold(pinmap):
+    """
+    Claim thr PWM (GP21) and the filtered-sense ADC (GP28).
+    The thr 4051 shares A/B/C with the laser mux; only its common
+    and the PWM/sense pins are claimed here.
+    Returns (thr_pwm, thr_sense, thr_mux) or (None, None, None)
+    if threshold_mux is absent.
+    """
+    thr = pinmap.get("threshold_mux")
+    print('Threshold', thr) 
+    
+    if not thr:
+        return None, None, None
+
+    thr_pwm = pwmio.PWMOut(
+        _gp(thr["pwm_gp"]),
+        frequency=1000,
+        duty_cycle=0,
+    )
+    thr_sense = analogio.AnalogIn(_gp(thr["sense_gp"]))
+    thr_mux = Mux4051(
+        common=thr["common"],
+        a = thr["a"],
+        b = thr["b"],
+        c = thr["c"],
+        y = thr["y"],
+        inh=thr.get("inh"),
+    )
+    print("THR pwm GP%d sense GP%d common GP%d"
+          % (thr["pwm_gp"], thr["sense_gp"], thr["common"]))
+    return thr_pwm, thr_sense, thr_mux
+
+def claim_muxes(pinmap):
+    laser = Mux4051(**pinmap["adc_mux"])
+    thr = None
+    print('Claim-mux', thr) 
+    if pinmap.get("threshold_mux"):
+        t = pinmap["threshold_mux"]
+        thr = Mux4051(
+            common=t["common"],
+            a=t["a"],
+            b=t["b"],
+            c=t["c"],
+            y =t["y"],
+            inh=t.get("inh")
+        )
+    return laser, thr
