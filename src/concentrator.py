@@ -215,6 +215,7 @@ class Concentrator:
             panel.PANEL_N,
             brightness=0.3,
             auto_write=False,
+            pixel_order=neopixel.RGB,
         )
         self.strip.fill((0, 0, 0))
         self.strip.show()
@@ -277,7 +278,8 @@ class Concentrator:
         self._still_held = [not pin.value for pin in self.inputs]
         self.last_false = [None] * self.n
         self.edge_at = [None] * self.n
-        self._prev_held = [False] * self.n
+        self._prev_held = list(self._still_held)
+        self._rescan_due = None
         self.high_since = [time.monotonic()] * self.n
         self.frame = panel.panel_frame({}, self.link)
         
@@ -353,6 +355,13 @@ class Concentrator:
         became = held and not prev
         released = (not held) and prev
         self._prev_held[i] = held
+        
+        if (became or released) and self.head[i] in ("lb", "empty", "fault"):
+            self._rescan_due = now        # a plug change, not a bell
+            print("ch %d plug change" % (i + 1))
+            self.tower.report(i, IDLE, False)
+            return IDLE, held
+        
         if became and self.last_false[i] is not None:
             self.edge_at[i] = now
             print("ch %d EDGE" % (i + 1))
@@ -385,6 +394,13 @@ class Concentrator:
 
     def _tower_step(self):
         """After tower.poll(): clock view, rescan on going inactive, gate."""
+        
+        if self._rescan_due is not None and \
+                time.monotonic() - self._rescan_due >= SETTLE_S:
+            self._rescan_due = None
+            with self.guard.paused_for():
+                self.rescan()
+        
         ringing = self.tower.tower in ("active", "ringing_down")
         if self.sntp is not None:
             self.sntp.set_ringing(ringing)        # spec T20
