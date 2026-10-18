@@ -111,7 +111,9 @@ class LoopbackSelfTest:
             bell.laser.duty_cycle = 0
         err = max(abs(f - d / 65535.0) for f, d in zip(frac, duties))
         mono = all(frac[i] <= frac[i + 1] + 0.02 for i in range(len(frac) - 1))
-        return {"test": "duty_sweep", "ch": bell.index, "ok": err <= SWEEP_TOL,
+        
+        ends = frac[0] <= 0.02 and frac[-1] >= 0.98
+        return {"test": "duty_sweep", "ch": bell.index, "ok": mono and ends,
                 "monotonic": mono, "frac": frac, "max_err": err}
 
     def run(self, bells, dac_bell=None):

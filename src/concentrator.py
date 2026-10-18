@@ -188,6 +188,15 @@ class Concentrator:
         self._probe_heads()          # survey borrows the tower selection
         self.selftest = self.survey.run(self._populated())   # startup only
         print("selftest ok=%s" % self.selftest["ok"])
+        
+        st = self.selftest
+        for ch, tests in st["channels"].items():
+            for name, t in tests.items():
+                if not t.get("ok"):
+                    print("   ch %d %s" % (ch + 1, name), t)
+        if not st["dac"].get("ok"):
+            print("   dac", st["dac"])
+        
         self._init_edge_state()
         self._prev_tower = self.tower.tower
         self._start_ring()
