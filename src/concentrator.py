@@ -19,7 +19,10 @@ Flow
    socket survey/classify (socket_survey -> channel_gate), loopback
    self-test, time sync (sntp_pico, if Wi-Fi and time.ntp_ips).
 2. Settle, then ring: ring.Ring holds the heads' lasers on and sends MIDI.
-3. On every tower-inactive transition: survey again, settle, ring again.
+   The watchdog (watchdog_guard, OFF by default) is armed only now, just
+   before the steady loop, and fed only from _sense_step().
+3. On every tower-inactive transition: survey again, settle, ring again
+   (the watchdog is paused around that rescan).
 The old test-program exec (settings test.program) is gone; see RETIRE.md.
 
 settings.json
@@ -73,6 +76,7 @@ from ring import Ring, open_midi
 import panel
 import report
 from board_pins import release
+from watchdog_guard import WatchdogGuard
 
 CONFIG_FILE = "settings.json"
 RING_WINDOW_S = 0.4
@@ -152,14 +156,19 @@ def emit(msg):
     if farm_log:   
         farm_log.write(msg)
         
-async def ws_poll_task():
+async def ws_poll_task(guard=None):
     while True:
         farm_ws.poll()
+        if guard is not None:
+            guard.checkin("ws_poll")       # a hung ws task stops the feeding
         await asyncio.sleep(0.05)
 
 class Concentrator:
     def __init__(self, cfg):
         self.cfg = cfg
+        # first: record why we booted (reset_reason/run_reason); never armed here
+        self.guard = WatchdogGuard(cfg.get("watchdog", {}) or {})
+        emit("boot reset=%s run=%s" % (self.guard.last_reset, self.guard.run_reason))
         self.pinmap = load_pinmap(cfg)
         self.sense_gps = self.pinmap["sense_gp"]
         self.n = len(self.sense_gps)          # set n first
@@ -262,7 +271,8 @@ class Concentrator:
         parts = {"mux": report.part(self.mux), "gate": report.part(self.gate),
                  "refresh": report.part(self.refresher),
                  "ring": report.part(self.ring),
-                 "sync": report.part(self.sntp, "boot_record")}
+                 "sync": report.part(self.sntp, "boot_record"),
+                 "watchdog": report.part(self.guard)}
         return report.build({
             "id": self.cfg.get("device", {}).get("name"),
             "name": self.cfg.get("device", {}).get("name"),
@@ -300,8 +310,13 @@ class Concentrator:
                      for c in range(4))
         activity = {"active": "ringing", "ringing_down": "ringing_down"}.get(
             self.tower.tower, "heartbeat")
+        right = self.status_slot.colour
+        if activity == "heartbeat" and self.guard.panel_state():
+            # last boot was a watchdog reset: LED6 blinks magenta with the
+            # heartbeat until acknowledged or a clean day (watchdog.ack_after_s)
+            activity, right = "watchdog_reset", (None if beat_on else (0, 0, 0))
         self.frame = panel.panel_frame(kinds, self.link, activity, beat_on,
-                                       right=self.status_slot.colour)
+                                       right=right)
         panel.paint(self.strip, self.frame)
         
     def _settle(self, i, held, now):
@@ -360,7 +375,8 @@ class Concentrator:
         if self.sntp is not None:
             self.sntp.set_ringing(ringing)        # spec T20
         if self.tower.tower == "inactive" and self._prev_tower != "inactive":
-            self.rescan()
+            with self.guard.paused_for():         # survey blocks for seconds
+                self.rescan()
         self._prev_tower = self.tower.tower
         self.gate.enforce(self.bells)
 
@@ -377,19 +393,22 @@ class Concentrator:
         self.strip.show()
         release([self.strip])
 
+    def _sense_step(self):
+        """One steady-loop pass. The only place the watchdog is fed."""
+        self.poll_sense()
+        self.tower.poll()
+        self._tower_step()
+        self.guard.loop_tick()
+
     def loop(self):
         while True:
-            self.poll_sense()
-            self.tower.poll()
-            self._tower_step()
+            self._sense_step()
             time.sleep(0.02)
             
             
     async def sense_task(self):  # or loop()
         while True:
-            self.poll_sense()
-            self.tower.poll()
-            self._tower_step()
+            self._sense_step()
             await asyncio.sleep(0.02)
 
     async def status_task(self):
@@ -398,19 +417,34 @@ class Concentrator:
             await asyncio.sleep(0.1)
             
 
-async def main():
+def start_app():
+    """Everything up to the steady loop: net, Concentrator (survey,
+    classify, self-test, ring), first time sync, server.  The watchdog is
+    armed last."""
     ip = setup_net()
     app = Concentrator(cfg)
     app.link = "wifi_only" if ip else "no_wifi"   # TODO: ws_client from farm_ws
     app.sntp = setup_sntp(ip)
+    if app.sntp is not None:
+        try:
+            app.sntp.burst_once()                 # first sync before arming
+        except Exception as e:
+            emit("first sync failed: %s" % e)
     start_server(cfg, app.status_payload)
-    tasks = [app.sense_task(), app.status_task(), ws_poll_task(),
+    app.guard.arm()
+    return app
+
+
+async def main():
+    app = start_app()
+    tasks = [app.sense_task(), app.status_task(), ws_poll_task(app.guard),
              app.refresher.run()]
     if app.sntp is not None:
         tasks.append(app.sntp.run())
     try:
         await asyncio.gather(*tasks)
     finally:
+        app.guard.disarm("exit")                  # Ctrl-C: REPL is not reset under you
         app.close()
         if farm_log:
             try:

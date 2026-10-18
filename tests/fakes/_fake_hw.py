@@ -3,6 +3,7 @@ claimed = {}      # gp -> owner description
 history = []      # (gp, kind) for every successful claim
 errors = []       # every 'GPxx in use' raised (even if the caller swallowed it)
 pwm = {}          # gp -> live PWMOut (for the GP28 RC-node fake)
+wdt_log = []      # (what, value, claims so far) for the fake watchdog
 din_fn = {}       # gp -> callable, test override of an input level
 adc_fn = {}       # gp -> callable, test override of an AnalogIn value
 

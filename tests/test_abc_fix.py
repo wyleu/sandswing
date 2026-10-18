@@ -14,18 +14,29 @@
 #
 # Fake board/digitalio/analogio/pwmio/neopixel/wifi raise ValueError('GPxx in
 # use') on a double claim, like CircuitPython.  Each scenario runs in a fresh
-# subprocess with src = ORIGINAL (/workspace/sandswing/src) or PATCHED
-# (/workspace/abc_fix/src overlaid on the original).
+# subprocess with src = ORIGINAL or PATCHED.
+#
+# ORIGINAL = $SANDSWING_ORIG_SRC, else this repo's own src/.  The 3 ORIGINAL
+# checks need the pre-restructure files (head_probe.py, mux4051.py); when
+# they are not there (they are retired on branch 'restructure') the checks
+# are SKIPPED, not failed:  "skipped: original code retired".
+#   SANDSWING_ORIG_SRC=/path/to/old/src python3 tests/test_abc_fix.py
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ORIG = "/workspace/sandswing/src"
 PATCHED = os.path.join(os.path.dirname(HERE), "src")
+ORIG = os.environ.get("SANDSWING_ORIG_SRC") or PATCHED
+ORIG_FILES = ("head_probe.py", "mux4051.py")
+
+
+def have_original():
+    return all(os.path.exists(os.path.join(ORIG, f)) for f in ORIG_FILES)
 SETTINGS = os.path.join(HERE, "data", "settings_current.json")
 
 
@@ -100,9 +111,19 @@ def check(name, cond, detail=""):
                           "" if cond else "  -- " + str(detail)))
 
 
+def skip(name, why="original code retired"):
+    results.append(None)
+    print("  skip  %s  -- skipped: %s" % (name, why))
+
+
 def main():
     print("ORIGINAL mux_blend (harness must reproduce the bug)")
     for sv in ("with_common27", "no_common"):
+        if not have_original():
+            skip("original/%s fails with 'GP18 in use'" % sv)
+            if sv == "with_common27":
+                skip("original/%s claims phantom GP27 first" % sv)
+            continue
         r = run("orig", sv, "concentrator")
         check("original/%s fails with 'GP18 in use'" % sv,
               not r["ok"] and "GP18 in use" in r.get("exc", ""), r.get("exc"))
@@ -138,14 +159,16 @@ def main():
         if name.startswith("test_") and open(os.path.join(HERE, name)).read().startswith("# tests for "):
             p = subprocess.run([sys.executable, os.path.join(HERE, name)],
                                capture_output=True, text=True, cwd=HERE)
-            last = p.stdout.strip().splitlines()[-1]
-            ps, fs = [int(x.split()[0]) for x in last.split(", ")]
+            m = re.findall(r"^(\d+) passed, (\d+) failed", p.stdout, re.M)
+            ps, fs = (int(m[-1][0]), int(m[-1][1])) if m else (0, 1)
             tot_p, tot_f = tot_p + ps, tot_f + fs + (1 if p.returncode and not fs else 0)
     last = "%d passed, %d failed" % (tot_p, tot_f)
     check("draft tests: " + last, tot_f == 0 and tot_p == 49, last)
 
     n_fail = results.count(False)
-    print("\n%d passed, %d failed" % (len(results) - n_fail, n_fail))
+    n_skip = results.count(None)
+    print("\n%d passed, %d failed, %d skipped"
+          % (len(results) - n_fail - n_skip, n_fail, n_skip))
     sys.exit(1 if n_fail else 0)
 
 

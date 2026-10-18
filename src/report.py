@@ -9,6 +9,9 @@ def build(facts, parts, panel_fields=None):
     Adds them under "parts", plus the panel fields."""
     doc = from_concentrator(facts)
     doc["parts"] = dict((k, v) for k, v in parts.items() if v is not None)
+    wd = doc["parts"].get("watchdog")
+    if wd:
+        doc["last_reset"] = wd.get("last_reset")      # e.g. "WATCHDOG"
     if panel_fields:
         doc.update(panel_fields)
     return doc

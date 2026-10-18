@@ -101,7 +101,7 @@ def main():
         check(t + " set_ringing follows tower", r.get("sntp_calls") == [True, False, True, False],
               r.get("sntp_calls"))
         check(t + " payload: 6 panel LEDs + parts", r.get("panel_len") == 6 and
-              r.get("parts") == ["gate", "mux", "refresh", "ring", "sync"], (r.get("panel_len"), r.get("parts")))
+              r.get("parts") == ["gate", "mux", "refresh", "ring", "sync", "watchdog"], (r.get("panel_len"), r.get("parts")))
         if sv == "with_common27":
             check(t + " common 27 warned", r.get("warn27"))
     r = spawn(me, "head")

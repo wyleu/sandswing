@@ -13,11 +13,14 @@ NEXT_SRC = os.path.join(os.path.dirname(HERE), "src")
 SETTINGS = os.path.join(HERE, "data", "settings_current.json")
 
 
-def spawn(test_file, scenario, settings_edit=None, src=NEXT_SRC, extra_src=None):
+def spawn(test_file, scenario, settings_edit=None, src=NEXT_SRC, extra_src=None,
+          patch=None):
+    """patch: dict merged into the top level of settings.json."""
     d = tempfile.mkdtemp(prefix="ssn_")
     s = json.load(open(SETTINGS))
     if settings_edit == "no_common":
         s["pins"]["threshold_mux"].pop("common", None)
+    s.update(patch or {})
     json.dump(s, open(os.path.join(d, "settings.json"), "w"))
     args = [sys.executable, test_file, "--child", scenario, src, extra_src or ""]
     p = subprocess.run(args, cwd=d, capture_output=True, text=True, timeout=300)
@@ -57,7 +60,14 @@ def check(name, cond, detail=""):
                           "" if cond else "  -- " + str(detail)[:600]))
 
 
+def skip(name, why):
+    results.append(None)
+    print("  skip  %s  -- skipped: %s" % (name, why))
+
+
 def finish():
     n_fail = results.count(False)
-    print("\n%d passed, %d failed" % (len(results) - n_fail, n_fail))
+    n_skip = results.count(None)
+    print("\n%d passed, %d failed, %d skipped"
+          % (len(results) - n_fail - n_skip, n_fail, n_skip))
     sys.exit(1 if n_fail else 0)
