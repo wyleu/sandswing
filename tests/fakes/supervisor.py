@@ -22,3 +22,10 @@ class _Runtime:
 
 
 runtime = _Runtime()
+
+
+
+def ticks_ms():
+    """Like CircuitPython: ms since boot, wrapping at 2**29."""
+    import time
+    return int(time.monotonic() * 1000) & ((1 << 29) - 1)

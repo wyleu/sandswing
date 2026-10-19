@@ -1,4 +1,7 @@
 # farm_ws.py — HTTP /status + one /ws client (Sand* farm)
+#
+# Shared by sandswing, sandsense, and other timed Sand* devices.
+# Pattern for /ws accept taken from sandsense (Websocket(request)).
 import json
 import wifi
 import adafruit_connection_manager
@@ -13,6 +16,7 @@ _server = None
 _ws = None
 _payload_fn = lambda: {}
 
+
 def wifi_candidates(cfg):
     nets = (cfg.raw.get("wifi") or {}).get("networks") or []
     if nets:
@@ -20,6 +24,7 @@ def wifi_candidates(cfg):
     ssid = cfg.get_str("wifi.ssid", "")
     pw = cfg.get_str("wifi.password", "")
     return [{"ssid": ssid, "password": pw}] if ssid else []
+
 
 def connect_wifi(cfg):
     last = None
@@ -38,8 +43,9 @@ def connect_wifi(cfg):
     print("WiFi failed:", last)
     return False
 
+
 def start_server(cfg, payload_fn):
-    """payload_fn() -> dict for GET /status."""
+    """payload_fn() -> dict for GET /status. Also accepts one /ws client."""
     global _server, _payload_fn
     _payload_fn = payload_fn
     if not HAS_HTTP:
@@ -71,6 +77,20 @@ def start_server(cfg, payload_fn):
                 headers={"Access-Control-Allow-Origin": "*"},
             )
 
+        @server.route(path_ws, GET)
+        def ws_route(request: Request):
+            # One client at a time (sandstore or sandbells). Same pattern as
+            # sandsense: replace any previous socket on reconnect.
+            global _ws
+            if _ws is not None:
+                try:
+                    _ws.close()
+                except Exception:
+                    pass
+            _ws = Websocket(request)
+            print("WS client connected")
+            return _ws
+
         host = str(wifi.radio.ipv4_address)
         server.start(host=host, port=port)
         print("HTTP http://%s%s" % (host, path_status))
@@ -82,24 +102,51 @@ def start_server(cfg, payload_fn):
         _server = None
         return None
 
+
+def _drop(why):
+    """Forget the client; close its socket quietly."""
+    global _ws
+    if _ws is not None:
+        try:
+            _ws.close()
+        except Exception:
+            pass
+    _ws = None
+    print("WS client dropped:", why)
+
+
 def poll():
+    """Accept HTTP/WS requests, then read one frame from the WS client so
+    pings get a pong and a client's close (or a dead socket) is noticed."""
     if _server:
         try:
             _server.poll()
         except Exception as e:
             print("ws poll:", e)
+    if _ws is not None:
+        try:
+            _ws.receive(fail_silently=True)   # handles ping/pong/close; we ignore data
+        except Exception as e:
+            _drop(e)
+            return
+        if _ws is not None and _ws.closed:
+            _drop("closed")
+
 
 def send(obj):
-    global _ws
+    """Send one JSON message; False if no client or it has gone."""
     if _ws is None:
+        return False
+    if _ws.closed:
+        _drop("closed")
         return False
     try:
         _ws.send_message(json.dumps(obj), fail_silently=True)
         return True
-    except Exception:
-        _ws = None
-        print("WS client dropped")
+    except Exception as e:
+        _drop(e)
         return False
+
 
 def ws_connected():
     return _ws is not None

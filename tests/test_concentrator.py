@@ -17,6 +17,10 @@ class FakeSntp:
     def boot_record(self):
         return {"sync": "fake"}
 
+    def stamp(self, raw_tick=None):
+        return {"tick_ms": 0, "utc_ms": None, "err_ms": None,
+                "sync": "unsynced", "acc": None, "epoch": 0,
+                "session": 0, "mode": "fake"}
 
 def child(scenario, src, extra):
     fh = child_setup(src, extra)

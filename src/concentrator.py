@@ -49,6 +49,7 @@ import board
 import digitalio
 import neopixel
 import wifi
+import os
 
 try:
     import farm_log
@@ -77,6 +78,9 @@ import panel
 import report
 from board_pins import release
 from watchdog_guard import WatchdogGuard
+from sand_event import Emitter
+from sntp_pico import TickClock
+
 
 CONFIG_FILE = "settings.json"
 RING_WINDOW_S = 0.4
@@ -173,7 +177,15 @@ class Concentrator:
         self.sense_gps = self.pinmap["sense_gp"]
         self.n = len(self.sense_gps)          # set n first
         self.link = "no_wifi"
-        self.sntp = None                      # set by main() if time sync is up
+        self.sntp = None
+            
+        self.ticks = TickClock()
+        self.events = Emitter(src="sandswing",
+                              device_id=cfg.get("device", {}).get("name", "concentrator"),
+                              boot_id=os.urandom(4).hex(),
+                              ticks=self.ticks)
+
+                                        # set by main() if time sync is up
         self._setup_sense()          # now claim the sense pins for the rest of the run
         self._setup_strip()
         self._setup_tower()
@@ -364,11 +376,13 @@ class Concentrator:
             self._rescan_due = now        # a plug change, not a bell
             print("ch %d plug change" % (i + 1))
             self.tower.report(i, IDLE, False)
-            return IDLE, held
+            return IDLE, held  
         
         if became and self.last_false[i] is not None:
             self.edge_at[i] = now
             print("ch %d EDGE" % (i + 1))
+            send(self.events.make(self.sntp, "stroke", {"ch": i + 1}))
+            
         if not held:
             self.last_false[i] = now
             if self.tower.test_mark[i]:
@@ -397,8 +411,7 @@ class Concentrator:
         print("rescan", self.head)
 
     def _tower_step(self):
-        """After tower.poll(): clock view, rescan on going inactive, gate."""
-        
+        """After tower.poll(): plug-change rescan after SETTLE_S, clock view, gate."""
         if self._rescan_due is not None and \
                 time.monotonic() - self._rescan_due >= SETTLE_S:
             self._rescan_due = None
@@ -408,9 +421,7 @@ class Concentrator:
         ringing = self.tower.tower in ("active", "ringing_down")
         if self.sntp is not None:
             self.sntp.set_ringing(ringing)        # spec T20
-        if self.tower.tower == "inactive" and self._prev_tower != "inactive":
-            with self.guard.paused_for():         # survey blocks for seconds
-                self.rescan()
+
         self._prev_tower = self.tower.tower
         self.gate.enforce(self.bells)
 
@@ -458,7 +469,9 @@ def start_app():
     ip = setup_net()
     app = Concentrator(cfg)
     app.link = "wifi_only" if ip else "no_wifi"   # TODO: ws_client from farm_ws
+
     app.sntp = setup_sntp(ip)
+    
     if app.sntp is not None:
         try:
             app.sntp.burst_once()                 # first sync before arming

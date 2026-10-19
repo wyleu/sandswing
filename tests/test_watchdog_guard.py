@@ -3,6 +3,8 @@
 import os
 import re
 import sys
+import time
+
 from hw import spawn, child_setup, child_finish, check, finish, NEXT_SRC
 
 ON = {"watchdog": {"enabled": True, "timeout_s": 8, "mode": "reset",
@@ -184,9 +186,10 @@ def child(scenario, src, extra):
         app.guard.checkin("ws_poll")
         # rescan pauses the watchdog
         n = len(fh.wdt_log)
-        for st in ("active", "inactive"):
-            app.tower.tower = st
-            app._tower_step()
+
+        app._rescan_due = time.monotonic() - concentrator.SETTLE_S - 1   # plug change, settled
+        app._tower_step()
+        
         out["rescan_log"] = [e[:2] for e in fh.wdt_log[n:]]
         out["mode_after_rescan"] = None if wdt.mode is None else str(wdt.mode)
         app.tower.tower = "inactive"
