@@ -37,9 +37,13 @@ LED_KIND = {
 
 LED_LINK = {"ws_client": (0, 32, 0), "wifi_only": (0, 0, 32),
             "no_wifi": (32, 12, 0), "error": (48, 0, 0)}
-LED_ACTIVITY = {"heartbeat": (8, 8, 8), "ringing": (0, 32, 0),
-                "ringing_down": (32, 16, 0), "selftest": (0, 24, 24),
-                "watchdog_reset": (48, 0, 48)}
+LED_ACTIVITY = {
+    "heartbeat": (8, 8, 8),
+    "heartbeat_nosync": (40, 0, 0),   # dim amber – no timing lock
+    "ringing": (0, 32, 0),
+    "ringing_down": (32, 16, 0), "selftest": (0, 24, 24),
+    "watchdog_reset": (48, 0, 48)
+    }
 
 def _flash_on(rate, beat_on):
     """rate 0 = solid. Higher = more off-time."""
@@ -56,16 +60,18 @@ def panel_frame(kinds, link="no_wifi", activity="heartbeat",
         if not _flash_on(rate, beat_on):
             colour = (0, 0, 0)
         out.append({"rgb": colour, "state": k})
+        
     a = LED_ACTIVITY.get(activity, LED_ACTIVITY["heartbeat"])
     if right is not None:
         a = right
-    if not beat_on and activity == "heartbeat" and right is None:
+        
+    if not beat_on and activity in ("heartbeat", "heartbeat_nosync") and right is None:
         a = (0, 0, 0)
+        
     out.append({"rgb": tuple(a), "state": activity})
     return out
 
 # panel_pixels, paint, payload, StatusSlot unchanged from original
-
 
 
 def panel_pixels(kinds, link="no_wifi", activity="heartbeat", beat_on=True,

@@ -2,38 +2,39 @@
 concentrator.py
 ===============
 Boot program for the concentrator Pico.
-
 code.py stays the launcher and should name this file in
 settings.json -> startup.program. This file does not replace the launcher.
 
-It owns the tower. tower_watch.py decides active, ringing-down, inactive,
-the day-tick, the test marks, and the status colour. This file feeds it
-head reports.
-
-It is the root: it builds every object and hands each one what it needs.
-Leaf modules never import each other's internals.
+It owns the tower and is the root: it builds every object and hands each
+one what it needs. Leaf modules never import each other's internals.
 
 Flow
 ----
-1. Startup tests: PWM slice check (tower_build, before any claim),
-   socket survey/classify (socket_survey -> channel_gate), loopback
-   self-test, time sync (sntp_pico, if Wi-Fi and time.ntp_ips).
-2. Settle, then ring: ring.Ring holds the heads' lasers on and sends MIDI.
-   The watchdog (watchdog_guard, OFF by default) is armed only now, just
-   before the steady loop, and fed only from _sense_step().
-3. On every tower-inactive transition: survey again, settle, ring again
-   (the watchdog is paused around that rescan).
+1. Startup: PWM slice check (tower_build), sense/laser/mux setup,
+   early panel indication, loopback self-test, time sync (sntp_pico,
+   if Wi-Fi and time.ntp_ips).
+2. Survey lifecycle is owned by SurveyState (idle / examining /
+   surveying / settled). concentrator only triggers it (boot, plug-change
+   edge, or explicit) and awaits step() from the sense task.
+   survey_all / measure / classify yield so the panel can update during
+   assessment.
+3. Panel LEDs are owned by panel_task. It reads the current phase and
+   kinds and flashes from panel.LED_KIND rates. LED6 shows the colour
+   tower_watch decides (via StatusSlot). The same frame goes to the strip
+   and to the ws payload.
+4. Ring: after settle, ring.Ring holds the heads' lasers and sends MIDI.
+   The watchdog (watchdog_guard, OFF by default) is armed only after
+   startup, just before the steady loop, and fed only from _sense_step().
+5. Steady loop (sense_task): poll sense, tower, gate, await survey step,
+   feed watchdog. panel_task and status/ws tasks run alongside.
+
 The old test-program exec (settings test.program) is gone; see RETIRE.md.
+On tower-inactive the absolute head state can be re-assessed by triggering
+SurveyState; ringing mode does not survey.
 
 settings.json
 -------------
   "startup": { "program": "concentrator.py" }
-
-Status
-------
-Six panel LEDs, one function: panel.panel_frame.  LED6 shows the colour
-tower_watch.py decides (it paints a StatusSlot, not the strip).  The
-same frame goes to the strip and to the ws payload.
 
 Pins
 ----
@@ -89,6 +90,8 @@ SETTLE_S = 0.3
 HEAD_NAME = {"head_new": "new", "head_old": "old", "loopback": "lb",
              "empty": "empty", "no_board": "empty", "fault": "fault",
              "unknown": "unknown"}
+
+HEARTBEAT_LENGTH = 1.25
 
 server = None
 
@@ -178,6 +181,10 @@ class Concentrator:
         self.n = len(self.sense_gps)          # set n first
         self.link = "no_wifi"
         self.sntp = None
+        
+        self._inactive_since = None
+        self._inactive_surveyed = False
+        self._empty_check = 0
             
         self.ticks = TickClock()
         self.events = Emitter(src="sandswing",
@@ -201,7 +208,8 @@ class Concentrator:
             paint_fn=lambda kinds, beat: self._paint_kinds(kinds, beat),
         )
         self.survey_state.trigger("boot")
-        
+        self._inactive_surveyed = True
+        self._inactive_since = time.monotonic()
         
         self.refresher = refresher_from_cfg(self.mux, self.bells,
                                             self.pinmap["raw"].get("threshold_mux") or {},
@@ -214,7 +222,6 @@ class Concentrator:
 
         self.selftest = self.survey.run(self._populated())   # startup only
         
-        self._surveyed_while_inactive = False
         print("selftest ok=%s" % self.selftest["ok"])
         
         st = self.selftest
@@ -281,63 +288,6 @@ class Concentrator:
         on = [c for bd in boards if bd.get("present") is not False for c in bd["channels"]]
         return [b for b in self.bells if b.index in on]
 
-
-    def _probe_heads(self):
-        self.ring.stop()
-        if not hasattr(self, "kinds"):
-            self.kinds = {}
-
-        # clear latched faults so a corrected plug can leave the fault state
-        for i in range(self.n):
-            self.gate.clear(i)
-
-        ch = getattr(self, "_rescan_ch", None)
-        if ch is None:
-            # boot: flash all channels cyan
-            for b in self.bells:
-                self.kinds[b.index] = "examining"
-            for _ in range(3):
-                self._paint(True)
-                time.sleep(0.15)
-                self._paint(False)
-                time.sleep(0.15)
-        else:
-            # plug-change rescan: flash only the channel that changed
-            if 0 <= ch < len(self.bells):
-                self.kinds[ch] = "examining"
-                for _ in range(4):
-                    self._paint(True)
-                    time.sleep(0.15)
-                    self._paint(False)
-                    time.sleep(0.15)
-            self._rescan_ch = None
-
-        # leave cyan on so the panel stays alive during the long survey
-#         for b in self.bells:
-#             self.kinds[b.index] = "examining"
-#         self._paint(True)
-
-        rep = survey_all(self.survey, self.bells, self.gate, self._boards())
-
-        self.kinds = dict((c, r["kind"]) for c, r in rep.items())
-        self.gate.enforce(self.bells)
-        self.head = [HEAD_NAME.get(self.kinds.get(i, "unknown"), "unknown")
-                     for i in range(self.n)]
-        self.fitted = set()
-
-        # show the final colours immediately
-        self._paint(True)
-
-        for i, kind in enumerate(self.head):
-            if kind in ("old", "new", "lb"):
-                self.fitted.add(i)
-                self.tower.set_fitted(i, True)
-            print("%.3f ch %d %s" % (time.monotonic(), i + 1, kind))
-            r = rep.get(i, {})
-            if kind != "empty":
-                print("   why", r.get("why"))
-                print("   m  ", r.get("m"))
-
     def _start_ring(self):
         """Settle, then ring.  TODO(spec C4): settle from measured delays."""
         time.sleep(SETTLE_S)
@@ -388,6 +338,8 @@ class Concentrator:
         for i, pin in enumerate(self.inputs):
             kind, held = self._channel(i, pin, now)
         self.ring.poll()
+        
+        self._watch_empty(now)
 
         tpm = (self.cfg.get("escapement", {}) or {}).get("tpm", 48)
         period = 120.0 / tpm                 # one pulse per two clock beats
@@ -403,8 +355,16 @@ class Concentrator:
         tripped = self.ring.tripped()
         kinds = dict((c, "response" if c in tripped else self.kinds.get(c, "unknown"))
                      for c in range(4))
+        
+        
         activity = {"active": "ringing", "ringing_down": "ringing_down"}.get(
             self.tower.tower, "heartbeat")
+        
+        if activity == "heartbeat":
+            synced = self.sntp is not None and getattr(self.sntp, "synced", False)
+            if not synced:
+                activity = "heartbeat_nosync"
+        
         right = None if self.tower.tower == "inactive" else self.status_slot.colour
         
         if activity == "heartbeat" and self.guard.panel_state():
@@ -470,27 +430,55 @@ class Concentrator:
         self._settle(i, held, now)
         return kind, held
 
-    def rescan(self):
-        self._probe_heads()
-        self._start_ring()
-        print("%.3f rescan %s" % (time.monotonic(), self.head))
 
     def _tower_step(self):
-        """
-        After tower.poll(): plug-change rescan after SETTLE_S, clock view, gate.
-        """
+        now = time.monotonic()
+        if self.tower.tower == "inactive":
+            if self._inactive_since is None:
+                self._inactive_since = now
+                self._inactive_surveyed = False
+            elif (not self._inactive_surveyed and
+                  now - self._inactive_since > 2.0):
+                self.survey_state.trigger("inactive")
+                self._inactive_surveyed = True
+        else:
+            self._inactive_since = None
+            self._inactive_surveyed = False
+            
+        ringing = self.tower.tower in ("active", "ringing_down")
+        if self.sntp is not None:
+            self.sntp.set_ringing(ringing)
+        self._prev_tower = self.tower.tower
+        self.gate.enforce(self.bells)
         
-        ringing = self.tower.tower in ("active", "ringing_down")
-        if self.sntp is not None:
-            self.sntp.set_ringing(ringing)
-        self._prev_tower = self.tower.tower
-        self.gate.enforce(self.bells)
+    def _watch_empty(self, now):
+        if now - getattr(self, "_empty_check", 0) < 1.0:
+            return
+        self._empty_check = now
+        for i, kind in enumerate(self.head):
+            if kind != "empty":
+                continue
+            if self._laser_current_present(i):
+                self.survey_state.trigger("empty-head", channel=i)
+                break
 
-        ringing = self.tower.tower in ("active", "ringing_down")
-        if self.sntp is not None:
-            self.sntp.set_ringing(ringing)
-        self._prev_tower = self.tower.tower
-        self.gate.enforce(self.bells)
+    def _laser_current_present(self, i):
+        """True if this channel’s laser shows current (same path as di_ma)."""
+        from laser_measure import counts_to_ma
+        bell = self.bells[i]
+        try:
+            with self.mux.select(bell):          # or self.tower / whatever select you use
+                bell.laser.duty_cycle = 0
+                dark = bell.sense.adc.value if hasattr(bell.sense, "adc") else 0
+                bell.laser.duty_cycle = 65535
+                time.sleep(0.02)
+                on = bell.sense.adc.value if hasattr(bell.sense, "adc") else 0
+                bell.laser.duty_cycle = 0
+            ma = counts_to_ma(on - dark)
+            return ma > 5.0                      # same threshold classify uses
+        except Exception:
+            bell.laser.duty_cycle = 0
+            return False
 
     def close(self):
         """Release everything this file and tower_build claimed."""
@@ -504,20 +492,15 @@ class Concentrator:
         self.strip.fill((0, 0, 0))
         self.strip.show()
         release([self.strip])
+     
 
-    async def _sense_step(self):          # make it async
+    async def _sense_step(self):       
         self.poll_sense()
         self.tower.poll()
         self._tower_step()
         await self.survey_state.step(True)
         self.guard.loop_tick()
 
-    def loop(self):
-        while True:
-            self._sense_step()
-            time.sleep(0.02)
-            
-            
     async def sense_task(self):  # or loop()
         while True:
             await self._sense_step()
@@ -537,19 +520,26 @@ class Concentrator:
             ch = getattr(self.survey_state, "_pending_ch", None)
             if override:
                 if ch is not None:
-                    # only the changed channel
                     kinds = dict(self.kinds)
                     kinds[ch] = override
                 else:
-                    # boot: all channels
                     kinds = {i: override for i in range(4)}
             else:
                 kinds = self.survey_state.kinds or self.kinds
+
+            # channel flash from LED_KIND rate
             rate = 0
             if override and override in P.LED_KIND:
                 rate = P.LED_KIND[override][1]
-            on = True if rate <= 0 else ((time.monotonic() * (rate + 1)) % 1.0) < 0.5
-            self._paint_kinds(kinds, on)
+            channel_on = True if rate <= 0 else ((time.monotonic() * (rate + 1)) % 1.0) < 0.5
+
+            # heartbeat beat (always toggles)
+            heartbeat_on = (time.monotonic() % HEARTBEAT_LENGTH) < (HEARTBEAT_LENGTH /2) 
+
+            # paint channels with channel_on; heartbeat uses heartbeat_on
+            # simplest: call _paint with heartbeat_on so LED6 flashes,
+            # and let panel_frame blank channels only when their own rate says so
+            self._paint_kinds(kinds, heartbeat_on if rate == 0 else channel_on)
             await asyncio.sleep(0.05)
         
 def start_app():
