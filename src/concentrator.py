@@ -268,6 +268,10 @@ class Concentrator:
 
         if not hasattr(self, "kinds"):
             self.kinds = {}
+            
+        # clear latched faults so a corrected plug can leave the fault state
+        for i in range(self.n):
+            self.gate.clear(i)
 
         ch = getattr(self, "_rescan_ch", None)
 
@@ -293,13 +297,12 @@ class Concentrator:
         # ... rest of the method unchanged
 
 
-
-
         self.kinds = dict((c, r["kind"]) for c, r in rep.items())
         self.gate.enforce(self.bells)
         self.head = [HEAD_NAME.get(self.kinds.get(i, "unknown"), "unknown")
                      for i in range(self.n)]
         self.fitted = set()
+        
         for i, kind in enumerate(self.head):
             if kind in ("old", "new", "lb"):
                 self.fitted.add(i)
