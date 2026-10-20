@@ -261,9 +261,40 @@ class Concentrator:
         on = [c for bd in boards if bd.get("present") is not False for c in bd["channels"]]
         return [b for b in self.bells if b.index in on]
 
+
+
     def _probe_heads(self):
-        self.ring.stop()                          # lasers off, notes off
+        self.ring.stop()
+
+        if not hasattr(self, "kinds"):
+            self.kinds = {}
+
+        ch = getattr(self, "_rescan_ch", None)
+
+        if ch is None:
+            # boot (or any survey that is not a plug-change rescan):
+            # light all channels immediately
+            for b in self.bells:
+                self.kinds[b.index] = "examining"
+            self._paint(True)
+            time.sleep(0.2)
+        else:
+            # plug-change rescan: flash only the channel that changed
+            if 0 <= ch < len(self.bells):
+                self.kinds[ch] = "examining"
+                for _ in range(4):
+                    self._paint(True)
+                    time.sleep(0.15)
+                    self._paint(False)
+                    time.sleep(0.15)
+            self._rescan_ch = None
+
         rep = survey_all(self.survey, self.bells, self.gate, self._boards())
+        # ... rest of the method unchanged
+
+
+
+
         self.kinds = dict((c, r["kind"]) for c, r in rep.items())
         self.gate.enforce(self.bells)
         self.head = [HEAD_NAME.get(self.kinds.get(i, "unknown"), "unknown")
@@ -373,10 +404,11 @@ class Concentrator:
         self._prev_held[i] = held
         
         if (became or released) and self.head[i] in ("lb", "empty", "fault"):
-            self._rescan_due = now        # a plug change, not a bell
+            self._rescan_due = now
+            self._rescan_ch = i          # remember which channel
             print("ch %d plug change" % (i + 1))
             self.tower.report(i, IDLE, False)
-            return IDLE, held  
+            return IDLE, held
         
         if became and self.last_false[i] is not None:
             self.edge_at[i] = now
