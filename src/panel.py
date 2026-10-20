@@ -31,6 +31,7 @@ LED_KIND = {
     "fault":     ((48, 0, 0), 2),
     "unknown":   ((8, 8, 8), 0),
     "examining": ((0, 48, 48), 3),   # cyan, fast – while a channel is being surveyed
+    "surveying": ((0, 48, 48), 1),   # slow cyan  (add this)
     "response":  ((48, 48, 48), 0),
 }
 

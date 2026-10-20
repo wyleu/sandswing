@@ -80,7 +80,7 @@ from board_pins import release
 from watchdog_guard import WatchdogGuard
 from sand_event import Emitter
 from sntp_pico import TickClock
-
+from survey_state import SurveyState
 
 CONFIG_FILE = "settings.json"
 RING_WINDOW_S = 0.4
@@ -188,17 +188,33 @@ class Concentrator:
                                         # set by main() if time sync is up
         self._setup_sense()          # now claim the sense pins for the rest of the run
         self._setup_strip()
+        
         self._setup_tower()
         self._setup_mux()            # one A/B/C owner; PWM slice check first
         self._setup_lasers()
         self.gate = ChannelGate(self.n)
         self.survey = SocketSurvey(self.mux)
+
+        self.survey_state = SurveyState(
+            n_channels=self.n,
+            survey_fn=lambda: survey_all(self.survey, self.bells, self.gate, self._boards()),
+            paint_fn=lambda kinds, beat: self._paint_kinds(kinds, beat),
+        )
+        self.survey_state.trigger("boot")
+        
+        
         self.refresher = refresher_from_cfg(self.mux, self.bells,
                                             self.pinmap["raw"].get("threshold_mux") or {},
                                             gate=self.gate)
         self.ring = Ring(self.inputs, self.lasers, midi=open_midi())
-        self._probe_heads()          # survey borrows the tower selection
+        
+        # early boot indication — before the long self-test
+        self.kinds = {i: "examining" for i in range(min(4, self.n))}
+        self._paint_kinds(self.kinds, True)
+
         self.selftest = self.survey.run(self._populated())   # startup only
+        
+        self._surveyed_while_inactive = False
         print("selftest ok=%s" % self.selftest["ok"])
         
         st = self.selftest
@@ -211,8 +227,12 @@ class Concentrator:
         
         self._init_edge_state()
         self._prev_tower = self.tower.tower
+        
+        self.head = ["unknown"] * self.n
+        self.kinds = {}
+        self.fitted = set()
+        
         self._start_ring()
-        print("heads", self.head)
 
     def _setup_sense(self):
         self.sense_gps = self.pinmap["sense_gp"]
@@ -262,26 +282,25 @@ class Concentrator:
         return [b for b in self.bells if b.index in on]
 
 
-
     def _probe_heads(self):
         self.ring.stop()
-
         if not hasattr(self, "kinds"):
             self.kinds = {}
-            
+
         # clear latched faults so a corrected plug can leave the fault state
         for i in range(self.n):
             self.gate.clear(i)
 
         ch = getattr(self, "_rescan_ch", None)
-
         if ch is None:
-            # boot (or any survey that is not a plug-change rescan):
-            # light all channels immediately
+            # boot: flash all channels cyan
             for b in self.bells:
                 self.kinds[b.index] = "examining"
-            self._paint(True)
-            time.sleep(0.2)
+            for _ in range(3):
+                self._paint(True)
+                time.sleep(0.15)
+                self._paint(False)
+                time.sleep(0.15)
         else:
             # plug-change rescan: flash only the channel that changed
             if 0 <= ch < len(self.bells):
@@ -293,22 +312,27 @@ class Concentrator:
                     time.sleep(0.15)
             self._rescan_ch = None
 
-        rep = survey_all(self.survey, self.bells, self.gate, self._boards())
-        # ... rest of the method unchanged
+        # leave cyan on so the panel stays alive during the long survey
+#         for b in self.bells:
+#             self.kinds[b.index] = "examining"
+#         self._paint(True)
 
+        rep = survey_all(self.survey, self.bells, self.gate, self._boards())
 
         self.kinds = dict((c, r["kind"]) for c, r in rep.items())
         self.gate.enforce(self.bells)
         self.head = [HEAD_NAME.get(self.kinds.get(i, "unknown"), "unknown")
                      for i in range(self.n)]
         self.fitted = set()
-        
+
+        # show the final colours immediately
+        self._paint(True)
+
         for i, kind in enumerate(self.head):
             if kind in ("old", "new", "lb"):
                 self.fitted.add(i)
                 self.tower.set_fitted(i, True)
-
-            print("ch %d %s" % (i + 1, kind))
+            print("%.3f ch %d %s" % (time.monotonic(), i + 1, kind))
             r = rep.get(i, {})
             if kind != "empty":
                 print("   why", r.get("why"))
@@ -367,7 +391,13 @@ class Concentrator:
 
         tpm = (self.cfg.get("escapement", {}) or {}).get("tpm", 48)
         period = 120.0 / tpm                 # one pulse per two clock beats
-        self._paint((now % period) < 0.2 * period)
+
+    def _paint_kinds(self, kinds, beat_on):
+        self.kinds = kinds
+        self.head = [HEAD_NAME.get(kinds.get(i, "unknown"), "unknown")
+                     for i in range(self.n)]
+        self._paint(beat_on)
+
 
     def _paint(self, beat_on):
         tripped = self.ring.tripped()
@@ -405,14 +435,14 @@ class Concentrator:
         became = held and not prev
         released = (not held) and prev
         self._prev_held[i] = held
-        
+
+        # plug-change → ask SurveyState (only on a real edge, only for non-head channels)
         if (became or released) and self.head[i] in ("lb", "empty", "fault"):
-            self._rescan_due = now
-            self._rescan_ch = i          # remember which channel
-            print("ch %d plug change" % (i + 1))
+            self.survey_state.trigger("plug", channel=i)
+            print("%.3f ch %d plug change" % (time.monotonic(), i + 1))
             self.tower.report(i, IDLE, False)
             return IDLE, held
-        
+    
         if became and self.last_false[i] is not None:
             self.edge_at[i] = now
             print("ch %d EDGE" % (i + 1))
@@ -443,20 +473,22 @@ class Concentrator:
     def rescan(self):
         self._probe_heads()
         self._start_ring()
-        print("rescan", self.head)
+        print("%.3f rescan %s" % (time.monotonic(), self.head))
 
     def _tower_step(self):
-        """After tower.poll(): plug-change rescan after SETTLE_S, clock view, gate."""
-        if self._rescan_due is not None and \
-                time.monotonic() - self._rescan_due >= SETTLE_S:
-            self._rescan_due = None
-            with self.guard.paused_for():
-                self.rescan()
+        """
+        After tower.poll(): plug-change rescan after SETTLE_S, clock view, gate.
+        """
         
         ringing = self.tower.tower in ("active", "ringing_down")
         if self.sntp is not None:
-            self.sntp.set_ringing(ringing)        # spec T20
+            self.sntp.set_ringing(ringing)
+        self._prev_tower = self.tower.tower
+        self.gate.enforce(self.bells)
 
+        ringing = self.tower.tower in ("active", "ringing_down")
+        if self.sntp is not None:
+            self.sntp.set_ringing(ringing)
         self._prev_tower = self.tower.tower
         self.gate.enforce(self.bells)
 
@@ -473,11 +505,11 @@ class Concentrator:
         self.strip.show()
         release([self.strip])
 
-    def _sense_step(self):
-        """One steady-loop pass. The only place the watchdog is fed."""
+    async def _sense_step(self):          # make it async
         self.poll_sense()
         self.tower.poll()
         self._tower_step()
+        await self.survey_state.step(True)
         self.guard.loop_tick()
 
     def loop(self):
@@ -488,7 +520,7 @@ class Concentrator:
             
     async def sense_task(self):  # or loop()
         while True:
-            self._sense_step()
+            await self._sense_step()
             await asyncio.sleep(0.02)
 
     async def status_task(self):
@@ -496,7 +528,30 @@ class Concentrator:
             # existing status / WS send
             await asyncio.sleep(0.1)
             
-
+    async def panel_task(self):
+        import panel as P
+        from survey_state import PHASE_KIND
+        while True:
+            phase = self.survey_state.phase
+            override = PHASE_KIND.get(phase)
+            ch = getattr(self.survey_state, "_pending_ch", None)
+            if override:
+                if ch is not None:
+                    # only the changed channel
+                    kinds = dict(self.kinds)
+                    kinds[ch] = override
+                else:
+                    # boot: all channels
+                    kinds = {i: override for i in range(4)}
+            else:
+                kinds = self.survey_state.kinds or self.kinds
+            rate = 0
+            if override and override in P.LED_KIND:
+                rate = P.LED_KIND[override][1]
+            on = True if rate <= 0 else ((time.monotonic() * (rate + 1)) % 1.0) < 0.5
+            self._paint_kinds(kinds, on)
+            await asyncio.sleep(0.05)
+        
 def start_app():
     """Everything up to the steady loop: net, Concentrator (survey,
     classify, self-test, ring), first time sync, server.  The watchdog is
@@ -519,8 +574,14 @@ def start_app():
 
 async def main():
     app = start_app()
-    tasks = [app.sense_task(), app.status_task(), ws_poll_task(app.guard),
-             app.refresher.run()]
+    tasks = [
+        app.sense_task(),
+        app.status_task(),
+        app.panel_task(),
+        ws_poll_task(app.guard),
+        app.refresher.run()
+        ]
+    
     if app.sntp is not None:
         tasks.append(app.sntp.run())
     try:
