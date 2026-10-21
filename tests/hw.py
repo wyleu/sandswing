@@ -41,6 +41,37 @@ def child_setup(src, extra_src=""):
     return _fake_hw
 
 
+# SurveyState needs ~18 steps for one idle -> examining -> surveying ->
+# settled -> idle cycle; this bound only stops a stuck survey hanging a test.
+SURVEY_STEP_LIMIT = 200
+
+
+def run_survey(app, reason="test", channel=None):
+    """Trigger app.survey_state, then await the steady loop's _sense_step()
+    until the survey has settled and gone back to idle, then let panel_task
+    paint once (that is what copies survey kinds into app.kinds/app.head).
+    Returns the phases seen.  Replaces the old app.rescan()/_probe_heads()."""
+    import asyncio
+    import survey_state
+
+    async def cycle():
+        app.survey_state.trigger(reason, channel=channel)
+        seen = []
+        for _ in range(SURVEY_STEP_LIMIT):
+            await app._sense_step()
+            seen.append(app.survey_state.phase)
+            if survey_state.SETTLED in seen and seen[-1] == survey_state.IDLE:
+                break
+        else:
+            raise AssertionError("survey did not settle: %s" % seen[-5:])
+        panel = asyncio.ensure_future(app.panel_task())
+        await asyncio.sleep(0)               # one panel_task pass
+        panel.cancel()
+        return seen
+
+    return asyncio.run(cycle())
+
+
 def child_finish(out, fh):
     counts = {}
     for gp, kind in fh.history:

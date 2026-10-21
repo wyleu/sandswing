@@ -9,8 +9,9 @@
 #   claim_muxes/claim_threshold idempotent -> build_from_pins idempotent
 #   one MuxAddress shared                  -> one Tower shared by both paths
 #   late Mux4051 shares                    -> late get_address/get_analog share
-#   scan_heads without addr while held     -> rescan while held (no claim)
+#   scan_heads without addr while held     -> survey while held (no claim)
 #   standalone scan_heads claims+releases  -> close() then a new Concentrator
+#   _probe_heads()/rescan()                -> SurveyState cycle (hw.run_survey)
 #
 # Fake board/digitalio/analogio/pwmio/neopixel/wifi raise ValueError('GPxx in
 # use') on a double claim, like CircuitPython.  Each scenario runs in a fresh
@@ -51,10 +52,11 @@ def child(variant, settings_variant, scenario):
     try:
         if scenario == "concentrator":
             import concentrator
+            from hw import run_survey
             app = concentrator.Concentrator(concentrator.cfg)
-            app._probe_heads()
-            app.rescan()
-            app.rescan()
+            run_survey(app, "boot")
+            run_survey(app)
+            run_survey(app)
             out["heads"] = list(app.head)
             out["thr_pwm_hz"] = getattr(app.thr_pwm, "frequency", None)
             import mux_select
@@ -65,7 +67,7 @@ def child(variant, settings_variant, scenario):
             out["thr_common_adc"] = 27 not in _fake_hw.claimed
             out["late_mux_shares"] = (mux_select.get_address(18, 19, 20) is app.mux and
                                       mux_select.get_analog(26) is app.bells[0].sense.adc)
-            app.rescan()                         # while held: borrows, no claim
+            run_survey(app)                      # while held: borrows, no claim
         elif scenario == "standalone":
             import concentrator
             app = concentrator.Concentrator(concentrator.cfg)
@@ -134,7 +136,7 @@ def main():
     for sv in ("with_common27", "no_common"):
         r = run("patched", sv, "concentrator")
         tag = "patched/%s" % sv
-        check(tag + " Concentrator + _probe_heads + rescan x2 runs", r["ok"], r.get("exc"))
+        check(tag + " Concentrator + boot survey + survey x2 runs", r["ok"], r.get("exc"))
         check(tag + " no 'GPxx in use' anywhere (incl. swallowed)", not r["errors"], r["errors"])
         multi = dict((g, n) for g, n in r["claims"].items() if g in ("18", "19", "20", "26", "21", "28"))
         check(tag + " A/B/C, GP26, GP21, GP28 each claimed exactly once",

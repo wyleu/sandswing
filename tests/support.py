@@ -126,6 +126,17 @@ def case(fn):
         print("  FAIL", fn.__name__, repr(e))
 
 
+def skip(name, why):
+    """Record a check that cannot run (e.g. a known firmware bug)."""
+    results.append((name, None, why))
+    print("  skip ", name, " -- skipped:", why)
+
+
+def run(coro):
+    """Run one coroutine (async survey/classify) to completion."""
+    return asyncio.run(coro)
+
+
 def expect(exc, f, *a):
     try:
         f(*a)
@@ -140,8 +151,10 @@ def load_json(name):
 
 
 def finish():
-    failed = [r for r in results if not r[1]]
-    print("\n%d passed, %d failed" % (len(results) - len(failed), len(failed)))
+    failed = [r for r in results if r[1] is False]
+    skipped = [r for r in results if r[1] is None]
+    print("\n%d passed, %d failed, %d skipped"
+          % (len(results) - len(failed) - len(skipped), len(failed), len(skipped)))
     sys.exit(1 if failed else 0)
 
 
