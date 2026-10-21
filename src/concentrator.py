@@ -508,9 +508,12 @@ class Concentrator:
         phase = await self.survey_state.step(True)
         if phase != prev and phase == SURVEYING:
             self.ring.stop()          # lasers are the survey's until it settles
-            for i in range(self.n):
-                self.gate.clear(i)    # a corrected plug can leave a latched fault
         elif phase != prev and phase == SETTLED:
+            # update the gate here (not at SURVEYING): clearing early left
+            # parts.gate.kind as 'unknown' for the whole survey, and a
+            # corrected plug needs clear() before set_kind can leave a fault
+            for i in range(self.n):
+                self.gate.clear(i)
             for i, kind in self.survey_state.kinds.items():
                 self.gate.set_kind(i, kind)   # else gate.enforce zeroes the heads
             # head[] now, not at the next panel pass: _watch_empty reads it

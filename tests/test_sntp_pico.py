@@ -531,6 +531,80 @@ def test_float32_state_keeps_ms():
     assert all(isinstance(e, int) for e in got)
 
 
+# ---- stamp rate (bench: -2700 ppm with a -56 ppm crystal) ----------------
+BENCH_DRIFT_PPM = -56.0         # /status last.drift_ppm after the fix's parent
+RATE_RUN_S = 30                 # stamp run like the bench stroke set
+RATE_TOL_PPM = 100              # utc must track ticks*(1+drift) within this
+
+
+@case
+def test_short_span_fit_keeps_b_zero():
+    """Two boot bursts ~1 s apart must not invent a ~2000 ppm slope from
+    tick-quantisation / RTT-asymmetry noise (the bench -2700 ppm case)."""
+    w = World(tick0=9110071, drift_ppm=0.0)
+    w.t = BENCH_UTC_MS - UTC0
+    c, clk = make(w, burst=8, interval_s=1.0, fit_samples=16)
+    assert c.burst_once()
+    w.bias = 2.7                                 # ~2.7 ms noise over ~1 s
+    w.sleep(1.0)                                 # as close as two run() bursts
+    assert c.burst_once()
+    assert c.b == 0.0, c.b * 1e6                 # unfixed would be ~+2700 ppm
+    assert abs(c.last["drift_ppm"]) < 1e-9
+    # then ring for 30 s on that mapping: utc tracks ticks (true drift 0)
+    first = c.stamp()
+    c.set_ringing(True)
+    for _ in range(RATE_RUN_S):
+        w.sleep(1.0)
+    last = c.stamp()
+    dt = last["tick_ms"] - first["tick_ms"]
+    ppm = ((last["utc_ms"] - first["utc_ms"]) / float(dt) - 1.0) * 1e6
+    assert abs(ppm) <= RATE_TOL_PPM, ppm
+
+
+@case
+def test_stamp_rate_matches_ticks_over_30s():
+    """A -56 ppm crystal: over 30 s of stamps (free then held), utc advances
+    within RATE_TOL_PPM of ticks * (1 + drift).  No continuous slew."""
+    w = World(tick0=9110071, drift_ppm=-BENCH_DRIFT_PPM)  # World sign: Pico slow
+    w.t = BENCH_UTC_MS - UTC0
+    c, clk = make(w, burst=8, interval_s=300, fit_samples=8)
+    for _ in range(6):                           # span long enough to fit
+        assert c.burst_once()
+        w.sleep(300)
+    assert abs(c.b * 1e6 - BENCH_DRIFT_PPM) < 5.0, c.b * 1e6
+    first = c.stamp()
+    c.set_ringing(True)
+    held = c.stamp()
+    for _ in range(RATE_RUN_S):
+        w.sleep(1.0)
+        c.stamp()
+    last = c.stamp()
+    dt = last["tick_ms"] - first["tick_ms"]
+    du = last["utc_ms"] - first["utc_ms"]
+    ppm = (du / float(dt) - 1.0) * 1e6
+    assert abs(ppm - BENCH_DRIFT_PPM) <= RATE_TOL_PPM, (ppm, BENCH_DRIFT_PPM, dt, du)
+    # free -> held first step also stays near 1:1 (bench: 1064 vs 1061)
+    d0 = held["tick_ms"] - first["tick_ms"]
+    if d0:
+        assert abs((held["utc_ms"] - first["utc_ms"]) / float(d0) - 1.0) * 1e6 <= RATE_TOL_PPM
+
+
+@case
+def test_accuracy_class_buckets_named():
+    assert S.ACC_MS_MAX_MS == 5.0 and S.ACC_S_MAX_MS == 500.0
+    w = World()
+    c, clk = synced(w)
+    t = clk.now()
+    e = c.error_ms(t)
+    assert e is not None
+    # the rule: e <= ACC_MS_MAX_MS -> "ms", else <= ACC_S_MAX_MS -> "s"
+    want = "ms" if e <= S.ACC_MS_MAX_MS else "s"
+    assert c.accuracy_class(t) == want
+    # a 5.2 ms error (bench flip) is "s" with the current 5 ms cut-off
+    assert c.accuracy_class(t, ms_target=5.0, s_target=500.0) == (
+        "ms" if e <= 5.0 else "s")
+
+
 n_fail = results.count(False)
 print("\n%d passed, %d failed" % (len(results) - n_fail, n_fail))
 sys.exit(1 if n_fail else 0)

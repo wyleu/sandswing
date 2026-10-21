@@ -63,6 +63,15 @@ NTP_FRAC_HALF = 1 << (NTP_FRAC_BITS - 1)
 MS_PER_S = 1000
 US_PER_MS = 1000
 TICK_MS = 1                     # supervisor.ticks_ms resolution
+# Offset noise of one sample from tick quantisation (t1 and t4 each +-1 tick).
+# A drift slope is fitted only once the samples span long enough for that
+# noise to be below the crystal tolerance (FIT_NOISE_MS / xtal_ppm, 40 s at
+# 50 ppm); before that the drift is taken as 0 (within the crystal spec).
+FIT_NOISE_MS = 2 * TICK_MS
+# accuracy_class() buckets (error bound in ms): "ms" = bell timing,
+# "s" = tower-clock check (rounds to the right second), else None.
+ACC_MS_MAX_MS = 5.0
+ACC_S_MAX_MS = 500.0
 
 
 def _default_ticks():
@@ -346,8 +355,12 @@ class SntpClock:
         n = float(len(pts))
         mx, my = sum(xs) / n, sum(ys) / n
         sxx = sum((x - mx) ** 2 for x in xs)
-        if sxx <= 0:
-            self.a_frac, self.b, self.resid = my, 0.0, 0.0
+        span = self.tref - pts[0][0]
+        if sxx <= 0 or span * self.xtal_ppm * 1e-6 < FIT_NOISE_MS:
+            # too short to see drift (e.g. the two boot bursts ~1 s apart:
+            # 2 ms of noise would read as ~2000 ppm): offset only
+            self.a_frac, self.b = my, 0.0
+            self.resid = max(abs(y - my) for y in ys)
             return
         self.b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
         self.a_frac = my - self.b * mx
@@ -479,7 +492,7 @@ class SntpClock:
         gap = abs(self._est(tick) - self._issued(tick))     # int ms
         return rtt / 2.0 + TICK_MS + self.resid + age * self.drift_unc + gap
 
-    def accuracy_class(self, tick, ms_target=5.0, s_target=500.0):
+    def accuracy_class(self, tick, ms_target=ACC_MS_MAX_MS, s_target=ACC_S_MAX_MS):
         """"ms" (bell timing), "s" (tower-clock check, rounds to the right
         second) or None, from the current error bound.  Holdover (stale)
         keeps a class only while the growing bound still fits."""
