@@ -182,8 +182,6 @@ class Concentrator:
         self.link = "no_wifi"
         self.sntp = None
         
-        self._inactive_since = None
-        self._inactive_surveyed = False
         self._empty_check = 0
             
         self.ticks = TickClock()
@@ -432,19 +430,6 @@ class Concentrator:
 
 
     def _tower_step(self):
-        now = time.monotonic()
-        if self.tower.tower == "inactive":
-            if self._inactive_since is None:
-                self._inactive_since = now
-                self._inactive_surveyed = False
-            elif (not self._inactive_surveyed and
-                  now - self._inactive_since > 2.0):
-                self.survey_state.trigger("inactive")
-                self._inactive_surveyed = True
-        else:
-            self._inactive_since = None
-            self._inactive_surveyed = False
-            
         ringing = self.tower.tower in ("active", "ringing_down")
         if self.sntp is not None:
             self.sntp.set_ringing(ringing)
