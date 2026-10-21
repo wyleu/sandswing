@@ -22,7 +22,8 @@ Flow
    kinds and flashes from panel.LED_KIND rates. LED6 shows the colour
    tower_watch decides (via StatusSlot). The same frame goes to the strip
    and to the ws payload.
-4. Ring: after settle, ring.Ring holds the heads' lasers and sends MIDI.
+4. Ring: each time the survey settles, _sense_step (re)starts ring.Ring
+   with the surveyed kinds; it holds the heads' lasers and sends MIDI.
    The watchdog (watchdog_guard, OFF by default) is armed only after
    startup, just before the steady loop, and fed only from _sense_step().
 5. Steady loop (sense_task): poll sense, tower, gate, await survey step,
@@ -81,7 +82,7 @@ from board_pins import release
 from watchdog_guard import WatchdogGuard
 from sand_event import Emitter
 from sntp_pico import TickClock
-from survey_state import SurveyState
+from survey_state import SurveyState, SURVEYING, SETTLED
 
 CONFIG_FILE = "settings.json"
 RING_WINDOW_S = 0.4
@@ -236,8 +237,7 @@ class Concentrator:
         self.head = ["unknown"] * self.n
         self.kinds = {}
         self.fitted = set()
-        
-        self._start_ring()
+        # the ring starts when the boot survey settles (_sense_step)
 
     def _setup_sense(self):
         self.sense_gps = self.pinmap["sense_gp"]
@@ -286,10 +286,11 @@ class Concentrator:
         on = [c for bd in boards if bd.get("present") is not False for c in bd["channels"]]
         return [b for b in self.bells if b.index in on]
 
-    def _start_ring(self):
-        """Settle, then ring.  TODO(spec C4): settle from measured delays."""
-        time.sleep(SETTLE_S)
-        self.ring.start(self.kinds)   # TODO(spec section 6): per-head laser_duty
+    async def _start_ring(self, kinds):
+        """Settle, then ring the surveyed heads.
+        TODO(spec C4): settle from measured delays."""
+        await asyncio.sleep(SETTLE_S)
+        self.ring.start(kinds)        # TODO(spec section 6): per-head laser_duty
 
     def _init_edge_state(self):
         self._still_since = [time.monotonic()] * self.n
@@ -483,7 +484,18 @@ class Concentrator:
         self.poll_sense()
         self.tower.poll()
         self._tower_step()
-        await self.survey_state.step(True)
+        prev = self.survey_state.phase
+        phase = await self.survey_state.step(True)
+        if phase != prev and phase == SURVEYING:
+            self.ring.stop()          # lasers are the survey's until it settles
+            for i in range(self.n):
+                self.gate.clear(i)    # a corrected plug can leave a latched fault
+        elif phase != prev and phase == SETTLED:
+            for i, kind in self.survey_state.kinds.items():
+                self.gate.set_kind(i, kind)   # else gate.enforce zeroes the heads
+            # head[] now, not at the next panel pass: _watch_empty reads it
+            self._paint_kinds(self.survey_state.kinds, True)
+            await self._start_ring(self.survey_state.kinds)
         self.guard.loop_tick()
 
     async def sense_task(self):  # or loop()

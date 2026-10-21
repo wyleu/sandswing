@@ -64,12 +64,23 @@ def run_survey(app, reason="test", channel=None):
                 break
         else:
             raise AssertionError("survey did not settle: %s" % seen[-5:])
-        panel = asyncio.ensure_future(app.panel_task())
-        await asyncio.sleep(0)               # one panel_task pass
-        panel.cancel()
+        await _panel_pass(app)
         return seen
 
     return asyncio.run(cycle())
+
+
+async def _panel_pass(app):
+    import asyncio
+    panel = asyncio.ensure_future(app.panel_task())
+    await asyncio.sleep(0)                   # one panel_task pass
+    panel.cancel()
+
+
+def paint_once(app):
+    """One panel_task pass (it alone refreshes app.frame now)."""
+    import asyncio
+    asyncio.run(_panel_pass(app))
 
 
 def child_finish(out, fh):

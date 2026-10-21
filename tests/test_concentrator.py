@@ -1,7 +1,7 @@
 # End to end: construct Concentrator on the fakes, survey (SurveyState), ring.
 import os
 import sys
-from hw import spawn, child_setup, child_finish, check, skip, finish, run_survey
+from hw import spawn, child_setup, child_finish, check, finish, run_survey, paint_once
 
 ONCE = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 26, 28]
 
@@ -25,27 +25,38 @@ class FakeSntp:
 def child(scenario, src, extra):
     fh = child_setup(src, extra)
     out = {"ok": False}
+    state = {"trip": False}
+
+    def plug_head():
+        # ch1 = a new head: laser current on GP26 when selected and lit;
+        # Blue/White follows the threshold (LM393) and is high at rest.
+        import mux_select
+
+        def cur():
+            t = list(mux_select._TOWERS.values())[0]
+            lit = 8 in fh.pwm and fh.pwm[8].duty_cycle == 65535
+            return 700 + (1490 if (lit and t.current == 0) else 0)
+
+        def bw():
+            if state["trip"]:
+                return False
+            return not (21 in fh.pwm and fh.pwm[21].duty_cycle > 30000)
+        fh.adc_fn[26] = cur
+        fh.din_fn[0] = bw
+
     try:
         if scenario == "head":
-            # ch1 = a new head: laser current on GP26 when selected and lit;
-            # Blue/White follows the threshold (LM393) and is high at rest.
-            import mux_select
-            state = {"trip": False}
-
-            def cur():
-                t = list(mux_select._TOWERS.values())[0]
-                lit = 8 in fh.pwm and fh.pwm[8].duty_cycle == 65535
-                return 700 + (1490 if (lit and t.current == 0) else 0)
-
-            def bw():
-                if state["trip"]:
-                    return False
-                return not (21 in fh.pwm and fh.pwm[21].duty_cycle > 30000)
-            fh.adc_fn[26] = cur
-            fh.din_fn[0] = bw
+            plug_head()
         import concentrator
         app = concentrator.Concentrator(concentrator.cfg)
         run_survey(app, "boot")              # boot survey (was _probe_heads in __init__)
+        if scenario == "late":
+            # empty at boot; a head is plugged into ch1 later
+            out["laser8_boot"] = fh.pwm[8].duty_cycle
+            plug_head()
+            run_survey(app, "empty-head", channel=0)
+            out["heads_late"] = list(app.head)
+            out["laser8_late"] = fh.pwm[8].duty_cycle
         app.sntp = FakeSntp()                # after: only the tower steps below count
         out["heads"] = list(app.head)
         out["selftest_ok"] = app.selftest["ok"]
@@ -66,9 +77,11 @@ def child(scenario, src, extra):
             out["laser8"] = fh.pwm[8].duty_cycle
             out["laser9"] = fh.pwm[9].duty_cycle
             app.poll_sense()
+            paint_once(app)
             out["rest_state"] = app.frame[1]["state"]
             state["trip"] = True
             app.poll_sense()
+            paint_once(app)
             out["trip_state"] = app.frame[1]["state"]
             state["trip"] = False
             app.poll_sense()
@@ -113,15 +126,17 @@ def main():
     r = spawn(me, "head")
     check("head: ch1 classified new, others empty",
           r.get("heads") == ["new"] + ["empty"] * 7, r.get("heads") or r.get("exc"))
-    # Firmware bug (src not changed here): ring.start() runs only once, in
-    # Concentrator.__init__ right after self.kinds = {}, and nothing restarts
-    # the ring when SurveyState settles, so no head's laser is lit and no
-    # stroke is counted.  Re-enable these when the ring follows the survey.
-    ring_bug = "firmware bug: ring started with no heads, not restarted after survey settles"
-    check("head: panel rest state head_new", r.get("rest_state") == "head_new", r.get("rest_state"))
-    skip("head: ring lit ch1 laser only", ring_bug)
-    skip("head: panel response -> stroke counted", ring_bug)
+    check("head: ring lit ch1 laser only", r.get("laser8") == 65535 and r.get("laser9") == 0,
+          (r.get("laser8"), r.get("laser9")))
+    check("head: panel rest -> response -> stroke counted",
+          r.get("rest_state") == "head_new" and r.get("trip_state") == "response"
+          and r.get("strokes") == 1, (r.get("rest_state"), r.get("trip_state"), r.get("strokes")))
     check("head: no 'GPxx in use'", r["ok"] and not r["errors"], r.get("exc") or r["errors"])
+    r = spawn(me, "late")
+    check("late head: a later survey finds ch1 and re-lights the ring",
+          r["ok"] and r.get("laser8_boot") == 0 and r.get("heads_late") == ["new"] + ["empty"] * 7
+          and r.get("laser8_late") == 65535,
+          r.get("exc") or (r.get("laser8_boot"), r.get("heads_late"), r.get("laser8_late")))
     r = spawn(me, "rebuild")
     check("close() releases everything; a second Concentrator builds clean",
           r["ok"] and not r["errors"] and r.get("heads") == ["empty"] * 8, r.get("exc") or r["errors"])
