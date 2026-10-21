@@ -1,7 +1,11 @@
-# farm_ws.py — HTTP /status + one /ws client (Sand* farm)
+# farm_ws.py — HTTP /status + up to MAX_WS_CLIENTS /ws clients (Sand* farm)
 #
 # Shared by sandswing, sandsense, and other timed Sand* devices.
 # Pattern for /ws accept taken from sandsense (Websocket(request)).
+# Every client gets every send (sandstore, sandbells, debug listeners).
+# Over the limit the NEW client is refused (accepted, then closed with
+# 1013 "try again later"): long-lived clients such as sandstore are never
+# kicked off by an ad-hoc listener.
 import json
 import time
 import wifi
@@ -13,8 +17,14 @@ try:
 except ImportError:
     HAS_HTTP = False
 
+MAX_WS_CLIENTS = 4             # RAM: one socket + small buffers each
+WS_NORMAL = 1000               # close codes (RFC 6455)
+WS_GOING_AWAY = 1001
+WS_TRY_AGAIN_LATER = 1013
+
 _server = None
-_ws = None
+_clients = []                  # live Websocket objects, oldest first
+_refused = []                  # accepted over the limit; closed in poll()
 _payload_fn = lambda: {}
 
 
@@ -46,7 +56,8 @@ def connect_wifi(cfg):
 
 
 def start_server(cfg, payload_fn):
-    """payload_fn() -> dict for GET /status. Also accepts one /ws client."""
+    """payload_fn() -> dict for GET /status. Also accepts /ws clients
+    (up to MAX_WS_CLIENTS)."""
     global _server, _payload_fn
     _payload_fn = payload_fn
     if not HAS_HTTP:
@@ -80,17 +91,7 @@ def start_server(cfg, payload_fn):
 
         @server.route(path_ws, GET)
         def ws_route(request: Request):
-            # One client at a time (sandstore or sandbells). Same pattern as
-            # sandsense: replace any previous socket on reconnect.
-            global _ws
-            if _ws is not None:
-                try:
-                    _ws.close()
-                except Exception:
-                    pass
-            _ws = Websocket(request)
-            print("WS client connected")
-            return _ws
+            return _accept(Websocket(request))
 
         host = str(wifi.radio.ipv4_address)
         server.start(host=host, port=port)
@@ -104,50 +105,81 @@ def start_server(cfg, payload_fn):
         return None
 
 
-def _drop(why):
-    """Forget the client; close its socket quietly."""
-    global _ws
-    if _ws is not None:
-        try:
-            _ws.close()
-        except Exception:
-            pass
-    _ws = None
-    print("%.3f WS client dropped:" % time.monotonic(), why)
+def _count():
+    return "(%d client%s)" % (len(_clients), "" if len(_clients) == 1 else "s")
+
+
+def _accept(ws):
+    """Add a client, or queue it for a polite refusal when full.  The
+    handshake must go out first, so the refusal close is sent in poll()."""
+    if len(_clients) >= MAX_WS_CLIENTS:
+        _refused.append(ws)
+    else:
+        _clients.append(ws)
+        print("%.3f WS client connected %s" % (time.monotonic(), _count()))
+    return ws
+
+
+def _close(ws, code):
+    try:
+        ws.close(code)
+    except Exception:
+        pass
+
+
+def _drop(ws, why, code=WS_GOING_AWAY):
+    """Forget one client; close its socket quietly."""
+    if ws in _clients:
+        _clients.remove(ws)
+    _close(ws, code)
+    print("%.3f WS client dropped: %s %s" % (time.monotonic(), why, _count()))
 
 
 def poll():
-    """Accept HTTP/WS requests, then read one frame from the WS client so
-    pings get a pong and a client's close (or a dead socket) is noticed."""
+    """Accept HTTP/WS requests, refuse clients over the limit, then read one
+    frame from each client so pings get a pong and a close (or a dead
+    socket) is noticed.  A bad client is dropped on its own."""
     if _server:
         try:
             _server.poll()
         except Exception as e:
             print("ws poll:", e)
-    if _ws is not None:
+    while _refused:
+        _close(_refused.pop(), WS_TRY_AGAIN_LATER)
+        print("%.3f WS client refused: max %d %s"
+              % (time.monotonic(), MAX_WS_CLIENTS, _count()))
+    for ws in list(_clients):
         try:
-            _ws.receive(fail_silently=True)   # handles ping/pong/close; we ignore data
+            ws.receive(fail_silently=True)    # handles ping/pong/close; data ignored
         except Exception as e:
-            _drop(e)
-            return
-        if _ws is not None and _ws.closed:
-            _drop("closed")
+            _drop(ws, e)
+            continue
+        if ws.closed:
+            _drop(ws, "closed", WS_NORMAL)
 
 
 def send(obj):
-    """Send one JSON message; False if no client or it has gone."""
-    if _ws is None:
+    """Send one JSON message to every client; True if at least one got it.
+    A failing client is dropped; the others still get the message."""
+    if not _clients:
         return False
-    if _ws.closed:
-        _drop("closed")
-        return False
-    try:
-        _ws.send_message(json.dumps(obj), fail_silently=True)
-        return True
-    except Exception as e:
-        _drop(e)
-        return False
+    msg = json.dumps(obj)
+    sent = False
+    for ws in list(_clients):
+        if ws.closed:
+            _drop(ws, "closed", WS_NORMAL)
+            continue
+        try:
+            ws.send_message(msg, fail_silently=True)
+            sent = True
+        except Exception as e:
+            _drop(ws, e)
+    return sent
 
 
 def ws_connected():
-    return _ws is not None
+    return bool(_clients)
+
+
+def ws_clients():
+    return len(_clients)
