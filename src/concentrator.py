@@ -150,14 +150,16 @@ def setup_net():
 def setup_sntp(ip):
     """SntpClock on the GPS servers by IP (spec T4), or None."""
     t = cfg.get("time", {}) or {}
-    ips = t.get("ntp_ips") or []
+    from time_servers import candidates
+    ips = candidates(t.get("ntp_ips"), ip, wifi.radio.ipv4_subnet, log=emit)
     if ip is None or not ips:
         emit("No time sync (no IP or no time.ntp_ips)")
         return None
     import socketpool
     from sntp_pico import SntpClock
     opts = dict((k, t[k]) for k in ("interval_s", "burst", "max_slew_ppm",
-                                    "step_ms", "ring_sample") if k in t)
+                                    "step_ms", "ring_sample", "timeout_s",
+                                    "stale_after") if k in t)
     return SntpClock(socketpool.SocketPool(wifi.radio), ips, **opts)
 
 

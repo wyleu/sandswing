@@ -12,6 +12,7 @@ SCHEMA = "sand.event/v1"
 # Stamp keys produced by SntpClock.stamp() (spec T10 / T24).
 _STAMP_KEYS = (
     "tick_ms", "utc_ms", "err_ms", "sync", "acc", "epoch", "session", "mode",
+    "srv", "stratum",           # time server IP and its stratum (null unsynced)
 )
 # Integer ms fields (a big utc as a CircuitPython float32 steps 131072 ms).
 _INT_KEYS = ("tick_ms", "utc_ms")
@@ -33,6 +34,8 @@ def _stamp_fields(clock, raw_tick=None, ticks=None):
             "epoch": 0,
             "session": 0,
             "mode": None,
+            "srv": None,
+            "stratum": None,
         }
     if raw_tick is None:
         st = clock.stamp()

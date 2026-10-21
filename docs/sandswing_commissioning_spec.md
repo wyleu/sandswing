@@ -128,7 +128,7 @@ Requirements:
   - Recommended: `keypad.Keys` events, whose `timestamp` is `ticks_ms`, with a short scan interval.
 - **T2** `ticks_ms` wraps at 2^29 ms (about 6.2 days), and first wraps about 65 s after power-on. Stamps SHALL be extended by a wrap counter (`TickClock`), and the extension SHALL be refreshed at least every half wrap (the SNTP loop does this).
 - **T3** `tick_ms` in payloads SHALL be the extended tick (ms since boot), sent with a `boot_id`.
-- **T4** A custom SNTP client (`sntp_pico.py`) SHALL query the GPS server **by IP** from settings (`time.ntp_ips`). CircuitPython's DNS can't resolve `.local`. **[A]** Optional mDNS discovery is allowed, with the IP as fallback.
+- **T4** A custom SNTP client (`sntp_pico.py`) SHALL query the GPS server **by IP** from settings (`time.ntp_ips`). CircuitPython's DNS can't resolve `.local`. **[A]** Optional mDNS discovery is allowed, with the IP as fallback. `time.ntp_ips` may list several sites' servers; only those on the device's subnet are used (all, if none is). Before each free-mode burst each candidate is probed once (short timeout); the lowest valid stratum wins, then the lowest RTT, and the burst goes to that server only. A server change clears the fit and RTT history and starts a new epoch; there is no reselection while ringing. Until the first sync, bursts are retried every 15 s.
 - **T5** Every `interval_s` (default 300 s), it SHALL send a burst of N queries (default 8). The minimum-RTT sample is kept. Offset = ((t2 − t1) + (t3 − t4)) / 2, with t1/t4 from extended ticks and t2/t3 from the server's 64-bit NTP stamps.
 - **T6** A sample SHALL be rejected when any of these hold:
   - stratum is 0 or 16, or leap indicator is 3 (unsynchronised)
@@ -141,11 +141,11 @@ Requirements:
   - `synced`
   - `stale`: no good burst for `stale_after` intervals
   - `held`: ringing mode, mapping frozen on purpose (T21). Not a fault.
-- **T10** Every event payload SHALL carry `tick_ms`, `utc_ms` (null while unsynced), `err_ms`, `sync`, `acc` (T16), and `epoch`, `session`, `mode` (T24).
+- **T10** Every event payload SHALL carry `tick_ms`, `utc_ms` (null while unsynced), `err_ms`, `sync`, `acc` (T16), `epoch`, `session`, `mode` (T24), and `srv`, `stratum` (time server and its stratum; null while unsynced).
 - **T11** A network call SHALL stall the sense loop for no more than `timeout_s` (default 0.25 s), and network errors SHALL never leave the sync loop.
 - **T12** Sandbells SHALL record its own receive time for latency statistics. It SHALL NOT replace the Pico stamp.
 - **T13** status-v1 SHALL add `utc_ms`, `tick_ms` and `sync`. `ts` = `utc_ms // 1000` when synced, else 0; it stays in whole seconds only for schema compatibility.
-- **T14** The boot record SHALL log the sync state, servers, last burst (RTT, offset, drift) and counters.
+- **T14** The boot record SHALL log the sync state, servers, the chosen server (`srv`, `stratum`, `disagree`), last burst (RTT, offset, drift) and counters.
 - **T15** The day boundary (`gps_day` → `tower_watch.gps_tick`) SHALL be raised once when synced UTC crosses midnight. **[A]** By default this is UTC; a setting gives a local offset. While unsynced, the existing local day count continues.
 - **T16** `accuracy_class(tick)` SHALL report `"ms"` (err ≤ 10 ms), `"s"` (err ≤ 500 ms) or none. It is in every stamp (`acc`) and in status-v1. A consumer SHALL use a time only for the class it needs.
 - **T17 Holdover.**

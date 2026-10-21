@@ -26,6 +26,8 @@ threshold_refresh.py
 panel.py
 report.py
 sntp_pico.py
+time_servers.py
+time_select.py
 watchdog_guard.py
 farm_ws.py
 farm_log.py

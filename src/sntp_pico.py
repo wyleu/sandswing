@@ -48,6 +48,9 @@
 import struct
 import time
 
+from time_servers import normalise
+from time_select import choose, STRATUM_MIN, STRATUM_MAX
+
 try:
     import asyncio
 except ImportError:
@@ -72,6 +75,9 @@ FIT_NOISE_MS = 2 * TICK_MS
 # "s" = tower-clock check (rounds to the right second), else None.
 ACC_MS_MAX_MS = 10.0
 ACC_S_MAX_MS = 500.0
+# Server choice: one short probe of each candidate before a free-mode burst.
+PROBE_TIMEOUT_S = 0.1           # per probe; a dead server costs no more
+BOOT_RETRY_S = 15               # retry interval while unsynced (not interval_s)
 
 
 def _default_ticks():
@@ -181,7 +187,10 @@ class SntpClock:
                  ring_sample=False, ring_burst=2, ring_interval_s=900,
                  sleep_fn=None):
         self.pool = pool
-        self.servers = list(servers)
+        self.servers = normalise(servers)     # a bare string is one IP
+        self.server = None      # chosen server (probe), bursts go only here
+        self.stratum = None     # its stratum
+        self.disagree = False   # two valid servers > SERVER_DISAGREE_MS apart
         self.clock = clock or TickClock()
         self.port = int(port)
         self.burst = int(burst)
@@ -227,7 +236,7 @@ class SntpClock:
         self._serial = 0
 
     # ---- one query --------------------------------------------------------
-    def _query(self, ip):
+    def _query(self, ip, timeout_s=None):
         """One SNTP exchange. Returns (t1, t4, t2, t3, stratum) or None:
         t1/t4 extended ticks (ms), t2/t3 server Unix us (ints).
         Never raises for network trouble; blocks at most timeout_s."""
@@ -239,7 +248,7 @@ class SntpClock:
         sock = None
         try:
             sock = self.pool.socket(self.pool.AF_INET, self.pool.SOCK_DGRAM)
-            sock.settimeout(self.timeout_s)
+            sock.settimeout(self.timeout_s if timeout_s is None else timeout_s)
             t1 = self.clock.now()
             sock.sendto(pkt, (ip, self.port))
             self.stats["sent"] += 1
@@ -263,7 +272,7 @@ class SntpClock:
             return None
         stratum = b[1]
         li = b[0] >> 6
-        if stratum == 0 or stratum >= 16 or li == 3:
+        if stratum < STRATUM_MIN or stratum > STRATUM_MAX or li == 3:
             self.stats["rejected_stratum"] += 1  # kiss-o'-death / unsynced
             return None
         s2, f2, s3, f3 = struct.unpack(">IIII", bytes(b[32:48]))
@@ -278,17 +287,77 @@ class SntpClock:
         mad = _median([abs(r - med) for r in self.rtts])
         return med + self.rtt_k * max(mad, 1.0)  # 1 ms = tick resolution
 
+    # ---- server choice ----------------------------------------------------
+    def _probe(self, ip):
+        """One short query -> time_select result dict."""
+        r = self._query(ip, min(self.timeout_s, PROBE_TIMEOUT_S))
+        if r is None:
+            return {"ip": ip, "stratum": None, "rtt_ms": None, "offset_ms": None}
+        rtt, _tick, off, st, _ip = self._better(None, r, ip)
+        return {"ip": ip, "stratum": st, "rtt_ms": rtt, "offset_ms": us_to_ms(off)}
+
+    def _needs_probe(self):
+        """Free mode only (never while ringing: the mapping is frozen), and
+        only when there is a choice to make."""
+        if len(self.servers) == 1 and self.server is None:
+            self.server = self.servers[0]        # no choice: stratum from the burst
+        return len(self.servers) > 1 and not self.ringing
+
+    def _choose(self, results):
+        best, self.disagree = choose(results)
+        if best is not None:
+            self._use(best["ip"], best["stratum"])
+
+    def _use(self, ip, stratum):
+        """Burst only against ip.  A change of server clears the fit and
+        its RTT history (never mix two servers in one drift fit) and starts
+        a new epoch; the issued mapping then slews/steps onto the new one."""
+        if ip == self.server:
+            self._set_stratum(stratum)
+            return
+        old, self.server, self.stratum = self.server, ip, None
+        self._set_stratum(stratum)
+        if old is None:
+            return
+        self.samples, self.rtts = [], []
+        self.a, self.a_frac, self.b, self.resid = None, 0.0, 0.0, 0.0
+        self.drift_unc = self.xtal_ppm * 1e-6
+        self.epoch += 1
+        self._log("server", self.clock.now(), server=ip, was=old)
+
+    def _set_stratum(self, stratum):
+        """Console line when the server or its stratum changes."""
+        if stratum is not None and stratum != self.stratum:
+            self.stratum = stratum
+            print("%.3f time server %s stratum %d" % (time.monotonic(), self.server, stratum))
+
+    def select_server(self, between=None):
+        if self._needs_probe():
+            res = []
+            for ip in self.servers:
+                res.append(self._probe(ip))
+                if between is not None:
+                    between()
+            self._choose(res)
+
+    async def aselect_server(self):
+        if self._needs_probe():
+            res = []
+            for ip in self.servers:
+                res.append(self._probe(ip))
+                await asyncio.sleep(0)           # yield between probes
+            self._choose(res)
+
+    # ---- one burst --------------------------------------------------------
     def burst_once(self, between=None, n=None):
-        """Run one burst synchronously.  between(): optional callback run
-        between queries (sync use).  Returns True if a sample was accepted."""
+        """Run one burst synchronously (server chosen first in free mode).
+        between(): optional callback run between queries (sync use).
+        Returns True if a sample was accepted."""
+        self.select_server(between)
         best = None
         n = self.burst if n is None else int(n)
         for i in range(n):
-            for ip in self.servers:
-                r = self._query(ip)
-                if r is not None:
-                    best = self._better(best, r, ip)
-                    break
+            best = self._burst_query(best)
             if i + 1 < n:
                 if between is not None:
                     between()
@@ -297,17 +366,21 @@ class SntpClock:
         return self._finish(best)
 
     async def aburst_once(self, n=None):
+        await self.aselect_server()
         best = None
         n = self.burst if n is None else int(n)
         for i in range(n):
-            for ip in self.servers:
-                r = self._query(ip)
-                if r is not None:
-                    best = self._better(best, r, ip)
-                    break
+            best = self._burst_query(best)
             if i + 1 < n:
                 await asyncio.sleep(self.gap_s)
         return self._finish(best)
+
+    def _burst_query(self, best):
+        ip = self.server
+        if ip is None:
+            return best                          # no server answered a probe
+        r = self._query(ip)
+        return best if r is None else self._better(best, r, ip)
 
     def _better(self, best, r, ip):
         t1, t4, t2, t3, st = r
@@ -323,6 +396,7 @@ class SntpClock:
             self.last = {"ok": False, "why": "no reply"}
             return False
         rtt, tick, off, st, ip = best
+        self._set_stratum(st)
         lim = self._rtt_limit()
         if lim is not None and rtt > lim:
             self.stats["rejected_rtt"] += 1
@@ -516,14 +590,19 @@ class SntpClock:
                 self.guard_hits += 1
         if u is not None and (self._last_issue is None or t >= self._last_issue[0]):
             self._last_issue = (t, u)
+        synced = u is not None and self.a is not None
         return {"tick_ms": t, "utc_ms": u, "err_ms": self.error_ms(t),
                 "sync": self.state(t), "acc": self.accuracy_class(t),
                 "epoch": self.epoch, "session": self.session,
-                "mode": self.mode()}
+                "mode": self.mode(),
+                "srv": self.server if synced else None,
+                "stratum": self.stratum if synced else None}
 
     def boot_record(self):
         return {"sync": self.state(), "mode": self.mode(),
                 "epoch": self.epoch, "servers": self.servers,
+                "srv": self.server, "stratum": self.stratum,
+                "disagree": self.disagree,
                 "last": self.last, "stats": dict(self.stats),
                 "events": list(self.events[-4:])}
 
@@ -540,8 +619,7 @@ class SntpClock:
             except Exception as e:                # belt and braces
                 self.stats["bad"] += 1
                 self.last = {"ok": False, "why": repr(e)}
-            wait = self.interval_s if not ringing else (
-                self.ring_interval_s if self.ring_sample else self.interval_s)
+            wait = self._wait_s(ringing)
             # sleep in short slices so a ring end triggers a prompt burst
             waited = 0.0
             slice_s = min(1.0, wait)
@@ -551,6 +629,14 @@ class SntpClock:
                     break
                 await asyncio.sleep(slice_s)
                 waited += slice_s
+
+    def _wait_s(self, ringing):
+        """Seconds to the next burst: BOOT_RETRY_S while unsynced (free)."""
+        if ringing:
+            return self.ring_interval_s if self.ring_sample else self.interval_s
+        if self.state() == "unsynced":
+            return min(BOOT_RETRY_S, self.interval_s)   # get a lock soon
+        return self.interval_s
 
     @staticmethod
     def worst_case_ms(hours, ppm):

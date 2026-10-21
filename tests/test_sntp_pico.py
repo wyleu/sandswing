@@ -57,6 +57,9 @@ class FakeSock:
         w = self.w
         w.sent += 1
         d = w.delays.pop(0) if w.delays else w.default
+        site = getattr(w, "per_ip", {}).get(addr[0])   # several servers
+        if site is not None:
+            d = None if site.get("dead") else site.get("delay", d)
         if d is None:
             w.t += self.timeout * 1000.0
             self.reply = None
@@ -65,11 +68,11 @@ class FakeSock:
             raise RuntimeError("radio fell over")
         up, down = d
         w.t += up
-        t2 = w.utc()
+        t2 = w.utc() + (site or {}).get("bias", 0.0)
         t3 = t2 + w.proc
         r = bytearray(48)
         r[0] = (w.li << 6) | (4 << 3) | 4
-        r[1] = w.stratum
+        r[1] = (site or {}).get("stratum", w.stratum)
         r[24:32] = pkt[40:48]
         r[32:40] = ntp_stamp(t2)
         r[40:48] = ntp_stamp(t3)
@@ -599,6 +602,139 @@ def test_accuracy_class_buckets_named():
     for err, want in ((5.2, "ms"), (10.5, "s")):   # 5.2 = the bench flip
         c.error_ms = lambda tick, e=err: e
         assert c.accuracy_class(t) == want, (err, c.accuracy_class(t))
+
+# ---- time servers: subnet filter, choice, switching ----------------------
+import time_servers as TS
+import time_select as TSel
+
+HOME_GPS, TOWER_GPS = "192.168.0.221", "10.42.0.1"
+NTP_IPS = [HOME_GPS, TOWER_GPS]
+LAN_MASK = "255.255.255.0"
+A_IP, B_IP = "10.0.0.5", "10.0.0.6"
+SLOW_RTT = (4.0, 4.0)
+FAST_RTT = (1.0, 1.0)
+
+
+def two_servers(a, b, **kw):
+    """World with servers A_IP / B_IP configured by dicts (stratum, delay,
+    bias, dead)."""
+    w = World()
+    w.per_ip = {A_IP: a, B_IP: b}
+    clock = S.TickClock(w.ticks)
+    kw.setdefault("burst", 3)
+    c = S.SntpClock(FakePool(w), [A_IP, B_IP], clock=clock, sleep_fn=w.sleep, **kw)
+    return w, c, clock
+
+
+@case
+def test_subnet_filter_home_and_tower():
+    assert TS.candidates(NTP_IPS, "192.168.0.81", LAN_MASK) == [HOME_GPS]
+    assert TS.candidates(NTP_IPS, "10.42.0.23", LAN_MASK) == [TOWER_GPS]
+    logged = []
+    assert TS.candidates(NTP_IPS, "172.16.5.9", LAN_MASK, log=logged.append) == NTP_IPS
+    assert logged and "trying all" in logged[0], logged
+    assert TS.candidates(NTP_IPS, None, None) == NTP_IPS
+
+
+@case
+def test_string_ntp_ips_is_one_ip_not_chars():
+    assert TS.normalise(HOME_GPS) == [HOME_GPS]
+    assert TS.normalise(HOME_GPS + ", " + TOWER_GPS) == NTP_IPS
+    w = World()
+    c = S.SntpClock(FakePool(w), HOME_GPS, clock=S.TickClock(w.ticks))
+    assert c.servers == [HOME_GPS], c.servers
+    assert TS.ip_to_int("256.1.1.1") is None and TS.ip_to_int("1.2.3") is None
+
+
+@case
+def test_select_lower_stratum_then_rtt_and_disagree():
+    r = lambda ip, st, rtt, off: {"ip": ip, "stratum": st, "rtt_ms": rtt, "offset_ms": off}
+    best, dis = TSel.choose([r("a", 2, 1.0, 0), r("b", 1, 9.0, 0)])
+    assert best["ip"] == "b" and not dis               # stratum beats RTT
+    best, dis = TSel.choose([r("a", 1, 5.0, 0), r("b", 1, 2.0, 1)])
+    assert best["ip"] == "b"                           # tie: lowest RTT
+    best, dis = TSel.choose([r("a", 1, 2.0, 0), r("b", 1, 3.0, TSel.SERVER_DISAGREE_MS + 1)])
+    assert dis
+    best, dis = TSel.choose([r("a", 0, 1.0, 0), r("b", 16, 1.0, 0), r("c", None, None, None)])
+    assert best is None and not dis
+
+
+@case
+def test_clock_bursts_only_the_chosen_server():
+    w, c, clk = two_servers({"stratum": 2, "delay": FAST_RTT}, {"stratum": 1, "delay": SLOW_RTT})
+    assert c.burst_once()
+    assert c.server == B_IP and c.stratum == 1 and c.last["server"] == B_IP
+    st = c.stamp()
+    assert st["srv"] == B_IP and st["stratum"] == 1
+    br = c.boot_record()
+    assert br["srv"] == B_IP and br["stratum"] == 1 and br["disagree"] is False
+
+
+@case
+def test_server_switch_new_epoch_clean_fit():
+    a, b = {"stratum": 1, "delay": FAST_RTT}, {"stratum": 1, "delay": SLOW_RTT}
+    w, c, clk = two_servers(a, b, interval_s=300)
+    for _ in range(3):
+        assert c.burst_once()
+        w.sleep(300)
+    assert c.server == A_IP and len(c.samples) == 3
+    ep = c.epoch
+    a["dead"] = True                                   # home box gone
+    assert c.burst_once()
+    assert c.server == B_IP and len(c.samples) == 1, (c.server, c.samples)
+    assert c.epoch > ep and any(e["kind"] == "server" for e in c.events)
+    assert c.stamp()["srv"] == B_IP
+
+
+@case
+def test_disagree_flag_from_probe():
+    w, c, clk = two_servers({"stratum": 1, "delay": FAST_RTT},
+                            {"stratum": 1, "delay": SLOW_RTT,
+                             "bias": TSel.SERVER_DISAGREE_MS * 2.0})
+    assert c.burst_once() and c.disagree and c.boot_record()["disagree"]
+
+
+@case
+def test_no_server_switch_while_ringing():
+    a, b = {"stratum": 1, "delay": FAST_RTT}, {"stratum": 2, "delay": FAST_RTT}
+    w, c, clk = two_servers(a, b)
+    assert c.burst_once() and c.server == A_IP
+    c.set_ringing(True)
+    ep = c.epoch
+    a["stratum"], b["stratum"] = 3, 1                  # B now better
+    c.burst_once()                                     # diagnostic only
+    assert c.server == A_IP and c.epoch == ep
+    c.set_ringing(False)
+    assert c.burst_once() and c.server == B_IP         # reselect when free
+
+
+@case
+def test_unsynced_retries_fast():
+    w = World()
+    w.default = None                                   # nothing answers
+    c, clk = make(w, burst=2, interval_s=300)
+    assert not c.burst_once() and c.state() == "unsynced"
+    assert c._wait_s(False) == S.BOOT_RETRY_S < c.interval_s
+    w.default = FAST_RTT
+    assert c.burst_once()
+    assert c._wait_s(False) == c.interval_s
+
+
+@case
+def test_every_stamp_carries_srv_and_stratum():
+    w = World()
+    c, clk = make(w, burst=2)
+    st = c.stamp()
+    assert "srv" in st and st["srv"] is None and st["stratum"] is None   # unsynced
+    assert c.burst_once()
+    for _ in range(3):
+        w.sleep(1.0)
+        st = c.stamp()
+        assert st["srv"] == A_IP and st["stratum"] == w.stratum, st
+    import sand_event
+    ev = sand_event.Emitter(src="sandswing").make(c, "stroke", {"ch": 1})
+    assert ev["srv"] == A_IP and ev["stratum"] == w.stratum
+
 
 n_fail = results.count(False)
 print("\n%d passed, %d failed" % (len(results) - n_fail, n_fail))

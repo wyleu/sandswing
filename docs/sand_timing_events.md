@@ -37,7 +37,18 @@ Already written for sandswing; treat it as **farm-common**:
 - `TickClock` — extends `supervisor.ticks_ms` past wrap.
 - `SntpClock` — burst SNTP to local GPS boxes **by IP** (`time.ntp_ips`).
 - States: `unsynced` | `synced` | `stale` | `held`.
-- `stamp()` → `tick_ms`, `utc_ms` (or null), `err_ms`, `sync`, `acc`, `epoch`, `session`, `mode`.
+- `stamp()` → `tick_ms`, `utc_ms` (or null), `err_ms`, `sync`, `acc`, `epoch`, `session`, `mode`,
+  `srv` (time server IP), `stratum` (its stratum); `srv`/`stratum` are null while unsynced.
+- Server choice (`time_servers.py`, `time_select.py`): `time.ntp_ips` may list
+  every site's GPS box (e.g. home `192.168.0.221`, tower sandmon `10.42.0.1`).
+  Only those on the device's own subnet are tried (all of them if none is).
+  Before each free-mode burst each candidate gets one short probe; the
+  lowest valid stratum (1–15) wins, then the lowest RTT, and the whole burst
+  goes to that one server.  A change of server clears the drift fit and RTT
+  history and starts a new `epoch` (console: `<t> time server <ip> stratum <n>`).
+  No reselection while ringing.  `disagree` (in `/status` sync) is set when
+  two valid servers differ by more than 20 ms.  While unsynced the client
+  retries every 15 s instead of `interval_s`.
 
 Rules (from commissioning spec T1–T25, summarised):
 
@@ -53,7 +64,7 @@ Rules (from commissioning spec T1–T25, summarised):
 
 ```json
 "time": {
-  "ntp_ips": ["192.168.x.y"],
+  "ntp_ips": ["192.168.0.221", "10.42.0.1"],
   "interval_s": 300,
   "burst": 8,
   "timeout_s": 0.25,
@@ -140,6 +151,8 @@ Every pushed event is one JSON object:
   "epoch": 3,
   "session": 1,
   "mode": "ringing",
+  "srv": "192.168.0.221",
+  "stratum": 1,
   "body": { }
 }
 ```
