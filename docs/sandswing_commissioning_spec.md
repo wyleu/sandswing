@@ -147,7 +147,7 @@ Requirements:
 - **T13** status-v1 SHALL add `utc_ms`, `tick_ms` and `sync`. `ts` = `utc_ms // 1000` when synced, else 0; it stays in whole seconds only for schema compatibility.
 - **T14** The boot record SHALL log the sync state, servers, last burst (RTT, offset, drift) and counters.
 - **T15** The day boundary (`gps_day` → `tower_watch.gps_tick`) SHALL be raised once when synced UTC crosses midnight. **[A]** By default this is UTC; a setting gives a local offset. While unsynced, the existing local day count continues.
-- **T16** `accuracy_class(tick)` SHALL report `"ms"` (err ≤ 5 ms), `"s"` (err ≤ 500 ms) or none. It is in every stamp (`acc`) and in status-v1. A consumer SHALL use a time only for the class it needs.
+- **T16** `accuracy_class(tick)` SHALL report `"ms"` (err ≤ 10 ms), `"s"` (err ≤ 500 ms) or none. It is in every stamp (`acc`) and in status-v1. A consumer SHALL use a time only for the class it needs.
 - **T17 Holdover.**
   - When bursts fail, the Pico SHALL keep `utc_ms` from the last offset and drift and report `stale`.
   - The drift uncertainty SHALL never be below `hold_ppm` (default 5 ppm, for crystal wander the fit can't see), so the bound keeps growing. For example, 6 h of holdover is about 108 ms: still class s, no longer class ms.

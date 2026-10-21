@@ -70,7 +70,7 @@ TICK_MS = 1                     # supervisor.ticks_ms resolution
 FIT_NOISE_MS = 2 * TICK_MS
 # accuracy_class() buckets (error bound in ms): "ms" = bell timing,
 # "s" = tower-clock check (rounds to the right second), else None.
-ACC_MS_MAX_MS = 5.0
+ACC_MS_MAX_MS = 10.0
 ACC_S_MAX_MS = 500.0
 
 

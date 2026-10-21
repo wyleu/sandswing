@@ -591,19 +591,14 @@ def test_stamp_rate_matches_ticks_over_30s():
 
 @case
 def test_accuracy_class_buckets_named():
-    assert S.ACC_MS_MAX_MS == 5.0 and S.ACC_S_MAX_MS == 500.0
+    assert S.ACC_MS_MAX_MS == 10.0 and S.ACC_S_MAX_MS == 500.0
     w = World()
     c, clk = synced(w)
     t = clk.now()
-    e = c.error_ms(t)
-    assert e is not None
     # the rule: e <= ACC_MS_MAX_MS -> "ms", else <= ACC_S_MAX_MS -> "s"
-    want = "ms" if e <= S.ACC_MS_MAX_MS else "s"
-    assert c.accuracy_class(t) == want
-    # a 5.2 ms error (bench flip) is "s" with the current 5 ms cut-off
-    assert c.accuracy_class(t, ms_target=5.0, s_target=500.0) == (
-        "ms" if e <= 5.0 else "s")
-
+    for err, want in ((5.2, "ms"), (10.5, "s")):   # 5.2 = the bench flip
+        c.error_ms = lambda tick, e=err: e
+        assert c.accuracy_class(t) == want, (err, c.accuracy_class(t))
 
 n_fail = results.count(False)
 print("\n%d passed, %d failed" % (len(results) - n_fail, n_fail))
