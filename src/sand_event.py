@@ -13,6 +13,8 @@ SCHEMA = "sand.event/v1"
 _STAMP_KEYS = (
     "tick_ms", "utc_ms", "err_ms", "sync", "acc", "epoch", "session", "mode",
 )
+# Integer ms fields (a big utc as a CircuitPython float32 steps 131072 ms).
+_INT_KEYS = ("tick_ms", "utc_ms")
 
 
 def _stamp_fields(clock, raw_tick=None, ticks=None):
@@ -39,6 +41,9 @@ def _stamp_fields(clock, raw_tick=None, ticks=None):
     out = {}
     for k in _STAMP_KEYS:
         out[k] = st.get(k)
+    for k in _INT_KEYS:                          # never a float on the wire:
+        if out[k] is not None:                   # float32 loses ms at ~1e12
+            out[k] = int(out[k])
     return out
 
 

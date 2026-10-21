@@ -36,6 +36,19 @@ def test_schema_and_body():
 
 
 @case
+def test_utc_and_tick_are_ints_on_the_wire():
+    class FloatClock(FakeClock):
+        def stamp(self, raw_tick=None):
+            st = FakeClock.stamp(self, raw_tick)
+            st["utc_ms"] = float(st["utc_ms"])
+            st["tick_ms"] = float(st["tick_ms"])
+            return st
+    doc = sand_event.Emitter(src="sandsense").make(FloatClock(), "stroke")
+    assert isinstance(doc["utc_ms"], int) and isinstance(doc["tick_ms"], int), doc
+    assert doc["utc_ms"] == FakeClock().stamp()["utc_ms"]
+
+
+@case
 def test_null_clock():
     doc = sand_event.make_event("tick", None, {"tick": 1})
     assert doc["sync"] == "unsynced"

@@ -324,7 +324,8 @@ def test_ringing_freezes_mapping_despite_new_offsets():
     t0 = clk.now()
     seg = c.segs[-1]
     ep, sess = c.epoch, c.session
-    pred = lambda t: int(round(seg[1] + (t - seg[0]) * seg[2]))
+    # seg = (t0, u0, dr): u0 + d + round(d * dr), d = ticks since t0
+    pred = lambda t: seg[1] + (t - seg[0]) + int(round((t - seg[0]) * seg[2]))
     stamps = []
     for k, bias in enumerate([+40.0, -60.0, +500.0, -5.0]):
         w.bias = bias                       # server now disagrees
@@ -339,7 +340,7 @@ def test_ringing_freezes_mapping_despite_new_offsets():
     # rate-constant: utc differences equal tick differences times one rate
     for a, b in zip(stamps, stamps[1:]):
         du, dt = b["utc_ms"] - a["utc_ms"], b["tick_ms"] - a["tick_ms"]
-        assert abs(du - dt * seg[2]) <= 1, (du, dt)
+        assert abs(du - dt * (1.0 + seg[2])) <= 1, (du, dt)
     assert c.guard_hits == 0
 
 
@@ -447,6 +448,87 @@ def test_four_hour_drift_bound():
     # relative timing: a 2 s stroke interval from tick deltas is unaffected
     a = c.stamp(); w.sleep(2.0); b = c.stamp()
     assert abs((b["utc_ms"] - a["utc_ms"]) - 2000 * (1 + 30e-6)) <= 1.5
+
+
+# ---- integer time (CircuitPython floats are 32-bit) ----------------------
+BENCH_UTC_MS = 1792575275008    # 2026-10-21 09:34:35.008, the bench sync time
+RUN_S = 60                      # simulated run of stamps
+STEP_S = 1.0                    # one stamp per second
+RUN_TOL_MS = 3                  # utc advance over RUN_S vs true elapsed
+
+
+def f32(x):
+    """x as a CircuitPython (IEEE single) float would hold it."""
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def bench_world():
+    w = World(tick0=9110071)             # tick_ms seen on the bench
+    w.t = BENCH_UTC_MS - UTC0            # true time = the bench sync time
+    return w
+
+
+@case
+def test_ntp_parse_is_integer_ms():
+    sec, frac = struct.unpack(">II", ntp_stamp(BENCH_UTC_MS + 0.5))
+    ms = S.ntp_to_unix_ms(sec, frac)
+    assert isinstance(ms, int) and abs(ms - BENCH_UTC_MS) <= 1, ms
+    us = S.ntp_to_unix_us(sec, frac)
+    assert isinstance(us, int) and abs(us - (BENCH_UTC_MS * 1000 + 500)) <= 1, us
+    # why: the bench value is itself a float32 step (131072 ms); 1 ms later
+    # and 60 s later still read back as the same float32
+    assert BENCH_UTC_MS % (1 << 17) == 0
+    assert f32(BENCH_UTC_MS + 1) == f32(BENCH_UTC_MS + RUN_S * 1000) == BENCH_UTC_MS
+
+
+@case
+def test_utc_int_and_advances_60s_with_2026_base():
+    w = bench_world()
+    c, clk = make(w, burst=4)
+    assert c.burst_once()
+    first = c.stamp()
+    prev = first
+    for _ in range(int(RUN_S / STEP_S)):
+        w.sleep(STEP_S)
+        st = c.stamp()
+        assert isinstance(st["utc_ms"], int) and isinstance(st["tick_ms"], int), st
+        assert st["utc_ms"] > prev["utc_ms"], (prev, st)
+        prev = st
+    adv = prev["utc_ms"] - first["utc_ms"]
+    assert abs(adv - RUN_S * 1000) <= RUN_TOL_MS, adv
+    assert abs(prev["utc_ms"] - (UTC0 + w.t)) <= RUN_TOL_MS
+    e = prev["err_ms"]
+    assert 0 < e < RUN_TOL_MS * 10, e                # small, not ~2**20
+
+
+@case
+def test_stamps_1ms_apart_differ():
+    w = bench_world()
+    c, clk = make(w, burst=4)
+    assert c.burst_once()
+    a = c.stamp()
+    w.sleep(0.001)
+    b = c.stamp()
+    assert b["tick_ms"] - a["tick_ms"] == 1, (a, b)
+    assert b["utc_ms"] - a["utc_ms"] == 1, (a, b)
+
+
+@case
+def test_float32_state_keeps_ms():
+    """Only small floats are kept: rounding them to float32 (as the Pico
+    would) does not move any stamp; the big bases are ints."""
+    w = World(tick0=9110071, drift_ppm=30.0)
+    w.t = BENCH_UTC_MS - UTC0
+    c, clk = synced(w)
+    assert isinstance(c.a, int) and all(isinstance(sg[0], int) and isinstance(sg[1], int)
+                                        for sg in c.segs), (c.a, c.segs)
+    ticks = [clk.now() + k * int(STEP_S * 1000) for k in range(RUN_S)]
+    want = [c.utc_ms(t) for t in ticks]
+    c.a_frac, c.b = f32(c.a_frac), f32(c.b)
+    c.segs = [(t0, u0, f32(dr)) for t0, u0, dr in c.segs]
+    got = [c.utc_ms(t) for t in ticks]
+    assert max(abs(g - x) for g, x in zip(got, want)) <= 1, (got[-1], want[-1])
+    assert all(isinstance(e, int) for e in got)
 
 
 n_fail = results.count(False)

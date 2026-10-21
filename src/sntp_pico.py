@@ -37,6 +37,13 @@
 # Why custom: adafruit_ntp returns whole seconds.  Here t1/t4 come from
 # supervisor.ticks_ms (1 ms) and t2/t3 from the server's 64-bit NTP stamps.
 # Never use time.monotonic() for event times (float, loses ms after days).
+#
+# Integer time: CircuitPython floats are 32-bit (24-bit mantissa), so a Unix
+# time in ms (~1.8e12) held as a float is quantised to 2**17 = 131072 ms.
+# Ticks, utc, offsets and mapping bases are therefore Python ints (arbitrary
+# precision) end to end.  Floats (drift / slew rates, fit intercept) only
+# ever multiply SMALL deltas (ms since a reference tick), and the product is
+# rounded to int before it is added to an int base.
 
 import struct
 import time
@@ -51,6 +58,11 @@ TICKS_MASK = TICKS_PERIOD - 1
 TICKS_HALF = TICKS_PERIOD >> 1
 NTP_UNIX_DELTA_S = 2208988800   # 1900-01-01 -> 1970-01-01
 NTP_PORT = 123
+NTP_FRAC_BITS = 32              # NTP timestamps are 32.32 fixed point
+NTP_FRAC_HALF = 1 << (NTP_FRAC_BITS - 1)
+MS_PER_S = 1000
+US_PER_MS = 1000
+TICK_MS = 1                     # supervisor.ticks_ms resolution
 
 
 def _default_ticks():
@@ -87,15 +99,32 @@ class TickClock:
         return self.extend(self._ticks())
 
 
+def _ntp_to_unix(sec, frac, per_s):
+    """NTP 32.32 fixed point -> Unix time in 1/per_s s (int, rounded)."""
+    return ((sec - NTP_UNIX_DELTA_S) * per_s
+            + ((frac * per_s + NTP_FRAC_HALF) >> NTP_FRAC_BITS))
+
+
 def ntp_to_unix_ms(sec, frac):
-    """NTP 32.32 fixed point -> Unix ms (float)."""
-    return (sec - NTP_UNIX_DELTA_S) * 1000.0 + frac * 1000.0 / 4294967296.0
+    """NTP 32.32 fixed point -> Unix ms (int)."""
+    return _ntp_to_unix(sec, frac, MS_PER_S)
+
+
+def ntp_to_unix_us(sec, frac):
+    """NTP 32.32 fixed point -> Unix us (int); keeps the sub-ms part."""
+    return _ntp_to_unix(sec, frac, MS_PER_S * US_PER_MS)
+
+
+def us_to_ms(us):
+    """Int us -> int ms, rounded half up (integer math only)."""
+    return (us + US_PER_MS // 2) // US_PER_MS
 
 
 def offset_delay(t1, t2, t3, t4):
     """Classic NTP: offset = ((t2-t1)+(t3-t4))/2, rtt = (t4-t1)-(t3-t2).
-    t1/t4 local ms, t2/t3 server ms.  offset is server minus local."""
-    return ((t2 - t1) + (t3 - t4)) / 2.0, (t4 - t1) - (t3 - t2)
+    All four in the same integer unit (local t1/t4, server t2/t3).  offset
+    is server minus local (int, floor of the half unit)."""
+    return ((t2 - t1) + (t3 - t4)) // 2, (t4 - t1) - (t3 - t2)
 
 
 def _median(xs):
@@ -161,7 +190,8 @@ class SntpClock:
         self.ring_sample = bool(ring_sample)
         self.ring_burst = int(ring_burst)
         self.ring_interval_s = float(ring_interval_s)
-        self.segs = []          # issued mapping: (t0, u0, rate), t0 ascending
+        self.segs = []          # issued mapping: (t0, u0, dr), t0 ascending;
+                                # t0/u0 int ms, dr = rate - 1 (small float)
         self.epoch = 0          # +1 whenever the issued mapping changes
         self.session = 0        # +1 at every ringing start
         self.ringing = False
@@ -173,8 +203,10 @@ class SntpClock:
         self._sleep = sleep_fn or time.sleep
         self.samples = []       # accepted burst minima: (tick, offset, rtt)
         self.rtts = []          # recent accepted minima rtt, for outlier test
-        self.a = None           # offset at tick tref
-        self.b = 0.0            # drift (ms per ms); utc = tick + a + b*(tick-tref)
+        self.a = None           # offset at tick tref (int us)
+        self.a_frac = 0.0       # small float part of the fitted offset (ms)
+        self.b = 0.0            # drift (ms per ms)
+                                # utc_ms = tick + ms(a + us(a_frac + b*(tick-tref)))
         self.tref = 0
         self.resid = 0.0        # max |residual| of the fit, ms
         self.drift_unc = self.xtal_ppm * 1e-6   # ms/ms; fit narrows it (n >= 3)
@@ -187,7 +219,8 @@ class SntpClock:
 
     # ---- one query --------------------------------------------------------
     def _query(self, ip):
-        """One SNTP exchange. Returns (t1, t4, t2, t3, stratum) or None.
+        """One SNTP exchange. Returns (t1, t4, t2, t3, stratum) or None:
+        t1/t4 extended ticks (ms), t2/t3 server Unix us (ints).
         Never raises for network trouble; blocks at most timeout_s."""
         pkt = bytearray(48)
         pkt[0] = 0x23                            # LI 0, VN 4, mode 3 (client)
@@ -226,7 +259,7 @@ class SntpClock:
             return None
         s2, f2, s3, f3 = struct.unpack(">IIII", bytes(b[32:48]))
         self.stats["ok"] += 1
-        return (t1, t4, ntp_to_unix_ms(s2, f2), ntp_to_unix_ms(s3, f3), stratum)
+        return (t1, t4, ntp_to_unix_us(s2, f2), ntp_to_unix_us(s3, f3), stratum)
 
     # ---- one burst --------------------------------------------------------
     def _rtt_limit(self):
@@ -269,10 +302,9 @@ class SntpClock:
 
     def _better(self, best, r, ip):
         t1, t4, t2, t3, st = r
-        off, rtt = offset_delay(t1, t2, t3, t4)
-        if rtt < 0:
-            rtt = 0.0                            # 1 ms tick quantisation
-        cand = (rtt, t1 + (t4 - t1) / 2.0, off, st, ip)
+        off, rtt_us = offset_delay(t1 * US_PER_MS, t2, t3, t4 * US_PER_MS)
+        rtt = max(rtt_us, 0) / float(US_PER_MS)  # small: float ms is fine
+        cand = (rtt, t1 + (t4 - t1) // 2, off, st, ip)   # off: int us
         return cand if best is None or cand[0] < best[0] else best
 
     def _finish(self, best):
@@ -289,34 +321,37 @@ class SntpClock:
             return False
         self.rtts.append(rtt)
         self.rtts = self.rtts[-self.rtt_hist:]
-        self.samples.append((tick, off, rtt))
+        self.samples.append((tick, off, rtt))    # off in int us
         self.samples = self.samples[-self.fit_samples:]
         self._fit()
         self.last_good = self.clock.now()
         if not self.ringing:
             self._apply(self.last_good)
         self.last = {"ok": True, "server": ip, "stratum": st, "rtt_ms": rtt,
-                     "offset_ms": off, "drift_ppm": self.b * 1e6}
+                     "offset_ms": us_to_ms(off), "drift_ppm": self.b * 1e6}
         return True
 
     def _fit(self):
-        """Least squares offset(tick) = a + b*(tick - tref), tref = last tick."""
+        """Least squares offset(tick) = a + a_frac + b*(tick - tref),
+        tref = last tick, a = last offset (int us).  The fit itself runs on
+        small deltas from (tref, a) in float ms, so float32 is enough."""
         pts = self.samples
         self.tref = pts[-1][0]
+        self.a = pts[-1][1]
         if len(pts) < 2:
-            self.a, self.b, self.resid = pts[-1][1], 0.0, 0.0
+            self.a_frac, self.b, self.resid = 0.0, 0.0, 0.0
             return
         xs = [p[0] - self.tref for p in pts]
-        ys = [p[1] for p in pts]
+        ys = [(p[1] - self.a) / float(US_PER_MS) for p in pts]
         n = float(len(pts))
         mx, my = sum(xs) / n, sum(ys) / n
         sxx = sum((x - mx) ** 2 for x in xs)
         if sxx <= 0:
-            self.a, self.b, self.resid = my, 0.0, 0.0
+            self.a_frac, self.b, self.resid = my, 0.0, 0.0
             return
         self.b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
-        self.a = my - self.b * mx
-        res = [y - (self.a + self.b * x) for x, y in zip(xs, ys)]
+        self.a_frac = my - self.b * mx
+        res = [y - (self.a_frac + self.b * x) for x, y in zip(xs, ys)]
         self.resid = max(abs(r) for r in res)
         if len(pts) >= 3:                        # slope standard error
             se = (sum(r * r for r in res) / (n - 2) / sxx) ** 0.5
@@ -325,8 +360,9 @@ class SntpClock:
 
     # ---- mapping ----------------------------------------------------------
     def _est(self, tick):
-        """The current ESTIMATE (fit), not what is issued."""
-        return tick + self.a + self.b * (tick - self.tref)
+        """The current ESTIMATE (fit), not what is issued.  Int ms."""
+        small_us = int(round((self.a_frac + self.b * (tick - self.tref)) * US_PER_MS))
+        return tick + us_to_ms(self.a + small_us)
 
     def _seg_at(self, tick):
         seg = None
@@ -341,7 +377,9 @@ class SntpClock:
         sg = self._seg_at(tick)
         if sg is None:
             return None
-        return sg[1] + (tick - sg[0]) * sg[2]
+        t0, u0, dr = sg
+        d = tick - t0
+        return u0 + d + int(round(d * dr))       # int ms; float only on d
 
     def _log(self, kind, tick, **kw):
         e = {"kind": kind, "tick_ms": tick, "epoch": self.epoch,
@@ -355,9 +393,9 @@ class SntpClock:
         if self.a is None:
             return
         e_now = self._est(now)
-        rate = 1.0 + self.b
+        dr = self.b
         if not self.segs:
-            self.segs = [(now, e_now, rate)]
+            self.segs = [(now, e_now, dr)]
             self.epoch += 1
             self._log("install", now)
             return
@@ -366,16 +404,17 @@ class SntpClock:
         self.segs = [sg for sg in self.segs if sg[0] <= now]
         self.epoch += 1
         if c > self.step_ms:
-            self.segs.append((now, e_now, rate))
+            self.segs.append((now, e_now, dr))
             self._log("step", now, correction_ms=c)
-        elif abs(c) < 1e-6:
-            self.segs.append((now, m_now, rate))
+        elif c == 0:
+            self.segs.append((now, m_now, dr))
         else:
             dur = abs(c) / self.max_slew
-            srate = rate + (self.max_slew if c > 0 else -self.max_slew)
-            self.segs.append((now, m_now, srate))
-            self.segs.append((now + dur, m_now + srate * dur, rate))
-            self._log("slew", now, correction_ms=c, slew_s=dur / 1000.0)
+            sdr = dr + (self.max_slew if c > 0 else -self.max_slew)
+            end = int(round(dur))                # slew length, whole ticks
+            self.segs.append((now, m_now, sdr))
+            self.segs.append((now + end, m_now + end + int(round(end * sdr)), dr))
+            self._log("slew", now, correction_ms=c, slew_s=dur / MS_PER_S)
         self.segs = self.segs[-16:]
 
     def set_ringing(self, ringing, now=None):
@@ -389,9 +428,9 @@ class SntpClock:
             self.ringing = True
             if self.segs:
                 f = self._issued(now)
-                rate = (1.0 + self.b) if self.a is not None else self._seg_at(now)[2]
+                dr = self.b if self.a is not None else self._seg_at(now)[2]
                 self.segs = [sg for sg in self.segs if sg[0] <= now]
-                self.segs.append((now, f, rate))   # one straight line
+                self.segs.append((now, f, dr))     # one straight line
                 self.segs = self.segs[-16:]
                 self.epoch += 1
                 self._session_null = False
@@ -416,7 +455,7 @@ class SntpClock:
         if self.ringing:
             return "held"                        # frozen on purpose
         now = self.clock.now() if now is None else now
-        if now - self.last_good > self.stale_after * self.interval_s * 1000.0:
+        if now - self.last_good > self.stale_after * self.interval_s * MS_PER_S:
             return "stale"
         return "synced"
 
@@ -426,7 +465,7 @@ class SntpClock:
         if self.ringing and self._session_null:
             return None
         u = self._issued(tick)
-        return None if u is None else int(round(u))
+        return None if u is None else int(u)
 
     def error_ms(self, tick):
         """Error bound (ms) for utc_ms(tick): half the chosen RTT, tick
@@ -437,8 +476,8 @@ class SntpClock:
             return None
         rtt = self.samples[-1][2]
         age = abs(tick - self.tref)
-        gap = abs(self._est(tick) - self._issued(tick))
-        return rtt / 2.0 + 1.0 + self.resid + age * self.drift_unc + gap
+        gap = abs(self._est(tick) - self._issued(tick))     # int ms
+        return rtt / 2.0 + TICK_MS + self.resid + age * self.drift_unc + gap
 
     def accuracy_class(self, tick, ms_target=5.0, s_target=500.0):
         """"ms" (bell timing), "s" (tower-clock check, rounds to the right
