@@ -22,6 +22,40 @@ class FakeSntp:
                 "sync": "unsynced", "acc": None, "epoch": 0,
                 "session": 0, "mode": "fake"}
 
+def watch_empty(app, fh, plug_head):
+    """_watch_empty with a head now in empty ch1: no pulse / select while
+    the tower rings or a survey runs; triggers 'empty-head' when inactive."""
+    import asyncio
+    import concentrator
+    lasers = set(concentrator.load_pinmap(concentrator.cfg)["laser_gp"])
+    selects = []
+    real_select = app.mux.select
+
+    def counting_select(b):
+        selects.append(b)
+        return real_select(b)
+    app.mux.select = counting_select
+    plug_head()
+    res = {}
+
+    def check_once(name):
+        del selects[:]
+        del fh.duty_log[:]
+        now = app._empty_check + concentrator.EMPTY_CHECK_S
+        asyncio.run(app._watch_empty(now))
+        res[name] = {"selects": len(selects),
+                     "pulses": len([1 for gp, d in fh.duty_log if gp in lasers and d]),
+                     "doubt": app.survey_state.status()["doubt"],
+                     "ch": getattr(app.survey_state, "_pending_ch", None)}
+    for st in ("active", "ringing_down", "inactive"):
+        app.tower.tower = st
+        check_once(st)
+    asyncio.run(app.survey_state.step(True))       # survey now running
+    res["survey_phase"] = app.survey_state.phase
+    check_once("surveying")
+    return {"watch": res}
+
+
 def child(scenario, src, extra):
     fh = child_setup(src, extra)
     out = {"ok": False}
@@ -50,6 +84,8 @@ def child(scenario, src, extra):
         import concentrator
         app = concentrator.Concentrator(concentrator.cfg)
         run_survey(app, "boot")              # boot survey (was _probe_heads in __init__)
+        if scenario == "watch":
+            out.update(watch_empty(app, fh, plug_head))
         if scenario == "late":
             # empty at boot; a head is plugged into ch1 later
             out["laser8_boot"] = fh.pwm[8].duty_cycle
@@ -137,6 +173,20 @@ def main():
           r["ok"] and r.get("laser8_boot") == 0 and r.get("heads_late") == ["new"] + ["empty"] * 7
           and r.get("laser8_late") == 65535,
           r.get("exc") or (r.get("laser8_boot"), r.get("heads_late"), r.get("laser8_late")))
+    r = spawn(me, "watch")
+    w = r.get("watch") or {}
+    quiet = {"selects": 0, "pulses": 0, "doubt": False, "ch": None}
+    for st in ("active", "ringing_down"):
+        check("empty check: no laser pulse or mux select while tower " + st,
+              r["ok"] and w.get(st) == quiet, r.get("exc") or w.get(st))
+    check("empty check: inactive + idle pulses ch1 and triggers 'empty-head' ch1",
+          (w.get("inactive") or {}).get("pulses", 0) > 0
+          and (w.get("inactive") or {}).get("selects", 0) > 0
+          and w["inactive"]["doubt"] and w["inactive"]["ch"] == 0, w.get("inactive"))
+    check("empty check: no laser pulse or mux select while a survey runs",
+          w.get("survey_phase") == "examining"
+          and (w.get("surveying") or {}).get("selects") == 0
+          and (w.get("surveying") or {}).get("pulses") == 0, (w.get("survey_phase"), w.get("surveying")))
     r = spawn(me, "rebuild")
     check("close() releases everything; a second Concentrator builds clean",
           r["ok"] and not r["errors"] and r.get("heads") == ["empty"] * 8, r.get("exc") or r["errors"])

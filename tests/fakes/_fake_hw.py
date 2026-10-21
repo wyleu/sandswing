@@ -6,6 +6,7 @@ pwm = {}          # gp -> live PWMOut (for the GP28 RC-node fake)
 wdt_log = []      # (what, value, claims so far) for the fake watchdog
 din_fn = {}       # gp -> callable, test override of an input level
 adc_fn = {}       # gp -> callable, test override of an AnalogIn value
+duty_log = []     # (gp, duty) for every PWMOut.duty_cycle write
 
 
 def claim(pin, kind):

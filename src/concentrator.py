@@ -75,14 +75,17 @@ from connector_boards import DEFAULT_BOARDS
 from socket_survey import SocketSurvey, survey_all
 from channel_gate import ChannelGate
 from threshold_refresh import refresher_from_cfg
-from ring import Ring, open_midi
+from ring import Ring, open_midi, FULL
 import panel
 import report
 from board_pins import release
 from watchdog_guard import WatchdogGuard
 from sand_event import Emitter
 from sntp_pico import TickClock
-from survey_state import SurveyState, SURVEYING, SETTLED
+from survey_state import SurveyState, SURVEYING, SETTLED, IDLE as SURVEY_IDLE
+from mux_errors import ChannelBusy
+from laser_measure import counts_to_ma
+from adc_avg import avg as _avg
 
 CONFIG_FILE = "settings.json"
 RING_WINDOW_S = 0.4
@@ -93,6 +96,11 @@ HEAD_NAME = {"head_new": "new", "head_old": "old", "loopback": "lb",
              "unknown": "unknown"}
 
 HEARTBEAT_LENGTH = 1.25
+
+# empty-socket check (_watch_empty): tower inactive + survey idle only
+EMPTY_CHECK_S = 1.0          # gap between checks
+EMPTY_SETTLE_S = 0.02        # laser on -> read the sense ADC
+EMPTY_HEAD_MA = 5.0          # laser current that means a head is now fitted
 
 server = None
 
@@ -183,7 +191,7 @@ class Concentrator:
         self.link = "no_wifi"
         self.sntp = None
         
-        self._empty_check = 0
+        self._empty_check = 0        # last _watch_empty run (monotonic s)
             
         self.ticks = TickClock()
         self.events = Emitter(src="sandswing",
@@ -337,8 +345,6 @@ class Concentrator:
         for i, pin in enumerate(self.inputs):
             kind, held = self._channel(i, pin, now)
         self.ring.poll()
-        
-        self._watch_empty(now)
 
         tpm = (self.cfg.get("escapement", {}) or {}).get("tpm", 48)
         period = 120.0 / tpm                 # one pulse per two clock beats
@@ -437,34 +443,48 @@ class Concentrator:
         self._prev_tower = self.tower.tower
         self.gate.enforce(self.bells)
         
-    def _watch_empty(self, now):
-        if now - getattr(self, "_empty_check", 0) < 1.0:
+    async def _watch_empty(self, now):
+        """Look for a head plugged into an 'empty' socket: pulse its laser
+        and read its current.  Only while the tower is inactive and the
+        survey idle (the pulse can trip a neighbour's near-threshold head).
+        Awaited from _sense_step, so gate.enforce cannot cut the pulse."""
+        if self.tower.tower != "inactive" or self.survey_state.phase != SURVEY_IDLE:
+            return
+        if now - self._empty_check < EMPTY_CHECK_S:
             return
         self._empty_check = now
+        checked = False
         for i, kind in enumerate(self.head):
             if kind != "empty":
                 continue
-            if self._laser_current_present(i):
+            ma = await self._laser_current_ma(self.bells[i])
+            if ma is None:
+                continue                         # mux busy: next time
+            checked = True
+            if ma > EMPTY_HEAD_MA:
                 self.survey_state.trigger("empty-head", channel=i)
                 break
+        if checked:
+            # the select moved the output 4051: refresh the hold caps now
+            for _ in self.bells:
+                self.refresher.step()
 
-    def _laser_current_present(self, i):
-        """True if this channel’s laser shows current (same path as di_ma)."""
-        from laser_measure import counts_to_ma
-        bell = self.bells[i]
+    async def _laser_current_ma(self, bell):
+        """Laser current in mA, as di_ma in socket_survey.measure; None if
+        the mux is held (same ChannelBusy rule the refresher uses)."""
+        adc = bell.sense.adc
         try:
-            with self.mux.select(bell):          # or self.tower / whatever select you use
+            with self.mux.select(bell):
                 bell.laser.duty_cycle = 0
-                dark = bell.sense.adc.value if hasattr(bell.sense, "adc") else 0
-                bell.laser.duty_cycle = 65535
-                time.sleep(0.02)
-                on = bell.sense.adc.value if hasattr(bell.sense, "adc") else 0
-                bell.laser.duty_cycle = 0
-            ma = counts_to_ma(on - dark)
-            return ma > 5.0                      # same threshold classify uses
-        except Exception:
+                dark = _avg(adc, self.survey.n_avg)
+                bell.laser.duty_cycle = FULL
+                await asyncio.sleep(EMPTY_SETTLE_S)
+                on = _avg(adc, self.survey.n_avg)
+        except ChannelBusy:
+            return None
+        finally:
             bell.laser.duty_cycle = 0
-            return False
+        return counts_to_ma(on - dark)
 
     def close(self):
         """Release everything this file and tower_build claimed."""
@@ -496,6 +516,7 @@ class Concentrator:
             # head[] now, not at the next panel pass: _watch_empty reads it
             self._paint_kinds(self.survey_state.kinds, True)
             await self._start_ring(self.survey_state.kinds)
+        await self._watch_empty(time.monotonic())
         self.guard.loop_tick()
 
     async def sense_task(self):  # or loop()
