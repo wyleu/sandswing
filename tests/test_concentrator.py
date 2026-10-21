@@ -22,6 +22,65 @@ class FakeSntp:
                 "sync": "unsynced", "acc": None, "epoch": 0,
                 "session": 0, "mode": "fake"}
 
+class SessionSntp(FakeSntp):
+    """set_ringing(True) on inactive->active starts a new session, like
+    SntpClock; stamp() reports session and mode."""
+    def __init__(self):
+        FakeSntp.__init__(self)
+        self.ringing, self.session, self.wakes = False, 0, 0
+
+    def set_ringing(self, r):
+        if r != self.ringing:
+            self.ringing = r
+            if r:
+                self.session += 1
+                self.wakes += 1
+
+    def stamp(self, raw_tick=None):
+        st = FakeSntp.stamp(self, raw_tick)
+        st.update(session=self.session, mode="ringing" if self.ringing else "free")
+        return st
+
+
+DOUBLE_MS = 85            # bench: ch2 EDGEs 85 ms apart
+AFTER_GAP_MS = 300        # > MIN_STROKE_GAP_MS
+OTHER_CH_MS = 50          # ch2 stroke this soon after ch1's
+
+
+def strokes(app, fh):
+    """Waking stroke session/mode and the minimum stroke gap (int ms ticks)."""
+    import concentrator
+    from sntp_pico import TickClock
+    level = {0: True, 1: True}                   # True = beam clear (not held)
+    fh.din_fn[0] = lambda: level[0]
+    fh.din_fn[1] = lambda: level[1]
+    app.head[0] = app.head[1] = "new"            # heads, not plug-change sockets
+    t = [1000000]
+    app.ticks = TickClock(lambda: t[0])
+    app.ring.clock_ms = app.ticks.now
+    sent = []
+    concentrator.send = sent.append
+    app.sntp = SessionSntp()
+    app.poll_sense()                             # all clear: last_false set
+    app.tower.poll()
+    app._tower_step()
+    tower0 = app.tower.tower
+
+    def stroke(ch, dt_ms):
+        t[0] += dt_ms
+        level[ch] = False
+        app.poll_sense()
+        level[ch] = True
+        app.poll_sense()
+    stroke(0, 0)                                 # waking stroke
+    stroke(0, DOUBLE_MS)                         # double: ignored
+    stroke(0, AFTER_GAP_MS)                      # next stroke
+    stroke(1, OTHER_CH_MS)                       # other channel: independent
+    app._tower_step()
+    return {"tower0": tower0, "wakes": app.sntp.wakes,
+            "events": [[e["body"]["ch"], e["session"], e["mode"]] for e in sent]}
+
+
 def watch_empty(app, fh, plug_head):
     """_watch_empty with a head now in empty ch1: no pulse / select while
     the tower rings or a survey runs; triggers 'empty-head' when inactive."""
@@ -84,6 +143,8 @@ def child(scenario, src, extra):
         import concentrator
         app = concentrator.Concentrator(concentrator.cfg)
         run_survey(app, "boot")              # boot survey (was _probe_heads in __init__)
+        if scenario == "strokes":
+            out.update(strokes(app, fh))
         if scenario == "watch":
             out.update(watch_empty(app, fh, plug_head))
         if scenario == "late":
@@ -173,6 +234,17 @@ def main():
           r["ok"] and r.get("laser8_boot") == 0 and r.get("heads_late") == ["new"] + ["empty"] * 7
           and r.get("laser8_late") == 65535,
           r.get("exc") or (r.get("laser8_boot"), r.get("heads_late"), r.get("laser8_late")))
+    r = spawn(me, "strokes")
+    ev = r.get("events") or []
+    check("strokes: tower inactive before the waking stroke", r.get("tower0") == "inactive",
+          r.get("exc") or r.get("tower0"))
+    check("strokes: waking stroke carries the new session, mode ringing",
+          ev[:1] == [[1, 1, "ringing"]], ev)
+    check("strokes: %d ms double ignored, stroke after the gap accepted" % DOUBLE_MS,
+          [e[0] for e in ev] == [1, 1, 2], ev)
+    check("strokes: other channel independent of ch1's gap", ev[-1:] == [[2, 1, "ringing"]], ev)
+    check("strokes: one session for the whole ring (one wake)",
+          r.get("wakes") == 1 and all(e[1] == 1 for e in ev), (r.get("wakes"), ev))
     r = spawn(me, "watch")
     w = r.get("watch") or {}
     quiet = {"selects": 0, "pulses": 0, "doubt": False, "ch": None}

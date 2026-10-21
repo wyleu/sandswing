@@ -25,6 +25,15 @@ VEL_ON = 100
 VEL_OFF = 0
 FULL = 65535
 HEADS = ("head_new", "head_old")
+# A re-trip on one head sooner than this is a double (bounce), not a stroke
+# (54-125 ms doubles seen on the bench; a hand-swung beam gives >= 320 ms,
+# a ringing bell >~1.5 s).  Integer ms: CircuitPython floats are 32-bit.
+MIN_STROKE_GAP_MS = 250
+NS_PER_MS = 1000000
+
+
+def _ticks_ms():
+    return time.monotonic_ns() // NS_PER_MS
 
 
 def open_midi():
@@ -51,7 +60,8 @@ def _note_msg(note, on):
 
 
 class Ring:
-    def __init__(self, inputs, lasers, midi=None, notes=NOTES, send_fn=None):
+    def __init__(self, inputs, lasers, midi=None, notes=NOTES, send_fn=None,
+                 clock_ms=None, min_gap_ms=MIN_STROKE_GAP_MS):
         self.inputs = inputs
         self.lasers = lasers
         self.midi = midi
@@ -63,6 +73,9 @@ class Ring:
         self.prev_held = {}
         self.sounding = [False] * self.n
         self.strokes = [0] * self.n
+        self.clock_ms = clock_ms or _ticks_ms   # int ms
+        self.min_gap_ms = min_gap_ms
+        self.on_at = [None] * self.n            # ms of the last counted stroke
         self.running = False
 
     def start(self, kinds, duty=None):
@@ -98,6 +111,12 @@ class Ring:
             if held != self.prev_held[ch]:
                 trip = held != self.rest_held[ch]
                 if trip and not self.sounding[ch]:
+                    now = self.clock_ms()
+                    last = self.on_at[ch]
+                    if last is not None and now - last < self.min_gap_ms:
+                        self.prev_held[ch] = held      # double: no note, no stroke
+                        continue
+                    self.on_at[ch] = now
                     self.sounding[ch] = True
                     self.strokes[ch] += 1
                     self._send(ch, True)

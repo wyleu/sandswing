@@ -87,6 +87,26 @@ def test_open_midi_without_usb_midi_is_none():
     assert ring.open_midi() is None
 
 
+@case
+def test_double_trip_inside_min_gap_is_one_stroke():
+    t = [100000]                                     # int ms clock
+    ins = [Pin(True) for _ in range(2)]
+    las = [Pwm() for _ in range(2)]
+    sent = []
+    r = ring.Ring(ins, las, send_fn=lambda ch, note, on: sent.append((ch, note, on)),
+                  clock_ms=lambda: t[0])
+    r.start({0: "head_new", 1: "head_new"})
+    ins[0].value = False; r.poll()                   # stroke
+    t[0] += 20; ins[0].value = True; r.poll()
+    t[0] += 34; ins[0].value = False; r.poll()       # 54 ms later: double
+    t[0] += 20; ins[0].value = True; r.poll()
+    assert r.strokes[0] == 1 and sent == [(0, 65, True), (0, 65, False)], sent
+    ins[1].value = False; r.poll()                   # other bell: independent
+    assert r.strokes[1] == 1, r.strokes
+    t[0] += ring.MIN_STROKE_GAP_MS; ins[0].value = False; r.poll()   # after the gap
+    assert r.strokes[0] == 2 and sent[-1] == (0, 65, True), sent
+
+
 n_fail = results.count(False)
 print("\n%d passed, %d failed" % (len(results) - n_fail, n_fail))
 sys.exit(1 if n_fail else 0)

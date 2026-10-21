@@ -75,7 +75,7 @@ from connector_boards import DEFAULT_BOARDS
 from socket_survey import SocketSurvey, survey_all
 from channel_gate import ChannelGate
 from threshold_refresh import refresher_from_cfg
-from ring import Ring, open_midi, FULL
+from ring import Ring, open_midi, FULL, MIN_STROKE_GAP_MS
 import panel
 import report
 from board_pins import release
@@ -221,7 +221,8 @@ class Concentrator:
         self.refresher = refresher_from_cfg(self.mux, self.bells,
                                             self.pinmap["raw"].get("threshold_mux") or {},
                                             gate=self.gate)
-        self.ring = Ring(self.inputs, self.lasers, midi=open_midi())
+        self.ring = Ring(self.inputs, self.lasers, midi=open_midi(),
+                         clock_ms=self.ticks.now)
         
         # early boot indication — before the long self-test
         self.kinds = {i: "examining" for i in range(min(4, self.n))}
@@ -305,6 +306,7 @@ class Concentrator:
         self._still_held = [not pin.value for pin in self.inputs]
         self.last_false = [None] * self.n
         self.edge_at = [None] * self.n
+        self.stroke_ms = [None] * self.n     # tick ms of the last accepted stroke
         self._prev_held = list(self._still_held)
         self._rescan_due = None
         self.high_since = [time.monotonic()] * self.n
@@ -408,11 +410,17 @@ class Concentrator:
             self.tower.report(i, IDLE, False)
             return IDLE, held
     
+        stroke = False
         if became and self.last_false[i] is not None:
             self.edge_at[i] = now
-            print("%.3f ch %d EDGE" % (now, i + 1))
-            send(self.events.make(self.sntp, "stroke", {"ch": i + 1}))
-            
+            t_ms, last = self.ticks.now(), self.stroke_ms[i]
+            if last is not None and t_ms - last < MIN_STROKE_GAP_MS:
+                print("%.3f ch %d DOUBLE %dms (ignored)" % (now, i + 1, t_ms - last))
+            else:
+                self.stroke_ms[i] = t_ms
+                stroke = True
+                print("%.3f ch %d EDGE" % (now, i + 1))
+
         if not held:
             self.last_false[i] = now
             if self.tower.test_mark[i]:
@@ -432,14 +440,23 @@ class Concentrator:
             self.tower.set_fitted(i, True)
             print("%.3f ch %d fitted" % (now, i + 1))
         self.tower.report(i, kind, held)
+        if stroke:
+            # the tower (and so the time session) wakes on this stroke:
+            # switch to ringing first so the stroke carries the new session
+            self._sync_ringing()
+            send(self.events.make(self.sntp, "stroke", {"ch": i + 1}))
         self._settle(i, held, now)
         return kind, held
 
 
-    def _tower_step(self):
+    def _sync_ringing(self):
+        """Time session follows the tower: active / ringing_down = ringing."""
         ringing = self.tower.tower in ("active", "ringing_down")
         if self.sntp is not None:
             self.sntp.set_ringing(ringing)
+
+    def _tower_step(self):
+        self._sync_ringing()
         self._prev_tower = self.tower.tower
         self.gate.enforce(self.bells)
         
