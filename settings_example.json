@@ -1,11 +1,21 @@
 {
+  "watchdog": {
+    "enabled": false,
+    "timeout_s": 8,
+    "mode": "reset",
+    "allow_with_usb": false,
+    "heartbeats": {"ws_poll": 5},
+    "ack_after_s": 86400
+    },
   "wifi": {
-    "ssid": "NOWRH81L",
-    "password": "YOUR_PASSWORD"
-  },
+  "networks": [
+       {"ssid": "NOWRH81L", "password": "********", "priority": 1},
+       {"ssid": "Sandbells", "password": "********", "priority": 2}
+     ]
+   },
   "time": {
      "ntp_ips": ["192.168.0.221", "10.42.0.1"] 
-  },
+  }, 
   "device": {
     "name": "sandswing-pico",
     "family": "sandswing",
