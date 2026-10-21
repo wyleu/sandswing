@@ -37,14 +37,12 @@ class SurveyState:
         self.phase = IDLE
         self.kinds = {}
         self.last_result = {}
-        self._flash_left = 0
         self._doubt = False          # set when we should re-assess
 
     def trigger(self, reason="manual", channel=None):
         """Call when there is doubt (plug event, inactive, boot, explicit)."""
         self._doubt = True
         self._pending_ch = channel
-        self._reason = reason
 
 
     async def step(self, beat_on=True):
@@ -72,13 +70,6 @@ class SurveyState:
         return self.phase
 
 
-
-    def _examining_kinds(self):
-        if getattr(self, "_pending_ch", None) is not None:
-            k = dict(self.kinds)
-            k[self._pending_ch] = "examining"
-            return k
-        return {i: "examining" for i in range(self.n)}
 
     def status(self):
         return {"phase": self.phase, "kinds": dict(self.kinds),

@@ -16,9 +16,7 @@
 # exists, C7 rest hint, C8 "head_pending"), with old/new decided only in the
 # reflector stage (R2).  See sandswing_code_changes.md section A.
 from signal_bands import (COUNTS_PER_MA, FLOOR_COUNTS, LB_RATIO_MIN,
-                          LB_LOAD_MIN, LB_LOAD_MAX, UNLOADED_MIN)
-
-KINDS = ("loopback", "head_new", "head_old", "empty", "fault")
+                          UNLOADED_MIN)
 
 
 def classify_socket(m, expected_ma=5.0, floor=FLOOR_COUNTS):

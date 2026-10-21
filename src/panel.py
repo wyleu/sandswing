@@ -18,8 +18,6 @@ panel.py -- the 6 front-panel LEDs (WS2813 on GP16), one function for all.
 ...
 """
 
-import time
-
 PANEL_N = 6
 
 LED_KIND = {

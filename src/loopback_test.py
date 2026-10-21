@@ -8,8 +8,7 @@
 # TODO(spec C3/C4): fixed sleeps below (0.01 s, 0.137 ms) -> derived waits.
 from rc_timing import rc_settle_s
 from adc_avg import avg as _avg
-from signal_bands import (LB_RATIO_MIN, LB_LOAD_MIN, LB_LOAD_MAX,
-                          UNLOADED_MIN, DAC_MAX_RESID, SWEEP_TOL)
+from signal_bands import LB_RATIO_MIN, UNLOADED_MIN, DAC_MAX_RESID
 
 
 def _fit(xs, ys):

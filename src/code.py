@@ -8,9 +8,6 @@ import time
 DEFAULT_PROGRAM = None  # ← set to e.g. "fallback.py" if desired
 CONFIG_FILE = "settings.json"
 try:
-    #import tomllib
-    # with open("settings.toml", "rb") as f:
-    #     config = tomllib.load(f)
     import json
     with open(CONFIG_FILE, "rb") as f:
         config = json.load(f)

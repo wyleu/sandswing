@@ -345,7 +345,6 @@ def load_config(path=CONFIG_PATH):
 
 def get_cfg():
     """Return cfg, loading defaults+file if needed."""
-    global cfg
     if cfg is None:
         return load_config()
     return cfg

@@ -27,7 +27,7 @@ Flow
    The watchdog (watchdog_guard, OFF by default) is armed only after
    startup, just before the steady loop, and fed only from _sense_step().
 5. Steady loop (sense_task): poll sense, tower, gate, await survey step,
-   feed watchdog. panel_task and status/ws tasks run alongside.
+   feed watchdog. panel_task and the ws poll task run alongside.
 
 The old test-program exec (settings test.program) is gone; see RETIRE.md.
 On tower-inactive the absolute head state can be re-assessed by triggering
@@ -62,13 +62,12 @@ except ImportError:
 from config_loader import load_config
 from tower_watch import (
     TowerWatch,
-    status_pixel,
     RINGING,
     STOOD,
     IDLE,
 )
 from pins_from_settings import load_pinmap
-from farm_ws import connect_wifi, start_server, poll, send
+from farm_ws import connect_wifi, start_server, send
 import farm_ws
 from tower_build import build_from_pins
 from connector_boards import DEFAULT_BOARDS
@@ -87,7 +86,6 @@ from mux_errors import ChannelBusy
 from laser_measure import counts_to_ma
 from adc_avg import avg as _avg
 
-CONFIG_FILE = "settings.json"
 RING_WINDOW_S = 0.4
 SETTLE_S = 0.3
 # survey kind -> the head names this file and sand_status already use
@@ -102,16 +100,8 @@ EMPTY_CHECK_S = 1.0          # gap between checks
 EMPTY_SETTLE_S = 0.02        # laser on -> read the sense ADC
 EMPTY_HEAD_MA = 5.0          # laser current that means a head is now fitted
 
-server = None
-
 cfg = load_config()
 cfg.banner()
-
-def load_settings():
-    import json
-    with open(CONFIG_FILE, "r") as f:
-        return json.load(f)
-
 
 def _claim_sense(sense_gps):
     pins = []
@@ -122,13 +112,6 @@ def _claim_sense(sense_gps):
         pins.append(pin)
     return pins
 
-
-def _release(pins):
-    for pin in pins:
-        try:
-            pin.deinit()
-        except Exception:
-            pass
 
 def setup_net():
     if not connect_wifi(cfg):
@@ -168,8 +151,6 @@ if farm_log:
     farm_log.start(cfg)
 
 def emit(msg):
-    global _last_line
-    _last_line = str(msg)
     print(msg)
     if farm_log:   
         farm_log.write(msg)
@@ -217,8 +198,6 @@ class Concentrator:
             paint_fn=lambda kinds, beat: self._paint_kinds(kinds, beat),
         )
         self.survey_state.trigger("boot")
-        self._inactive_surveyed = True
-        self._inactive_since = time.monotonic()
         
         self.refresher = refresher_from_cfg(self.mux, self.bells,
                                             self.pinmap["raw"].get("threshold_mux") or {},
@@ -243,7 +222,6 @@ class Concentrator:
             print("   dac", st["dac"])
         
         self._init_edge_state()
-        self._prev_tower = self.tower.tower
         
         self.head = ["unknown"] * self.n
         self.kinds = {}
@@ -279,7 +257,6 @@ class Concentrator:
             emit("pins: " + w)
         drive = self.bells[0].drive if self.bells else None
         self.thr_pwm = drive.pwm if drive else None      # GP21, threshold_mux.pwm_hz
-        self.thr_sense = drive.back if drive else None   # GP28 monitor
 
     def _setup_lasers(self):
         pins = self.mux.pins
@@ -304,14 +281,10 @@ class Concentrator:
         self.ring.start(kinds)        # TODO(spec section 6): per-head laser_duty
 
     def _init_edge_state(self):
-        self._still_since = [time.monotonic()] * self.n
-        self._still_held = [not pin.value for pin in self.inputs]
         self.last_false = [None] * self.n
         self.edge_at = [None] * self.n
         self.stroke_ms = [None] * self.n     # tick ms of the last accepted stroke
-        self._prev_held = list(self._still_held)
-        self._rescan_due = None
-        self.high_since = [time.monotonic()] * self.n
+        self._prev_held = [not pin.value for pin in self.inputs]
         self.frame = panel.panel_frame({}, self.link)
         
     def status_payload(self):
@@ -338,20 +311,14 @@ class Concentrator:
         """Call when the GPS clock head announces the day boundary."""
         self.tower.gps_tick()
 
-    def report_head(self, index, kind, return_held):
-        self.tower.report(index, kind, return_held)
-
     def poll_sense(self):
         """Active-low sense, pull-up. A falling edge opens a ring window.
         A return held with no edge is STOOD, not an edge.
         """
         now = time.monotonic()
         for i, pin in enumerate(self.inputs):
-            kind, held = self._channel(i, pin, now)
+            self._channel(i, pin, now)
         self.ring.poll()
-
-        tpm = (self.cfg.get("escapement", {}) or {}).get("tpm", 48)
-        period = 120.0 / tpm                 # one pulse per two clock beats
 
     def _paint_kinds(self, kinds, beat_on):
         self.kinds = kinds
@@ -384,20 +351,6 @@ class Concentrator:
                                        right=right)
         panel.paint(self.strip, self.frame)
         
-    def _settle(self, i, held, now):
-        if held != self._still_held[i]:
-            self._still_held[i] = held
-            self._still_since[i] = now
-            return
-        if i not in self.fitted:
-            return
-        if (now - self._still_since[i]) < SETTLE_S:
-            return
-        kind = "old" if held else "new"
-        if self.head[i] is None:
-            self.head[i] = kind
-            print("ch %d head=%s" % (i + 1, kind))
-            
     def _channel(self, i, pin, now):
         prev = self._prev_held[i]
         held = not pin.value
@@ -447,7 +400,6 @@ class Concentrator:
             # switch to ringing first so the stroke carries the new session
             self._sync_ringing()
             send(self.events.make(self.sntp, "stroke", {"ch": i + 1}))
-        self._settle(i, held, now)
         return kind, held
 
 
@@ -459,7 +411,6 @@ class Concentrator:
 
     def _tower_step(self):
         self._sync_ringing()
-        self._prev_tower = self.tower.tower
         self.gate.enforce(self.bells)
         
     async def _watch_empty(self, now):
@@ -546,11 +497,6 @@ class Concentrator:
             await self._sense_step()
             await asyncio.sleep(0.02)
 
-    async def status_task(self):
-        while True:
-            # existing status / WS send
-            await asyncio.sleep(0.1)
-            
     async def panel_task(self):
         import panel as P
         from survey_state import PHASE_KIND
@@ -606,7 +552,6 @@ async def main():
     app = start_app()
     tasks = [
         app.sense_task(),
-        app.status_task(),
         app.panel_task(),
         ws_poll_task(app.guard),
         app.refresher.run()
