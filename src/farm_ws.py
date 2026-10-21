@@ -3,6 +3,7 @@
 # Shared by sandswing, sandsense, and other timed Sand* devices.
 # Pattern for /ws accept taken from sandsense (Websocket(request)).
 import json
+import time
 import wifi
 import adafruit_connection_manager
 
@@ -112,7 +113,7 @@ def _drop(why):
         except Exception:
             pass
     _ws = None
-    print("WS client dropped:", why)
+    print("%.3f WS client dropped:" % time.monotonic(), why)
 
 
 def poll():

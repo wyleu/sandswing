@@ -404,7 +404,7 @@ class Concentrator:
     
         if became and self.last_false[i] is not None:
             self.edge_at[i] = now
-            print("ch %d EDGE" % (i + 1))
+            print("%.3f ch %d EDGE" % (now, i + 1))
             send(self.events.make(self.sntp, "stroke", {"ch": i + 1}))
             
         if not held:
@@ -418,13 +418,13 @@ class Concentrator:
         else:
             kind = IDLE
         if became:
-            print("ch %d HELD kind=%s" % (i + 1, kind))
+            print("%.3f ch %d HELD kind=%s" % (now, i + 1, kind))
         elif released:
-            print("ch %d CLEAR" % (i + 1))
+            print("%.3f ch %d CLEAR" % (now, i + 1))
         if held and i not in self.fitted:
             self.fitted.add(i)
             self.tower.set_fitted(i, True)
-            print("ch %d fitted" % (i + 1))
+            print("%.3f ch %d fitted" % (now, i + 1))
         self.tower.report(i, kind, held)
         self._settle(i, held, now)
         return kind, held

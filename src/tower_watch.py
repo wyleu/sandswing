@@ -220,7 +220,7 @@ class TowerWatch:
             MAGENTA: "magenta marked",
             CYAN: "cyan test",
         }
-        print("tower", names.get(colour, colour), self.tower)
+        print("%.3f tower" % time.monotonic(), names.get(colour, colour), self.tower)
         if self.status is None:
             return
         self.status[0] = colour

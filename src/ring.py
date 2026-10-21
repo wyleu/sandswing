@@ -18,6 +18,8 @@ Does not sweep the orange threshold wire. Does not paint pixels: tripped()
 feeds panel.panel_frame via concentrator.
 """
 
+import time
+
 NOTES = (65, 64, 62, 60, 58, 57, 55, 53)
 VEL_ON = 100
 VEL_OFF = 0
@@ -77,7 +79,7 @@ class Ring:
             self.rest_held[ch] = held
             self.prev_held[ch] = held
         self.running = True
-        print("RINGING", [(c + 1, k, self.notes[c]) for c, k in sorted(self.heads.items())])
+        print("%.3f RINGING" % time.monotonic(), [(c + 1, k, self.notes[c]) for c, k in sorted(self.heads.items())])
 
     def _send(self, ch, on):
         note = self.notes[ch]
@@ -85,8 +87,8 @@ class Ring:
             self._send_fn(ch, note, on)
         elif self.midi is not None:
             self.midi.send(_note_msg(note, on))
-        print("ch %d %s %d%s" % (ch + 1, "ON" if on else "OFF", note,
-                                 "" if (self.midi or self._send_fn) else " (no midi)"))
+        print("%.3f ch %d %s %d%s" % (time.monotonic(), ch + 1, "ON" if on else "OFF", note,
+                                       "" if (self.midi or self._send_fn) else " (no midi)"))
 
     def poll(self):
         if not self.running:
