@@ -337,7 +337,7 @@ class Concentrator:
             self.tower.tower, "heartbeat")
         
         if activity == "heartbeat":
-            synced = self.sntp is not None and getattr(self.sntp, "synced", False)
+            synced = self.sntp is not None and self.sntp.state() == "synced"
             if not synced:
                 activity = "heartbeat_nosync"
         
@@ -519,6 +519,10 @@ class Concentrator:
                 rate = P.LED_KIND[override][1]
             channel_on = True if rate <= 0 else ((time.monotonic() * (rate + 1)) % 1.0) < 0.5
 
+            # LED1: green while a /ws client (Sandbells ingest) is connected
+            if self.link != "no_wifi":
+                self.link = "ws_client" if farm_ws.ws_clients() else "wifi_only"
+
             # heartbeat beat (always toggles)
             heartbeat_on = (time.monotonic() % HEARTBEAT_LENGTH) < (HEARTBEAT_LENGTH /2) 
 
@@ -534,7 +538,7 @@ def start_app():
     armed last."""
     ip = setup_net()
     app = Concentrator(cfg)
-    app.link = "wifi_only" if ip else "no_wifi"   # TODO: ws_client from farm_ws
+    app.link = "wifi_only" if ip else "no_wifi"   # panel_task: ws_client when /ws connected
 
     app.sntp = setup_sntp(ip)
     
