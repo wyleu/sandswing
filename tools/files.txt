@@ -35,3 +35,4 @@ sand_status.py
 bell_machine.py
 sand_event.py
 survey_state.py
+fake_strokes.py
