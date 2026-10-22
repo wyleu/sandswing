@@ -113,8 +113,18 @@ def _claim_sense(sense_gps):
     return pins
 
 
+WIFI_ROUNDS = 6          # passes over wifi.networks at boot before giving up
+WIFI_RETRY_S = 10        # pause between passes (hotspot may still be starting)
+
+
 def setup_net():
-    if not connect_wifi(cfg):
+    for rnd in range(WIFI_ROUNDS):
+        if connect_wifi(cfg):
+            break
+        if rnd < WIFI_ROUNDS - 1:
+            emit("WiFi pass %d/%d failed – retry in %d s" % (rnd + 1, WIFI_ROUNDS, WIFI_RETRY_S))
+            time.sleep(WIFI_RETRY_S)
+    else:
         emit("No WiFi – lineup still runs")
         return None
     import wifi
