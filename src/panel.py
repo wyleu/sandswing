@@ -22,6 +22,7 @@ PANEL_N = 6
 
 LED_KIND = {
     "loopback":  ((0, 0, 24), 0),
+    "trigger":   ((24, 0, 48), 0),   # bluish violet, steady: trigger plug (test switch)
     "head_new":  ((0, 32, 0), 0),
     "head_old":  ((16, 32, 0), 0),
     "empty":     ((24, 12, 0), 0),

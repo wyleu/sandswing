@@ -123,12 +123,19 @@ class LoopbackSelfTest:
             if getattr(b, "laser", None) is not None and \
                     getattr(b, "sense_pin", None) is not None and r["threshold"]["plug"]:
                 r["digital"] = self.digital_loopback(b)
-                r["sweep"] = self.duty_sweep(b)
+                seen = r["digital"]["seen"]
+                if not r["digital"]["ok"] and len(set(seen)) == 1:
+                    # strap B, sense ignores the laser (high: switch open;
+                    # low: switch to 0 V held): a trigger plug.  Not a failure.
+                    r["digital"].update(ok=None, trigger=True)
+                else:
+                    r["sweep"] = self.duty_sweep(b)
             report["channels"][b.index] = r
         free = [b for b in bells if report["channels"][b.index]["threshold"]["plug"] is False]
         db = dac_bell or (free[0] if free else None)
         report["dac"] = self.dac_linearity(db) if db is not None else \
             {"test": "dac_linearity", "ok": None, "why": "no unloaded channel"}
-        oks = [t["ok"] for r in report["channels"].values() for t in r.values()]
+        oks = [t["ok"] for r in report["channels"].values() for t in r.values()
+               if t["ok"] is not None]
         report["ok"] = all(oks) and report["dac"]["ok"] is not False
         return report

@@ -90,6 +90,7 @@ RING_WINDOW_S = 0.4
 SETTLE_S = 0.3
 # survey kind -> the head names this file and sand_status already use
 HEAD_NAME = {"head_new": "new", "head_old": "old", "loopback": "lb",
+             "trigger": "trigger",
              "empty": "empty", "no_board": "empty", "fault": "fault",
              "unknown": "unknown"}
 
@@ -104,6 +105,15 @@ WIFI_REJOIN_RINGING_S = 120.0    # ...and while ringing (a join blocks sensing)
 WIFI_JOIN_TIMEOUT_S = 10         # per network in the list
 LINK_DEAD_S = 120.0              # Wi-Fi "up" but no client heard: radio reset
 LINK_DEAD_RESET_S = 600.0        # still nothing: reset the Pico (watchdog armed only)
+
+# Trigger plug (test switch, docs/trigger-plug.md).  Code constants.
+# Stroke on the first low sample after the switch has been seen open for
+# TRIGGER_REARM_MS (release bounce cannot re-fire; press bounce is ignored
+# because the channel is disarmed until a clean release).
+TRIGGER_REARM_MS = 50            # open this long before the next press counts
+TRIGGER_MIN_GAP_MS = 150         # and never two test strokes closer than this
+TRIGGER_STUCK_MS = 10000         # held this long (tower quiet): resurvey once
+TRIGGER_BODY = {"test": True, "src": "trigger"}
 
 # empty-socket check (_watch_empty): tower inactive + survey idle only
 EMPTY_CHECK_S = 1.0          # gap between checks
@@ -315,6 +325,11 @@ class Concentrator:
         self.edge_at = [None] * self.n
         self.stroke_ms = [None] * self.n     # tick ms of the last accepted stroke
         self._prev_held = [not pin.value for pin in self.inputs]
+        self.trig_armed = [False] * self.n   # trigger plug: next press counts
+        self.trig_open_ms = [None] * self.n  # tick ms the switch was seen open
+        self.trig_low_ms = [None] * self.n   # tick ms the press began
+        self.trig_stuck = [False] * self.n
+        self.trig_presses = [0] * self.n
         self.frame = panel.panel_frame({}, self.link)
         
     def status_payload(self):
@@ -360,7 +375,8 @@ class Concentrator:
 
     def _paint(self, beat_on):
         tripped = self.ring.tripped()
-        kinds = dict((c, "response" if c in tripped else self.kinds.get(c, "unknown"))
+        kinds = dict((c, "response" if (c in tripped or self._trigger_down(c))
+                      else self.kinds.get(c, "unknown"))
                      for c in range(4))
         
         
@@ -400,7 +416,9 @@ class Concentrator:
             return IDLE, held
     
         stroke = False
-        if became and self.last_false[i] is not None:
+        if self.head[i] == "trigger":
+            stroke = self._trigger_edge(i, held, now)
+        elif became and self.last_false[i] is not None:
             self.edge_at[i] = now
             t_ms, last = self.ticks.now(), self.stroke_ms[i]
             if last is not None and t_ms - last < MIN_STROKE_GAP_MS:
@@ -433,8 +451,55 @@ class Concentrator:
             # the tower (and so the time session) wakes on this stroke:
             # switch to ringing first so the stroke carries the new session
             self._sync_ringing()
-            send(self.events.make(self.sntp, "stroke", {"ch": i + 1}))
+            body = {"ch": i + 1}
+            if self.head[i] == "trigger":
+                body.update(TRIGGER_BODY)        # labelled, never hidden
+            send(self.events.make(self.sntp, "stroke", body))
         return kind, held
+
+    def _trigger_down(self, i):
+        prev = getattr(self, "_prev_held", None)     # not yet at early boot
+        return (prev is not None and i < self.n
+                and self.head[i] == "trigger" and prev[i])
+
+    def _trigger_edge(self, i, held, now):
+        """Trigger plug: True when this sample is a counted press."""
+        t = self.ticks.now()
+        opened = self.trig_open_ms[i]
+        if opened is not None and t < opened:
+            opened = self.trig_open_ms[i] = t        # clock replaced: start again
+        if not held:
+            self.trig_low_ms[i] = None
+            self.trig_stuck[i] = False
+            if opened is None:
+                self.trig_open_ms[i] = t
+            elif t - opened >= TRIGGER_REARM_MS:
+                self.trig_armed[i] = True
+            return False
+        if opened is not None and t - opened >= TRIGGER_REARM_MS:
+            self.trig_armed[i] = True                # open long enough before this press
+        self.trig_open_ms[i] = None
+        if self.trig_low_ms[i] is None:
+            self.trig_low_ms[i] = t
+        elif (not self.trig_stuck[i] and self.tower.tower == "inactive"
+              and t - self.trig_low_ms[i] >= TRIGGER_STUCK_MS):
+            # a hand does not hold a push switch this long: a head swapped
+            # in, or a stuck switch.  Look again (once per hold).
+            self.trig_stuck[i] = True
+            print("%.3f ch %d trigger held %d ms: resurvey" % (now, i + 1, t - self.trig_low_ms[i]))
+            self.survey_state.trigger("trigger-held", channel=i)
+        if not self.trig_armed[i]:
+            return False
+        self.trig_armed[i] = False
+        last = self.stroke_ms[i]
+        if last is not None and t - last < TRIGGER_MIN_GAP_MS:
+            print("%.3f ch %d TRIGGER %dms after the last (ignored)" % (now, i + 1, t - last))
+            return False
+        self.stroke_ms[i] = t
+        self.edge_at[i] = now
+        self.trig_presses[i] += 1
+        print("%.3f ch %d TRIGGER press %d" % (now, i + 1, self.trig_presses[i]))
+        return True
 
 
     def _sync_ringing(self):

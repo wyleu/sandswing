@@ -53,4 +53,36 @@ def test_full_run_report():
     assert rep["dac"]["ch"] == 2
 
 
+class IdleHighPin(object):
+    """Blue/White with nothing driving it but the pull-up (trigger plug,
+    switch open)."""
+    value = True
+
+
+@case
+def test_trigger_plug_in_selftest_is_not_a_failure():
+    random.seed(4)
+    tower, bells, _ = rig(plug_a={0}, plug_b={0, 1})
+    bells[1].sense_pin = IdleHighPin()          # ch2: trigger plug, switch open
+    rep = loopback_test.LoopbackSelfTest(tower).run(bells)
+    d = rep["channels"][1]["digital"]
+    assert d.get("trigger") and d["ok"] is None, d
+    assert "sweep" not in rep["channels"][1]
+    assert rep["ok"], rep
+
+
+class LowPin(object):
+    value = False                               # switch to 0 V held
+
+
+@case
+def test_trigger_plug_held_to_ground_in_selftest_is_not_a_failure():
+    random.seed(5)
+    tower, bells, _ = rig(plug_a={0}, plug_b={0, 1})
+    bells[1].sense_pin = LowPin()
+    rep = loopback_test.LoopbackSelfTest(tower).run(bells)
+    assert rep["channels"][1]["digital"].get("trigger"), rep["channels"][1]
+    assert rep["ok"], rep
+
+
 finish()

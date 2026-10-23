@@ -12,3 +12,6 @@ LB_LOAD_MIN, LB_LOAD_MAX = 0.75, 0.92   # GP28 / unloaded-expected, looped
 UNLOADED_MIN = 0.95           # GP28 / expected with no plug
 DAC_MAX_RESID = 1311          # 2 % FS: RP2xxx ADC ENOB ~9 bit [inferred]
 SWEEP_TOL = 0.12              # fraction-high vs duty, path A sweep
+# Trigger plug (Orange <-> Green/White strap + push switch Green -> Blue/White):
+# GP28 load must look like a loopback's (>= the "10 k on Orange" band top)
+TRIGGER_LOAD_MIN = 0.70

@@ -177,6 +177,86 @@ def link(app):
     return {"link": res}
 
 
+def plug_trigger(fh, pressed, to_ground=False):
+    """ch1 = trigger plug: Orange <-> Green/White strapped (GP28 loaded,
+    GP26 follows it when ch1 is selected); Green -> Blue/White only while
+    pressed["on"].  Open: Blue/White idles high (board pull-up)."""
+    import mux_select
+
+    def sel0():
+        t = list(mux_select._TOWERS.values())[0]
+        return t.current == 0
+
+    def gp28():
+        d = fh.pwm[21].duty_cycle if 21 in fh.pwm else 0
+        return int(d * (0.835 if sel0() else 1.0))
+
+    def gp26():
+        return int(gp28() * 0.99) if sel0() else 700
+
+    def bw():
+        if pressed["on"]:
+            if to_ground:
+                return False                                  # 0 V
+            return 8 in fh.pwm and fh.pwm[8].duty_cycle > 32767   # = Green
+        return True
+    fh.adc_fn[28] = gp28
+    fh.adc_fn[26] = gp26
+    fh.din_fn[0] = bw
+
+
+def trigger(app, fh, pressed):
+    """Trigger plug on ch1: classified 'trigger', a press is one labelled
+    stroke on the normal path, bounce is ignored, presses never resurvey."""
+    import concentrator
+    from sntp_pico import TickClock
+    res = {"heads": list(app.head), "laser8": fh.pwm[8].duty_cycle}
+    t = [5000000]
+    app.ticks = TickClock(lambda: t[0])
+    sent = []
+    concentrator.send = lambda obj, keep=True: sent.append(obj)
+    app.sntp = SessionSntp()
+    app.tower.tower = "inactive"
+
+    def sample(on, dt_ms):
+        t[0] += dt_ms
+        pressed["on"] = on
+        app.poll_sense()
+    sample(False, 20)
+    sample(False, 60)                     # open >= TRIGGER_REARM_MS: armed
+    paint_once(app)
+    res["rest_led"] = [list(app.frame[1]["rgb"]), app.frame[1]["state"]]
+    sample(True, 20)                      # press 1
+    paint_once(app)
+    res["down_led"] = app.frame[1]["state"]
+    sample(False, 5)                      # press bounce
+    sample(True, 5)
+    sample(True, 300)                     # held
+    sample(False, 20)                     # release ...
+    sample(True, 10)                      # ... release bounce (not re-armed)
+    sample(False, 10)
+    sample(False, 60)                     # clean release: armed
+    sample(True, 20)                      # press 2
+    sample(False, 60)
+    sample(False, 60)
+    for _ in range(5):                    # quick presses, 4 Hz
+        sample(True, 125)
+        sample(False, 125)
+    res["doubt"] = app.survey_state.status()["doubt"]
+    res["strokes"] = [e["body"] for e in sent if e.get("type") == "stroke"]
+    res["types"] = sorted(set(e.get("type") for e in sent))
+    # held for ages with the tower quiet: one resurvey request
+    app.tower.tower = "inactive"
+    sample(True, 20)
+    for _ in range(3):
+        app.tower.tower = "inactive"
+        sample(True, concentrator.TRIGGER_STUCK_MS // 2)
+    res["stuck_doubt"] = app.survey_state.status()["doubt"]
+    res["stuck_ch"] = getattr(app.survey_state, "_pending_ch", None)
+    pressed["on"] = False
+    return {"trigger": res}
+
+
 def child(scenario, src, extra):
     fh = child_setup(src, extra)
     out = {"ok": False}
@@ -200,8 +280,11 @@ def child(scenario, src, extra):
         fh.din_fn[0] = bw
 
     try:
+        pressed = {"on": scenario in ("trigger_held", "trigger_held_gnd")}
         if scenario == "head":
             plug_head()
+        if scenario in ("trigger", "trigger_held", "trigger_held_gnd"):
+            plug_trigger(fh, pressed, to_ground=scenario == "trigger_held_gnd")
         import concentrator
         app = concentrator.Concentrator(concentrator.cfg)
         run_survey(app, "boot")              # boot survey (was _probe_heads in __init__)
@@ -211,6 +294,24 @@ def child(scenario, src, extra):
             out.update(watch_empty(app, fh, plug_head))
         if scenario == "link":
             out.update(link(app))
+        if scenario == "trigger":
+            out.update(trigger(app, fh, pressed))
+        if scenario == "trigger_held_gnd":
+            import concentrator as C
+            out["gnd_heads"] = list(app.head)
+            sent = []
+            C.send = lambda obj, keep=True: sent.append(obj)
+            pressed["on"] = False                    # release: no stroke, no survey
+            app.poll_sense()
+            out["gnd_release_doubt"] = app.survey_state.status()["doubt"]
+            out["gnd_release_strokes"] = len(sent)
+        if scenario == "trigger_held":
+            out["held_heads"] = list(app.head)
+            pressed["on"] = False                    # released after the survey
+            app.poll_sense()
+            out["held_release_doubt"] = app.survey_state.status()["doubt"]
+            run_survey(app, "plug", channel=0)
+            out["held_after"] = list(app.head)
         if scenario == "late":
             # empty at boot; a head is plugged into ch1 later
             out["laser8_boot"] = fh.pwm[8].duty_cycle
@@ -323,6 +424,36 @@ def main():
           w.get("survey_phase") == "examining"
           and (w.get("surveying") or {}).get("selects") == 0
           and (w.get("surveying") or {}).get("pulses") == 0, (w.get("survey_phase"), w.get("surveying")))
+    r = spawn(me, "trigger")
+    T = r.get("trigger") or {}
+    check("trigger: ch1 classified 'trigger', others empty, laser held at 0",
+          r["ok"] and T.get("heads") == ["trigger"] + ["empty"] * 7
+          and T.get("laser8") == 0, r.get("exc") or (T.get("heads"), T.get("laser8")))
+    check("trigger: violet at rest, white while pressed",
+          T.get("rest_led") == [[24, 0, 48], "trigger"] and T.get("down_led") == "response",
+          (T.get("rest_led"), T.get("down_led")))
+    st = T.get("strokes") or []
+    check("trigger: each press one labelled stroke; press/release bounce ignored",
+          len(st) == 7 and all(b == {"ch": 1, "test": True, "src": "trigger"} for b in st), st)
+    check("trigger: presses never ask for a resurvey", T.get("doubt") is False, T.get("doubt"))
+    check("trigger: only stroke events sent", T.get("types") == ["stroke"], T.get("types"))
+    check("trigger: held > TRIGGER_STUCK_MS (tower quiet) -> one resurvey of ch1",
+          T.get("stuck_doubt") is True and T.get("stuck_ch") == 0,
+          (T.get("stuck_doubt"), T.get("stuck_ch")))
+    check("trigger: self-test still ok with a trigger plug", r.get("selftest_ok"), r.get("selftest_ok"))
+    r = spawn(me, "trigger_held")
+    check("trigger held through the survey: loopback, release resurveys -> trigger",
+          r["ok"] and (r.get("held_heads") or [None])[0] == "lb"
+          and r.get("held_release_doubt") is True
+          and (r.get("held_after") or [None])[0] == "trigger",
+          r.get("exc") or (r.get("held_heads"), r.get("held_release_doubt"), r.get("held_after")))
+    r = spawn(me, "trigger_held_gnd")
+    check("trigger (switch to 0 V) held through the survey: still 'trigger'; "
+          "release sends nothing and does not resurvey",
+          r["ok"] and (r.get("gnd_heads") or [None])[0] == "trigger"
+          and r.get("gnd_release_doubt") is False and r.get("gnd_release_strokes") == 0,
+          r.get("exc") or (r.get("gnd_heads"), r.get("gnd_release_doubt"),
+                           r.get("gnd_release_strokes")))
     r = spawn(me, "link")
     L = r.get("link") or {}
     check("link: LED6 white synced / amber holdover / red unsynced",

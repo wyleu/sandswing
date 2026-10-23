@@ -12,6 +12,13 @@ from connector_boards import DEFAULT_BOARDS, board_of, apply_boards
 from adc_avg import avg as _avg
 
 
+# A loopback must follow on every look.  A trigger plug whose switch (to
+# Green) is held during measure() also follows; re-check over ~0.6 s, and
+# if it ever stops following it was a press: classify without the follow.
+LOOPBACK_CONFIRM_N = 3
+LOOPBACK_CONFIRM_S = 0.2
+
+
 class SocketSurvey(LoopbackSelfTest):
     """Collects the measurements above for one bell, then classifies."""
 
@@ -69,6 +76,14 @@ class SocketSurvey(LoopbackSelfTest):
     async def classify(self, bell, expected_ma=5.0):
         m = await self.measure(bell)
         kind, why = classify_socket(m, expected_ma)
+        if kind == "loopback":
+            for _ in range(LOOPBACK_CONFIRM_N):
+                await asyncio.sleep(LOOPBACK_CONFIRM_S)
+                if not self.digital_loopback(bell)["ok"]:
+                    m["follow"] = False          # it let go: a trigger press
+                    m["follow_lost"] = True
+                    kind, why = classify_socket(m, expected_ma)
+                    break
         return {"ch": bell.index, "kind": kind, "why": why, "m": m}
 
 async def survey_all(survey, bells, gate, boards):

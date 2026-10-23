@@ -1,5 +1,7 @@
 # channel_gate.py -- never drive a channel whose socket is not known. Leaf.
 DRIVE_OK = ("loopback", "head_new", "head_old")
+# "trigger" is NOT here on purpose: its laser output must stay at duty 0
+# (Green driven low), which is what pulls Blue/White low when pressed.
 
 
 class ChannelGate:

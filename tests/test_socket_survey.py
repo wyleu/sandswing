@@ -20,6 +20,31 @@ def test_survey_loopback_and_empty_end_to_end():
     assert tower.holder is None
 
 
+@case
+def test_trigger_pressed_during_survey_is_not_a_loopback():
+    """Trigger plug (strap B; switch Green -> Blue/White) pressed while
+    measure() runs, released before the loopback re-check: 'trigger'.
+    A real loopback still passes every re-check."""
+    random.seed(6)
+    tower, bells, plant = rig(plug_a={0, 1}, plug_b={0, 1})
+    for b in bells:
+        b.sense_pin = PullSensePin(plant, b.index)
+    sv = socket_survey.SocketSurvey(tower, pull_up="up", pull_down="down")
+    orig, calls = sv.digital_loopback, [0]
+
+    def released_after_first(b):
+        r = orig(b)
+        if b.index == 1:
+            calls[0] += 1
+            plant.plug_a.discard(1)          # switch let go
+        return r
+    sv.digital_loopback = released_after_first
+    r1 = run(sv.classify(bells[1]))
+    assert r1["kind"] == "trigger" and r1["m"].get("follow_lost"), r1
+    r0 = run(sv.classify(bells[0]))
+    assert r0["kind"] == "loopback" and not r0["m"].get("follow_lost"), r0
+
+
 # Firmware bug (src not changed here): since 9891e47 survey_all() lost its
 # absent-board check (placeholder comment only), apply_boards() and
 # gate.set_kind(), so ch 5-8 on the absent conn2 are probed and the gate is

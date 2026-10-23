@@ -16,12 +16,12 @@
 # exists, C7 rest hint, C8 "head_pending"), with old/new decided only in the
 # reflector stage (R2).  See sandswing_code_changes.md section A.
 from signal_bands import (COUNTS_PER_MA, FLOOR_COUNTS, LB_RATIO_MIN,
-                          UNLOADED_MIN)
+                          UNLOADED_MIN, TRIGGER_LOAD_MIN)
 
 
 def classify_socket(m, expected_ma=5.0, floor=FLOOR_COUNTS):
-    """Return (kind, reasons).  kind in: loopback, head_new, head_old, empty,
-    fault.  Signature thresholds are first guesses, to be tuned on the bench."""
+    """Return (kind, reasons).  kind in: loopback, trigger, head_new,
+    head_old, empty, fault.  Signature thresholds are first guesses, to be tuned on the bench."""
     why = []
     laser = m.get("di_ma", 0.0) >= 0.4 * expected_ma
     strap_b = m.get("r50", 0.0) >= LB_RATIO_MIN
@@ -50,6 +50,23 @@ def classify_socket(m, expected_ma=5.0, floor=FLOOR_COUNTS):
     # loopback plug
     if strap_a and strap_b:
         return "loopback", ["both straps seen"]
+    # trigger plug (test switch): Orange <-> Green/White strapped, plus a
+    # push switch on Blue/White (to 0 V, or to Green, which run mode holds
+    # at duty 0 = low).  No laser current, sense does not follow the laser,
+    # Orange loaded like a loopback.  Blue/White idles high (switch open) or
+    # sits low whatever the laser does (switch to 0 V held through the
+    # survey).  Before the partial-strap fault and the 10 k band.  A switch
+    # to Green held through the survey reads "both straps" above: loopback
+    # until it is released (the plug-change rule then resurveys).
+    up = bool(m.get("sense_hi")) or bool(m.get("pull_follow", True))
+    if strap_b and not strap_a and not laser and l50 >= TRIGGER_LOAD_MIN:
+        if up:
+            return "trigger", ["trigger plug (test switch): Orange-Green/White "
+                               "link, switch open (Blue/White idles high); "
+                               "press it for a test stroke"]
+        return "trigger", ["trigger plug (test switch): Orange-Green/White "
+                           "link, switch held during the survey (Blue/White "
+                           "low); release, then press for a test stroke"]
     if strap_a != strap_b and not laser:
         return "fault", ["partial loopback (%s strap only): open conductor "
                          "or mis-strapped plug" % ("A" if strap_a else "B")]
