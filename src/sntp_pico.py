@@ -78,6 +78,12 @@ ACC_S_MAX_MS = 500.0
 # Server choice: one short probe of each candidate before a free-mode burst.
 PROBE_TIMEOUT_S = 0.1           # per probe; a dead server costs no more
 BOOT_RETRY_S = 15               # retry interval while unsynced (not interval_s)
+# RTT outlier gate: the history only learns from accepted bursts, so a lasting
+# step in the network path (busy hotspot, storm interference) would reject
+# every burst for ever and the clock would sit in holdover.  After this many
+# rejections in a row the history is cleared and the burst accepted.
+RTT_RELEARN_AFTER = 3
+LEAP_UNSYNC = 3                 # NTP leap indicator 3 = server not synchronised
 
 
 def _default_ticks():
@@ -232,6 +238,9 @@ class SntpClock:
         self.stats = {"sent": 0, "ok": 0, "timeout": 0, "bad": 0,
                       "rejected_rtt": 0, "rejected_stratum": 0, "bursts": 0}
         self.last = None        # summary of the last burst (for the boot log)
+        self.peer = None        # last reply seen, even a rejected one:
+                                # {"srv", "stratum", "leap"} (GPS lock check)
+        self._rtt_rejects = 0   # rtt-gate rejections in a row
         self._buf = bytearray(48)
         self._serial = 0
 
@@ -272,7 +281,8 @@ class SntpClock:
             return None
         stratum = b[1]
         li = b[0] >> 6
-        if stratum < STRATUM_MIN or stratum > STRATUM_MAX or li == 3:
+        self.peer = {"srv": ip, "stratum": stratum, "leap": li}
+        if stratum < STRATUM_MIN or stratum > STRATUM_MAX or li == LEAP_UNSYNC:
             self.stats["rejected_stratum"] += 1  # kiss-o'-death / unsynced
             return None
         s2, f2, s3, f3 = struct.unpack(">IIII", bytes(b[32:48]))
@@ -354,6 +364,7 @@ class SntpClock:
         between(): optional callback run between queries (sync use).
         Returns True if a sample was accepted."""
         self.select_server(between)
+        self._rej0 = self.stats["rejected_stratum"]
         best = None
         n = self.burst if n is None else int(n)
         for i in range(n):
@@ -367,6 +378,7 @@ class SntpClock:
 
     async def aburst_once(self, n=None):
         await self.aselect_server()
+        self._rej0 = self.stats["rejected_stratum"]
         best = None
         n = self.burst if n is None else int(n)
         for i in range(n):
@@ -393,15 +405,28 @@ class SntpClock:
         self.stats["bursts"] += 1
         self.clock.now()                         # keep the wrap extension alive
         if best is None:
-            self.last = {"ok": False, "why": "no reply"}
+            rej = self.stats["rejected_stratum"] - getattr(self, "_rej0", 0)
+            if rej > 0 and self.peer is not None:
+                # it answered, but says it has no time (GPS NO Lock and no
+                # local/orphan stratum on the server): keep holdover
+                self.last = {"ok": False, "why": "server not synchronised "
+                             "(stratum %d, leap %d)" % (self.peer["stratum"],
+                                                         self.peer["leap"])}
+            else:
+                self.last = {"ok": False, "why": "no reply"}
             return False
         rtt, tick, off, st, ip = best
         self._set_stratum(st)
         lim = self._rtt_limit()
         if lim is not None and rtt > lim:
-            self.stats["rejected_rtt"] += 1
-            self.last = {"ok": False, "why": "rtt %.1f > %.1f" % (rtt, lim)}
-            return False
+            self._rtt_rejects += 1
+            if self._rtt_rejects < RTT_RELEARN_AFTER:
+                self.stats["rejected_rtt"] += 1
+                self.last = {"ok": False, "why": "rtt %.1f > %.1f" % (rtt, lim)}
+                return False
+            self.rtts = []                       # the path changed: relearn
+            self._log("rtt_relearn", self.clock.now(), rtt_ms=rtt, limit_ms=lim)
+        self._rtt_rejects = 0
         self.rtts.append(rtt)
         self.rtts = self.rtts[-self.rtt_hist:]
         self.samples.append((tick, off, rtt))    # off in int us
@@ -603,7 +628,8 @@ class SntpClock:
                 "epoch": self.epoch, "servers": self.servers,
                 "srv": self.server, "stratum": self.stratum,
                 "disagree": self.disagree,
-                "last": self.last, "stats": dict(self.stats),
+                "last": self.last, "peer": self.peer,
+                "stats": dict(self.stats),
                 "events": list(self.events[-4:])}
 
     async def run(self):

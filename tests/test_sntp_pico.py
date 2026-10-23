@@ -175,6 +175,57 @@ def test_reject_outlier_rtt_from_history():
 
 
 @case
+def test_rtt_gate_relearns_after_a_lasting_path_change():
+    """A lasting RTT step (busy hotspot) must not hold the clock in holdover
+    for ever: after RTT_RELEARN_AFTER rejections in a row it is accepted."""
+    w = World()
+    c, clk = make(w, burst=2, interval_s=300)
+    for d in (3.0, 4.0, 3.5, 4.5, 3.0):
+        w.default = (d / 2, d / 2)
+        assert c.burst_once()
+        w.sleep(300)
+    w.default = (40.0, 40.0)
+    got = []
+    for _ in range(S.RTT_RELEARN_AFTER):
+        got.append(c.burst_once())
+        w.sleep(300)
+    assert got == [False] * (S.RTT_RELEARN_AFTER - 1) + [True], got
+    assert c.stats["rejected_rtt"] == S.RTT_RELEARN_AFTER - 1
+    assert c.state() == "synced" and c.last["ok"]
+    assert c.burst_once()                         # the new path is now normal
+
+
+@case
+def test_unsynchronised_server_is_named_and_holdover_kept():
+    """sandmon in GPS NO Lock without local/orphan: replies with stratum 16
+    / leap 3.  The Pico keeps holdover (still stamps utc) and says why."""
+    w = World()
+    c, clk = make(w, burst=3, interval_s=300, stale_after=3)
+    assert c.burst_once() and c.state() == "synced"
+    w.stratum, w.li = 16, 3
+    for _ in range(4):
+        w.sleep(300)
+        assert not c.burst_once()
+    assert "not synchronised" in c.last["why"] and "16" in c.last["why"], c.last
+    assert c.peer == {"srv": "10.0.0.5", "stratum": 16, "leap": 3}, c.peer
+    assert c.state() == "stale"
+    st = c.stamp()
+    assert st["utc_ms"] is not None and st["sync"] == "stale"   # strokes keep utc
+    assert c.boot_record()["peer"]["stratum"] == 16
+    w.stratum, w.li = 1, 0                        # lock back
+    w.sleep(300)
+    assert c.burst_once() and c.state() == "synced"
+
+
+@case
+def test_no_reply_still_says_no_reply():
+    w = World()
+    c, clk = make(w, burst=2)
+    w.default = None
+    assert not c.burst_once() and c.last["why"] == "no reply"
+
+
+@case
 def test_drift_fit_predicts_ahead():
     w = World(drift_ppm=40.0)
     c, clk = make(w, burst=3, interval_s=300, fit_samples=8)

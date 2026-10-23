@@ -150,6 +150,9 @@ def child(scenario, src, extra):
         class S:
             synced = True        # so LED6 shows heartbeat, not heartbeat_nosync
 
+            def state(self):
+                return "synced"
+
             def __init__(self):
                 self.bursts = 0
 

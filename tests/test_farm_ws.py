@@ -25,6 +25,8 @@ class FakeWs:
             raise self.on_receive
         if self.on_receive == "close":   # library answers a client close
             self.closed = True
+        if isinstance(self.on_receive, list) and self.on_receive:
+            return self.on_receive.pop(0)  # text frames from the client
         return None
 
     def send_message(self, msg, opcode=None, fail_silently=False):
@@ -47,9 +49,43 @@ import farm_ws
 
 
 def fresh(n):
-    del farm_ws._clients[:]
-    del farm_ws._refused[:]
+    farm_ws.reset_state()
     return [farm_ws._accept(FakeWs()) for _ in range(n)]
+
+
+class Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+class FakeConn:
+    """socketpool socket, non-blocking: send() takes at most `take` bytes,
+    or raises EAGAIN (TCP buffer full) when take == 0."""
+    def __init__(self, take=4096):
+        self.take = take
+        self.data = bytearray()
+
+    def send(self, view):
+        if self.take == 0:
+            raise OSError(farm_ws.EAGAIN, "EAGAIN")
+        n = min(self.take, len(view))
+        self.data.extend(bytes(view[:n]))
+        return n
+
+
+class RealishWs(FakeWs):
+    """Has the 4.8.2 internals _send_text uses (_prepare_frame, _request)."""
+    def __init__(self, conn):
+        FakeWs.__init__(self)
+        self._request = types.SimpleNamespace(connection=conn,
+                                              client_address=("10.42.0.50", 1))
+
+    @staticmethod
+    def _prepare_frame(opcode, message):
+        return bytearray([0x80 | opcode, len(message)]) + message
 
 
 @case
@@ -102,6 +138,77 @@ def test_over_max_refuses_the_new_client_with_1013():
 def test_no_clients_send_false():
     fresh(0)
     assert farm_ws.send({"n": 1}) is False and not farm_ws.ws_connected()
+
+
+@case
+def test_heartbeat_client_silent_too_long_is_dropped_and_noted():
+    a, b = fresh(2)
+    clock = Clock()
+    real = farm_ws.time.monotonic
+    farm_ws.time.monotonic = clock
+    try:
+        a.on_receive = ['{"type":"heartbeat"}']
+        farm_ws.poll()                          # a is now a heartbeat client
+        assert farm_ws.live_clients() == 1 and farm_ws.sandbells_connected()
+        clock.t += farm_ws.CLIENT_SILENT_S + 1
+        farm_ws.poll()
+        assert farm_ws._clients == [b], farm_ws._clients   # b never sent: kept
+        assert not farm_ws.sandbells_connected()   # b alone is not "Sandbells"
+        notes = farm_ws.take_link_notes()
+        whats = [w for w, _ in notes]
+        assert whats.count("client_connected") == 2, whats
+        assert whats[-1] == "client_dropped" and "silent" in notes[-1][1]["reason"]
+        st = farm_ws.link_status()
+        assert st["drops"] == 1 and st["silent_drops"] == 1 and st["connects"] == 2
+        assert "silent" in st["last_drop_reason"]
+    finally:
+        farm_ws.time.monotonic = real
+
+
+@case
+def test_legacy_clients_still_green_until_a_heartbeat_is_seen():
+    fresh(1)
+    farm_ws.poll()
+    assert farm_ws.sandbells_connected()        # old ingest: any client counts
+
+
+@case
+def test_send_to_a_full_tcp_buffer_gives_up_and_drops_that_client():
+    farm_ws.reset_state()
+    stuck = farm_ws._accept(RealishWs(FakeConn(take=0)))
+    good_conn = FakeConn(take=7)                 # partial sends are fine
+    good = farm_ws._accept(RealishWs(good_conn))
+    old = farm_ws.SEND_TIMEOUT_S
+    farm_ws.SEND_TIMEOUT_S = 0.05
+    try:
+        assert farm_ws.send({"type": "stroke", "n": 1})
+    finally:
+        farm_ws.SEND_TIMEOUT_S = old
+    assert farm_ws._clients == [good] and stuck.closed
+    assert farm_ws.stats["send_timeouts"] == 1
+    assert good_conn.data[2:] == b'{"type": "stroke", "n": 1}', good_conn.data
+
+
+@case
+def test_new_client_gets_recent_events_replayed_not_heartbeats():
+    fresh(0)
+    for n in range(farm_ws.REPLAY_N + 5):
+        farm_ws.send({"seq": n + 1})              # nobody connected: kept
+    farm_ws.send({"heartbeat": 1}, keep=False)
+    a = farm_ws._accept(FakeWs())
+    assert not a.sent                            # handshake first
+    farm_ws.poll()
+    assert len(a.sent) == farm_ws.REPLAY_N, len(a.sent)
+    assert a.sent[0] == '{"seq": 6}' and a.sent[-1] == '{"seq": %d}' % (farm_ws.REPLAY_N + 5)
+
+
+@case
+def test_refusal_is_counted_and_noted():
+    fresh(farm_ws.MAX_WS_CLIENTS)
+    farm_ws._accept(FakeWs())
+    farm_ws.poll()
+    whats = [w for w, _ in farm_ws.take_link_notes()]
+    assert "client_refused" in whats and farm_ws.stats["refused"] == 1
 
 
 finish()

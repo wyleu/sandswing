@@ -79,7 +79,7 @@ import panel
 import report
 from board_pins import release
 from watchdog_guard import WatchdogGuard
-from sand_event import Emitter
+from sand_event import Emitter, make_event
 from sntp_pico import TickClock
 from survey_state import SurveyState, SURVEYING, SETTLED, IDLE as SURVEY_IDLE
 from mux_errors import ChannelBusy
@@ -94,6 +94,16 @@ HEAD_NAME = {"head_new": "new", "head_old": "old", "loopback": "lb",
              "unknown": "unknown"}
 
 HEARTBEAT_LENGTH = 1.25
+
+# Link health (docs/link-health.md).  Code constants, not settings.
+PANEL_SCHEMA = "sand.panel/v1"   # heartbeat frames: Sandbells shows, never stores
+PICO_HEARTBEAT_S = 5.0           # heartbeat (LED mimic + link + sync) to /ws
+LINK_CHECK_S = 2.0               # Wi-Fi supervision pass
+WIFI_REJOIN_S = 30.0             # rejoin attempts while the tower is quiet
+WIFI_REJOIN_RINGING_S = 120.0    # ...and while ringing (a join blocks sensing)
+WIFI_JOIN_TIMEOUT_S = 10         # per network in the list
+LINK_DEAD_S = 120.0              # Wi-Fi "up" but no client heard: radio reset
+LINK_DEAD_RESET_S = 600.0        # still nothing: reset the Pico (watchdog armed only)
 
 # empty-socket check (_watch_empty): tower inactive + survey idle only
 EMPTY_CHECK_S = 1.0          # gap between checks
@@ -165,9 +175,11 @@ def emit(msg):
     if farm_log:   
         farm_log.write(msg)
         
-async def ws_poll_task(guard=None):
+async def ws_poll_task(guard=None, app=None):
     while True:
         farm_ws.poll()
+        if app is not None:
+            app.flush_link_notes()
         if guard is not None:
             guard.checkin("ws_poll")       # a hung ws task stops the feeding
         await asyncio.sleep(0.05)
@@ -182,6 +194,14 @@ class Concentrator:
         self.sense_gps = self.pinmap["sense_gp"]
         self.n = len(self.sense_gps)          # set n first
         self.link = "no_wifi"
+        self.wifi_up = False             # set by start_app; link_task follows it
+        self.wifi_lost = 0               # times the Wi-Fi link was lost
+        self.rejoins = 0                 # successful rejoins after a loss
+        self.radio_resets = 0
+        self._dead_handled = False       # one radio reset per silent spell
+        self.boot_at = time.monotonic()
+        self.hb_seq = 0                  # heartbeat counter (not the event seq)
+        self._frame_args = None
         self.sntp = None
         
         self._empty_check = 0        # last _watch_empty run (monotonic s)
@@ -302,7 +322,8 @@ class Concentrator:
                  "refresh": report.part(self.refresher),
                  "ring": report.part(self.ring),
                  "sync": report.part(self.sntp, "boot_record"),
-                 "watchdog": report.part(self.guard)}
+                 "watchdog": report.part(self.guard),
+                 "link": self.link_status()}
         return report.build({
             "id": self.cfg.get("device", {}).get("name"),
             "name": self.cfg.get("device", {}).get("name"),
@@ -347,9 +368,11 @@ class Concentrator:
             self.tower.tower, "heartbeat")
         
         if activity == "heartbeat":
-            synced = self.sntp is not None and self.sntp.state() == "synced"
-            if not synced:
-                activity = "heartbeat_nosync"
+            st = self.sntp.state() if self.sntp is not None else "unsynced"
+            if st == "stale":
+                activity = "heartbeat_holdover"   # amber: still stamping utc
+            elif st != "synced":
+                activity = "heartbeat_nosync"     # red: no utc at all
         
         right = None if self.tower.tower == "inactive" else self.status_slot.colour
         
@@ -359,6 +382,7 @@ class Concentrator:
             activity, right = "watchdog_reset", (None if beat_on else (0, 0, 0))
         self.frame = panel.panel_frame(kinds, self.link, activity, beat_on,
                                        right=right)
+        self._frame_args = (kinds, self.link, activity, right)
         panel.paint(self.strip, self.frame)
         
     def _channel(self, i, pin, now):
@@ -529,9 +553,11 @@ class Concentrator:
                 rate = P.LED_KIND[override][1]
             channel_on = True if rate <= 0 else ((time.monotonic() * (rate + 1)) % 1.0) < 0.5
 
-            # LED1: green while a /ws client (Sandbells ingest) is connected
+            # LED1: green while Sandbells is connected and heard (a client
+            # that sends heartbeats); link_task sets "no_wifi" on a loss
             if self.link != "no_wifi":
-                self.link = "ws_client" if farm_ws.ws_clients() else "wifi_only"
+                self.link = ("ws_client" if farm_ws.sandbells_connected()
+                             else "wifi_only")
 
             # heartbeat beat (always toggles)
             heartbeat_on = (time.monotonic() % HEARTBEAT_LENGTH) < (HEARTBEAT_LENGTH /2) 
@@ -542,6 +568,152 @@ class Concentrator:
             self._paint_kinds(kinds, heartbeat_on if rate == 0 else channel_on)
             await asyncio.sleep(0.05)
         
+    # ---- link health ------------------------------------------------------
+    def link_event(self, what, **info):
+        """A "link" sand.event/v1 (stored by Sandbells, kept for replay)."""
+        body = {"what": what}
+        body.update(info)
+        emit("%.3f link %s %s" % (time.monotonic(), what, info))
+        send(self.events.make(self.sntp, "link", body))
+
+    def flush_link_notes(self):
+        take = getattr(farm_ws, "take_link_notes", None)
+        if take is None:
+            return
+        for what, info in take():
+            self.link_event(what, **info)
+
+    def link_status(self):
+        st = getattr(farm_ws, "link_status", None)
+        d = st() if st is not None else {}
+        d.update({"wifi_up": self.wifi_up, "wifi_lost": self.wifi_lost,
+                  "rejoins": self.rejoins, "radio_resets": self.radio_resets})
+        return d
+
+    def _mimic(self):
+        """The panel as it looks in its ON phase (a heartbeat sampled in
+        the dark half of a blink would read as black)."""
+        if self._frame_args is None:
+            return panel.payload(self.frame)
+        kinds, link, activity, right = self._frame_args
+        return panel.payload(panel.panel_frame(kinds, link, activity, True,
+                                               right=right))
+
+    def heartbeat_doc(self):
+        """sand.panel/v1 heartbeat: same envelope as events (type, src, id,
+        boot_id, seq = heartbeat count, stamp fields, body)."""
+        self.hb_seq += 1
+        sn = self.sntp
+        body = self._mimic()
+        body.update({
+            "link": self.link,
+            "tower": self.tower.tower,
+            "net": self.link_status(),
+            "wifi": {"ip": farm_ws.wifi_ip() if hasattr(farm_ws, "wifi_ip") else None,
+                     "rssi": farm_ws.wifi_rssi() if hasattr(farm_ws, "wifi_rssi") else None},
+            "sync": sn.state() if sn is not None else "unsynced",
+            "time": None if sn is None else {
+                "srv": sn.server, "stratum": sn.stratum, "last": sn.last,
+                "peer": getattr(sn, "peer", None)},
+            "last_seq": self.events.seq,          # newest event seq this boot
+            "uptime_s": int(time.monotonic() - self.boot_at),
+            "last_reset": self.guard.last_reset,
+            "watchdog": self.guard.armed,
+        })
+        try:
+            import gc
+            body["mem_free"] = gc.mem_free()
+        except (ImportError, AttributeError):
+            pass
+        doc = make_event("heartbeat", sn, body, src=self.events.src,
+                         device_id=self.events.device_id,
+                         boot_id=self.events.boot_id, seq=self.hb_seq,
+                         ticks=self.ticks)
+        doc["schema"] = PANEL_SCHEMA
+        return doc
+
+    async def heartbeat_task(self):
+        while True:
+            await asyncio.sleep(PICO_HEARTBEAT_S)
+            if farm_ws.ws_clients():
+                try:
+                    send(self.heartbeat_doc(), keep=False)
+                except Exception as e:           # never let it kill main()
+                    emit("heartbeat: %r" % e)
+
+    def _rejoin(self):
+        """Blocking join (paused watchdog).  True if we have an address."""
+        with self.guard.paused_for():
+            farm_ws.connect_wifi(self.cfg, timeout=WIFI_JOIN_TIMEOUT_S)
+        return farm_ws.wifi_ok()
+
+    def _wifi_regained(self, down_s):
+        ip = farm_ws.wifi_ip()
+        self.wifi_up = True
+        self.link = "wifi_only"
+        if farm_ws.server_running() and farm_ws.server_host() != ip:
+            farm_ws.stop_server()                # new address: rebind
+        if not farm_ws.server_running():
+            start_server(self.cfg, self.status_payload)
+        if self.sntp is None and ip is not None:
+            self.sntp = setup_sntp(ip)           # boot had no Wi-Fi
+            if self.sntp is not None:
+                asyncio.create_task(self.sntp.run())
+        self.link_event("wifi_back", ip=ip, down_s=down_s, rejoins=self.rejoins)
+
+    def link_step(self, now, state):
+        """One supervision pass.  state: {"lost_at", "tried_at"}."""
+        if not farm_ws.wifi_ok():
+            if self.wifi_up:
+                self.wifi_up = False
+                self.wifi_lost += 1
+                self.link = "no_wifi"
+                state["lost_at"] = now
+                state["tried_at"] = now          # give it a moment by itself
+                farm_ws.drop_all("wifi lost")
+                self.link_event("wifi_lost", count=self.wifi_lost)
+            gap = (WIFI_REJOIN_S if self.tower.tower == "inactive"
+                   else WIFI_REJOIN_RINGING_S)
+            if now - state["tried_at"] >= gap:
+                state["tried_at"] = now
+                if self._rejoin():
+                    self.rejoins += 1
+            return
+        if not self.wifi_up:
+            lost = state.get("lost_at")
+            self._wifi_regained(None if lost is None else round(now - lost, 1))
+            return
+        # Wi-Fi says up.  Is anything getting through?
+        if not farm_ws.stats.get("hb_seen"):
+            return                               # old Sandbells / bench: no rule
+        age = farm_ws.last_rx_age_s(now)
+        if age is None or age < LINK_DEAD_S:
+            self._dead_handled = False
+            return
+        if self.tower.tower != "inactive":
+            return                               # never during ringing
+        if age >= LINK_DEAD_RESET_S and self.guard.armed:
+            self.link_event("reset", reason="nothing heard %d s" % age)
+            farm_ws.poll()                       # last chance to send it
+            import microcontroller
+            microcontroller.reset()
+        if not self._dead_handled:
+            self._dead_handled = True
+            self.radio_resets += 1
+            self.link_event("link_dead", reason="nothing heard %d s" % age,
+                            sync=self.sntp.state() if self.sntp else None)
+            farm_ws.reset_radio()                # next pass: lost -> rejoin
+
+    async def link_task(self):
+        state = {"lost_at": None, "tried_at": 0.0}
+        while True:
+            await asyncio.sleep(LINK_CHECK_S)
+            try:
+                self.link_step(time.monotonic(), state)
+            except Exception as e:               # never let it kill main()
+                emit("link_task: %r" % e)
+
+
 def start_app():
     """Everything up to the steady loop: net, Concentrator (survey,
     classify, self-test, ring), first time sync, server.  The watchdog is
@@ -549,6 +721,7 @@ def start_app():
     ip = setup_net()
     app = Concentrator(cfg)
     app.link = "wifi_only" if ip else "no_wifi"   # panel_task: ws_client when /ws connected
+    app.wifi_up = bool(ip)                        # link_task rejoins if not
 
     app.sntp = setup_sntp(ip)
     
@@ -567,8 +740,10 @@ async def main():
     tasks = [
         app.sense_task(),
         app.panel_task(),
-        ws_poll_task(app.guard),
-        app.refresher.run()
+        ws_poll_task(app.guard, app),
+        app.refresher.run(),
+        app.heartbeat_task(),
+        app.link_task(),
         ]
     
     if app.sntp is not None:

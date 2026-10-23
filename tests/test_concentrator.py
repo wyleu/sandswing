@@ -17,6 +17,12 @@ class FakeSntp:
     def boot_record(self):
         return {"sync": "fake"}
 
+    sync_state = "synced"
+    server, stratum, last, peer = "10.42.0.1", 1, None, None
+
+    def state(self):
+        return self.sync_state
+
     def stamp(self, raw_tick=None):
         return {"tick_ms": 0, "utc_ms": None, "err_ms": None,
                 "sync": "unsynced", "acc": None, "epoch": 0,
@@ -115,6 +121,62 @@ def watch_empty(app, fh, plug_head):
     return {"watch": res}
 
 
+def link(app):
+    """Heartbeat frame, LED holdover/nosync, Wi-Fi loss -> rejoin -> back,
+    and the silent-link radio reset (fake farm_ws functions)."""
+    import concentrator
+    import farm_ws
+    sent = []
+    concentrator.send = lambda obj, keep=True: sent.append((obj, keep))
+    app.sntp = FakeSntp()
+    app.tower.tower = "inactive"
+    res = {}
+    for st in ("synced", "stale", "unsynced"):
+        app.sntp.sync_state = st
+        app._paint(True)
+        res["led6_" + st] = [list(app.frame[5]["rgb"]), app.frame[5]["state"]]
+    app._paint(False)                              # dark half of the blink
+    hb = app.heartbeat_doc()
+    res["hb"] = {"schema": hb["schema"], "type": hb["type"], "seq": hb["seq"],
+                 "keys": sorted(k for k in hb if k != "body"),
+                 "led6": hb["body"]["panel"][5], "sync": hb["body"]["sync"],
+                 "has": sorted(k for k in ("panel", "panel_state", "link", "net",
+                                           "time", "tower", "last_seq")
+                               if k in hb["body"])}
+    # Wi-Fi lost -> link event, LED1 no_wifi; rejoin after WIFI_REJOIN_S
+    wifi = {"ok": True}
+    joins, started, drops, resets = [], [], [], []
+    farm_ws.wifi_ok = lambda: wifi["ok"]
+    farm_ws.wifi_ip = lambda: "10.42.0.81"
+    farm_ws.drop_all = drops.append
+    farm_ws.connect_wifi = lambda cfg, timeout=None: joins.append(timeout)
+    farm_ws.server_running = lambda: bool(started)
+    farm_ws.reset_radio = lambda: resets.append(1)
+    concentrator.start_server = lambda cfg, fn: started.append(1)
+    app.wifi_up, app.link = True, "ws_client"
+    state = {"lost_at": None, "tried_at": 0.0}
+    wifi["ok"] = False
+    app.link_step(100.0, state)
+    res["lost"] = [app.link, app.wifi_lost, list(drops), list(joins)]
+    app.link_step(100.0 + concentrator.WIFI_REJOIN_S - 1, state)
+    res["early_joins"] = len(joins)
+    app.link_step(100.0 + concentrator.WIFI_REJOIN_S, state)
+    res["joins"] = list(joins)
+    wifi["ok"] = True
+    app.link_step(140.0, state)
+    res["back"] = [app.link, app.wifi_up, len(started)]
+    # Wi-Fi "up" but nothing heard: one radio reset per silent spell
+    farm_ws.stats["hb_seen"] = True
+    farm_ws.last_rx_age_s = lambda now=None: concentrator.LINK_DEAD_S + 1
+    app.link_step(200.0, state)
+    app.link_step(202.0, state)
+    res["radio_resets"] = len(resets)
+    whats = [o["body"]["what"] for o, k in sent if o.get("type") == "link"]
+    res["link_whats"] = whats
+    res["link_kept"] = all(k for o, k in sent if o.get("type") == "link")
+    return {"link": res}
+
+
 def child(scenario, src, extra):
     fh = child_setup(src, extra)
     out = {"ok": False}
@@ -147,6 +209,8 @@ def child(scenario, src, extra):
             out.update(strokes(app, fh))
         if scenario == "watch":
             out.update(watch_empty(app, fh, plug_head))
+        if scenario == "link":
+            out.update(link(app))
         if scenario == "late":
             # empty at boot; a head is plugged into ch1 later
             out["laser8_boot"] = fh.pwm[8].duty_cycle
@@ -217,7 +281,7 @@ def main():
         check(t + " set_ringing follows tower", r.get("sntp_calls") == [True, False, True, False],
               r.get("sntp_calls"))
         check(t + " payload: 6 panel LEDs + parts", r.get("panel_len") == 6 and
-              r.get("parts") == ["gate", "mux", "refresh", "ring", "sync", "watchdog"], (r.get("panel_len"), r.get("parts")))
+              r.get("parts") == ["gate", "link", "mux", "refresh", "ring", "sync", "watchdog"], (r.get("panel_len"), r.get("parts")))
         if sv == "with_common27":
             check(t + " common 27 warned", r.get("warn27"))
     r = spawn(me, "head")
@@ -259,6 +323,31 @@ def main():
           w.get("survey_phase") == "examining"
           and (w.get("surveying") or {}).get("selects") == 0
           and (w.get("surveying") or {}).get("pulses") == 0, (w.get("survey_phase"), w.get("surveying")))
+    r = spawn(me, "link")
+    L = r.get("link") or {}
+    check("link: LED6 white synced / amber holdover / red unsynced",
+          L.get("led6_synced") == [[8, 8, 8], "heartbeat"]
+          and L.get("led6_stale") == [[40, 20, 0], "heartbeat_holdover"]
+          and L.get("led6_unsynced") == [[40, 0, 0], "heartbeat_nosync"], r.get("exc") or L)
+    hb = L.get("hb") or {}
+    check("link: heartbeat is sand.panel/v1 with the event envelope",
+          hb.get("schema") == "sand.panel/v1" and hb.get("type") == "heartbeat"
+          and hb.get("seq") == 1 and {"src", "id", "boot_id", "seq", "tick_ms",
+                                      "utc_ms", "sync"} <= set(hb.get("keys", [])), hb)
+    check("link: heartbeat LED mimic is the ON phase, with link/net/time",
+          hb.get("led6") == [40, 0, 0] and hb.get("has") == sorted(
+              ["panel", "panel_state", "link", "net", "time", "tower", "last_seq"]), hb)
+    check("link: Wi-Fi lost -> LED1 no_wifi, clients dropped, no instant rejoin",
+          L.get("lost") == ["no_wifi", 1, ["wifi lost"], []], L.get("lost"))
+    check("link: rejoin only after WIFI_REJOIN_S, with a join timeout",
+          L.get("early_joins") == 0 and L.get("joins") == [10], (L.get("early_joins"), L.get("joins")))
+    check("link: back -> wifi_only, server restarted",
+          L.get("back") == ["wifi_only", True, 1], L.get("back"))
+    check("link: silent link -> one radio reset per spell", L.get("radio_resets") == 1,
+          L.get("radio_resets"))
+    check("link: link events wifi_lost, wifi_back, link_dead (kept for replay)",
+          L.get("link_whats") == ["wifi_lost", "wifi_back", "link_dead"] and L.get("link_kept"),
+          L.get("link_whats"))
     r = spawn(me, "rebuild")
     check("close() releases everything; a second Concentrator builds clean",
           r["ok"] and not r["errors"] and r.get("heads") == ["empty"] * 8, r.get("exc") or r["errors"])

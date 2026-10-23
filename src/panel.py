@@ -37,11 +37,16 @@ LED_LINK = {"ws_client": (0, 32, 0), "wifi_only": (0, 0, 32),
             "no_wifi": (32, 12, 0), "error": (48, 0, 0)}
 LED_ACTIVITY = {
     "heartbeat": (8, 8, 8),
-    "heartbeat_nosync": (40, 0, 0),   # dim amber – no timing lock
+    "heartbeat_nosync": (40, 0, 0),   # red: never synced (no utc on strokes)
+    "heartbeat_holdover": (40, 20, 0),  # amber: time server lost, holdover
+                                        # (strokes still carry utc, err grows)
     "ringing": (0, 32, 0),
     "ringing_down": (32, 16, 0), "selftest": (0, 24, 24),
     "watchdog_reset": (48, 0, 48)
     }
+
+HEARTBEAT_KINDS = ("heartbeat", "heartbeat_nosync", "heartbeat_holdover")
+
 
 def _flash_on(rate, beat_on):
     """rate 0 = solid. Higher = more off-time."""
@@ -63,7 +68,7 @@ def panel_frame(kinds, link="no_wifi", activity="heartbeat",
     if right is not None:
         a = right
         
-    if not beat_on and activity in ("heartbeat", "heartbeat_nosync") and right is None:
+    if not beat_on and activity in HEARTBEAT_KINDS and right is None:
         a = (0, 0, 0)
         
     out.append({"rgb": tuple(a), "state": activity})
