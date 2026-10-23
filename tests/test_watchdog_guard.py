@@ -153,6 +153,11 @@ def child(scenario, src, extra):
             def state(self):
                 return "synced"
 
+            def stamp(self, raw_tick=None):      # survey 'channel' events
+                return {"tick_ms": 0, "utc_ms": None, "err_ms": None,
+                        "sync": "synced", "acc": None, "epoch": 0,
+                        "session": 0, "mode": "fake"}
+
             def __init__(self):
                 self.bursts = 0
 

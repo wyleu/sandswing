@@ -115,6 +115,11 @@ TRIGGER_MIN_GAP_MS = 150         # and never two test strokes closer than this
 TRIGGER_STUCK_MS = 10000         # held this long (tower quiet): resurvey once
 TRIGGER_BODY = {"test": True, "src": "trigger"}
 
+# Survey "why" (docs/survey-why.md).  Code constants.
+WHY_HB_CHARS = 80            # heartbeat: first why line, cut to this length
+WHY_HB_KINDS = ("fault", "trigger", "unknown")   # ...and only for these kinds
+WHY_LINES_MAX = 3            # /status + events: at most this many why lines
+
 # empty-socket check (_watch_empty): tower inactive + survey idle only
 EMPTY_CHECK_S = 1.0          # gap between checks
 EMPTY_SETTLE_S = 0.02        # laser on -> read the sense ADC
@@ -122,6 +127,15 @@ EMPTY_HEAD_MA = 5.0          # laser current that means a head is now fitted
 
 cfg = load_config()
 cfg.banner()
+
+def short_why(w, n=WHY_HB_CHARS):
+    """Cut a why line to n chars, keeping its trailing "(measurements)"."""
+    if len(w) <= n:
+        return w
+    k = w.rfind(" (")
+    tail = w[k:] if k > 0 and w.endswith(")") and len(w) - k < n // 2 else ""
+    return w[:n - len(tail) - 3].rstrip() + "..." + tail
+
 
 def _claim_sense(sense_gps):
     pins = []
@@ -330,6 +344,9 @@ class Concentrator:
         self.trig_low_ms = [None] * self.n   # tick ms the press began
         self.trig_stuck = [False] * self.n
         self.trig_presses = [0] * self.n
+        # survey result per channel: kind, why, and for a fault what latched it
+        self.chan = [{"kind": "unknown", "why": [], "latched": None}
+                     for _ in range(self.n)]
         self.frame = panel.panel_frame({}, self.link)
         
     def status_payload(self):
@@ -338,7 +355,8 @@ class Concentrator:
                  "ring": report.part(self.ring),
                  "sync": report.part(self.sntp, "boot_record"),
                  "watchdog": report.part(self.guard),
-                 "link": self.link_status()}
+                 "link": self.link_status(),
+                 "survey": self.survey_status()}
         return report.build({
             "id": self.cfg.get("device", {}).get("name"),
             "name": self.cfg.get("device", {}).get("name"),
@@ -456,6 +474,55 @@ class Concentrator:
                 body.update(TRIGGER_BODY)        # labelled, never hidden
             send(self.events.make(self.sntp, "stroke", body))
         return kind, held
+
+    # ---- survey why ---------------------------------------------------------
+    def _survey_settled(self, results, kinds):
+        """One console line per channel, and a stored "channel" event for
+        each channel whose kind changed (prev_kind, why)."""
+        results = results or {}
+        for i in range(self.n):
+            r = results.get(i) or {}
+            kind = kinds.get(i, r.get("kind", "unknown"))
+            why = [str(w) for w in (r.get("why") or [])][:WHY_LINES_MAX]
+            c = self.chan[i]
+            prev = c["kind"]
+            changed = kind != prev
+            emit("ch %d %s: %s%s" % (i + 1, kind, "; ".join(why) or "-",
+                                     (" (was %s)" % prev) if changed else ""))
+            c["kind"], c["why"] = kind, why
+            if not changed:
+                continue
+            ev = {}
+            try:                                 # never let a report stop the ring
+                ev = self.events.make(self.sntp, "channel",
+                                      {"ch": i + 1, "kind": kind,
+                                       "prev_kind": prev, "why": why})
+                send(ev)
+            except Exception as e:
+                emit("channel event ch %d: %r" % (i + 1, e))
+            if kind == "fault":
+                c["latched"] = {"why": why, "seq": ev.get("seq"),
+                                "uptime_s": int(time.monotonic() - self.boot_at),
+                                "utc_ms": ev.get("utc_ms")}
+            else:
+                c["latched"] = None
+
+    def survey_status(self):
+        """/status parts.survey: kind + why per channel, and for a fault the
+        why, event seq and time that latched it."""
+        return {"phase": self.survey_state.phase,
+                "channels": [dict(ch=i + 1, **c) for i, c in enumerate(self.chan)]}
+
+    def chan_brief(self):
+        """Heartbeat: [kind, short why or None] per channel (why only for
+        fault / trigger / unknown, first line, WHY_HB_CHARS max)."""
+        out = []
+        for c in self.chan:
+            w = None
+            if c["kind"] in WHY_HB_KINDS and c["why"]:
+                w = short_why(c["why"][0])
+            out.append([c["kind"], w])
+        return out
 
     def _trigger_down(self, i):
         prev = getattr(self, "_prev_held", None)     # not yet at early boot
@@ -587,6 +654,8 @@ class Concentrator:
                 self.gate.set_kind(i, kind)   # else gate.enforce zeroes the heads
             # head[] now, not at the next panel pass: _watch_empty reads it
             self._paint_kinds(self.survey_state.kinds, True)
+            self._survey_settled(self.survey_state.last_result,
+                                 self.survey_state.kinds)
             await self._start_ring(self.survey_state.kinds)
         await self._watch_empty(time.monotonic())
         self.guard.loop_tick()
@@ -681,6 +750,7 @@ class Concentrator:
                 "srv": sn.server, "stratum": sn.stratum, "last": sn.last,
                 "peer": getattr(sn, "peer", None)},
             "last_seq": self.events.seq,          # newest event seq this boot
+            "chan": self.chan_brief(),
             "uptime_s": int(time.monotonic() - self.boot_at),
             "last_reset": self.guard.last_reset,
             "watchdog": self.guard.armed,

@@ -257,6 +257,37 @@ def trigger(app, fh, pressed):
     return {"trigger": res}
 
 
+def plug_orange_short(fh, ch):
+    """Orange on channel ch shorted to 0 V: GP28 reads ~0 when it is selected."""
+    import mux_select
+
+    def gp28():
+        t = list(mux_select._TOWERS.values())[0]
+        if t.current == ch:
+            return 0
+        return fh.pwm[21].duty_cycle if 21 in fh.pwm else 0
+    fh.adc_fn[28] = gp28
+
+
+def why(app, fh, sent, lines):
+    """Survey why: console lines, channel events on change only, /status
+    parts.survey (with what latched a fault), heartbeat chan brief."""
+    res = {"boot_events": [e["body"] for e in sent if e.get("type") == "channel"],
+           "boot_lines": [l for l in lines if l.startswith("ch ")]}
+    st = app.status_payload()["parts"]["survey"]
+    res["status_ch2"] = st["channels"][1]
+    res["fault_seq"] = [e["seq"] for e in sent if e.get("type") == "channel"
+                        and e["body"]["ch"] == 2][0]
+    res["hb_chan"] = app.heartbeat_doc()["body"]["chan"][:3]
+    del sent[:], lines[:]
+    fh.adc_fn.pop(28, None)                  # short removed
+    run_survey(app, "plug", channel=1)
+    res["fix_events"] = [e["body"] for e in sent if e.get("type") == "channel"]
+    res["fix_lines"] = [l for l in lines if l.startswith("ch 2 ")]
+    res["fix_latched"] = app.status_payload()["parts"]["survey"]["channels"][1]["latched"]
+    return {"why": res}
+
+
 def child(scenario, src, extra):
     fh = child_setup(src, extra)
     out = {"ok": False}
@@ -286,6 +317,16 @@ def child(scenario, src, extra):
         if scenario in ("trigger", "trigger_held", "trigger_held_gnd"):
             plug_trigger(fh, pressed, to_ground=scenario == "trigger_held_gnd")
         import concentrator
+        sent, lines = [], []
+        if scenario == "why":
+            plug_orange_short(fh, 1)
+            concentrator.send = lambda obj, keep=True: sent.append(obj)
+            real_emit = concentrator.emit
+
+            def emit(msg):
+                lines.append(msg)
+                real_emit(msg)
+            concentrator.emit = emit
         app = concentrator.Concentrator(concentrator.cfg)
         run_survey(app, "boot")              # boot survey (was _probe_heads in __init__)
         if scenario == "strokes":
@@ -296,6 +337,8 @@ def child(scenario, src, extra):
             out.update(link(app))
         if scenario == "trigger":
             out.update(trigger(app, fh, pressed))
+        if scenario == "why":
+            out.update(why(app, fh, sent, lines))
         if scenario == "trigger_held_gnd":
             import concentrator as C
             out["gnd_heads"] = list(app.head)
@@ -382,7 +425,7 @@ def main():
         check(t + " set_ringing follows tower", r.get("sntp_calls") == [True, False, True, False],
               r.get("sntp_calls"))
         check(t + " payload: 6 panel LEDs + parts", r.get("panel_len") == 6 and
-              r.get("parts") == ["gate", "link", "mux", "refresh", "ring", "sync", "watchdog"], (r.get("panel_len"), r.get("parts")))
+              r.get("parts") == ["gate", "link", "mux", "refresh", "ring", "survey", "sync", "watchdog"], (r.get("panel_len"), r.get("parts")))
         if sv == "with_common27":
             check(t + " common 27 warned", r.get("warn27"))
     r = spawn(me, "head")
@@ -454,6 +497,35 @@ def main():
           and r.get("gnd_release_doubt") is False and r.get("gnd_release_strokes") == 0,
           r.get("exc") or (r.get("gnd_heads"), r.get("gnd_release_doubt"),
                            r.get("gnd_release_strokes")))
+    r = spawn(me, "why")
+    W = r.get("why") or {}
+    be = W.get("boot_events") or []
+    check("why: boot survey stores one 'channel' event per channel (prev unknown)",
+          r["ok"] and len(be) == 8 and all(b["prev_kind"] == "unknown" for b in be)
+          and [b["ch"] for b in be] == list(range(1, 9)), r.get("exc") or be)
+    f = [b for b in be if b["ch"] == 2]
+    check("why: ch2 Orange short -> fault, why carries the measurement",
+          f and f[0]["kind"] == "fault" and "(l50 0.00 < 0.20)" in f[0]["why"][0], f)
+    bl = W.get("boot_lines") or []
+    check("why: one console line per channel, e.g. 'ch 2 fault: ... (was unknown)'",
+          len(bl) == 8 and bl[1].startswith("ch 2 fault: Orange shorted to ground")
+          and bl[1].endswith("(was unknown)"), bl[:2])
+    s2 = W.get("status_ch2") or {}
+    check("why: /status parts.survey ch2 kind + why + latched (seq, uptime)",
+          s2.get("kind") == "fault" and s2.get("why") and (s2.get("latched") or {}).get("seq")
+          == W.get("fault_seq") and "uptime_s" in (s2.get("latched") or {}), s2)
+    hb = W.get("hb_chan") or []
+    check("why: heartbeat chan = [kind, short why] (why only for fault/trigger)",
+          hb[:1] == [["empty", None]] and hb[1][0] == "fault"
+          and hb[1][1].startswith("Orange shorted") and len(hb[1][1]) <= 80
+          and hb[1][1].endswith("... (l50 0.00 < 0.20)"), hb)
+    fe = W.get("fix_events") or []
+    check("why: resurvey stores an event only for the changed channel",
+          fe == [{"ch": 2, "kind": "empty", "prev_kind": "fault", "why": fe[0]["why"]}]
+          if fe else False, fe)
+    check("why: changed channel's console line says (was fault); latch cleared",
+          (W.get("fix_lines") or [""])[-1].endswith("(was fault)")
+          and W.get("fix_latched") is None, (W.get("fix_lines"), W.get("fix_latched")))
     r = spawn(me, "link")
     L = r.get("link") or {}
     check("link: LED6 white synced / amber holdover / red unsynced",
