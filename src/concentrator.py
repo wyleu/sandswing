@@ -1013,7 +1013,25 @@ async def main():
         print("Cleanup complete")
 
 def run():
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        raise                                    # someone at the console: stay in the REPL
+    except Exception as e:
+        # A task died.  The serial log drops most of a traceback, so say what
+        # it was in one line, then restart: a stopped program means a dead tower.
+        emit("main exit: %s: %s" % (type(e).__name__, e))
+        try:
+            import sys
+            sys.print_exception(e)
+        except Exception:
+            pass
+        time.sleep(3)
+        try:
+            import microcontroller
+            microcontroller.reset()
+        except ImportError:
+            raise e
 
 
 if __name__ == "__main__" or __name__ == "<module>":
