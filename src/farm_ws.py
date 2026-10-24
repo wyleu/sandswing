@@ -310,6 +310,13 @@ def _drop(ws, why, code=WS_GOING_AWAY):
     if ws in _new:
         _new.remove(ws)
     _close(ws, code)
+    if isinstance(why, Exception) and not isinstance(why, OSError):
+        # a bug, not a network fault: put the traceback in the serial log
+        try:
+            import sys
+            sys.print_exception(why)
+        except Exception:
+            print("trace:", repr(why))
     why = _why(why)
     if known:
         stats["drops"] += 1
