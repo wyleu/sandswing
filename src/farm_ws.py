@@ -70,7 +70,11 @@ def wifi_candidates(cfg):
     return [{"ssid": ssid, "password": pw}] if ssid else []
 
 
+_joined_ssid = None   # remembered because ap_info is not available on every build
+
+
 def connect_wifi(cfg, timeout=None):
+    global _joined_ssid
     last = None
     for n in wifi_candidates(cfg):
         ssid, password = n.get("ssid", ""), n.get("password", "")
@@ -83,6 +87,7 @@ def connect_wifi(cfg, timeout=None):
             else:
                 wifi.radio.connect(ssid, password, timeout=timeout)
             print("WiFi OK", ssid, wifi.radio.ipv4_address)
+            _joined_ssid = ssid
             return True
         except Exception as e:
             last = e
@@ -186,12 +191,16 @@ def wifi_rssi():
 
 
 def wifi_ssid():
-    """The network we are joined to (the config's ssid can be a list)."""
+    """The network we are joined to (the config's ssid can be a list).
+    ap_info is None on some builds, so fall back to what we joined."""
     try:
         ssid = wifi.radio.ap_info.ssid
-        return ssid.decode() if isinstance(ssid, (bytes, bytearray)) else ssid
+        ssid = ssid.decode() if isinstance(ssid, (bytes, bytearray)) else ssid
+        if ssid:
+            return ssid
     except Exception:
-        return None
+        pass
+    return _joined_ssid
 
 
 def _count():
