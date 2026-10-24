@@ -76,8 +76,23 @@ def test_concentrator_panel():
 @case
 def test_missing_bits_do_not_break():
     doc = sand_status.from_concentrator(dict(FACTS, more={"time": {}, "link": {}}))
-    assert val(doc, "network", "rssi")["value"] == "—"
+    assert val(doc, "network", "gateway")["value"] == "—"
     assert val(doc, "time", "sync")["value"] == "unsynced"
+
+
+@case
+def test_no_rssi_shows_gateway_ping():
+    def doc_with(**link):
+        more = dict(MORE)
+        more["rssi"] = None
+        more["link"] = dict(more.get("link") or {}, **link)
+        return sand_status.from_concentrator(dict(FACTS, more=more))
+    d = doc_with(gw_ms=4.2, gw_fail=0)
+    assert val(d, "network", "gateway")["value"] == "4.2 ms"
+    assert val(d, "network", "gateway")["level"] == "ok"
+    d = doc_with(gw_ms=None, gw_fail=3)
+    assert val(d, "network", "gateway")["value"] == "no reply (3 missed)"
+    assert val(d, "network", "gateway")["level"] == "error"
 
 
 finish()

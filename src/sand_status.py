@@ -355,6 +355,18 @@ def _signal(rssi):
     return "%d dBm weak" % rssi, "error"
 
 
+def _gateway_item(link):
+    """Ping round trip to the Wi-Fi gateway: the link-quality stand-in when
+    the radio cannot report signal strength."""
+    ms, fail = link.get("gw_ms"), link.get("gw_fail") or 0
+    if fail:
+        return item("gateway", "Gateway ping", "no reply (%d missed)" % fail, "error")
+    if ms is None:
+        return item("gateway", "Gateway ping", None)
+    lvl = "ok" if ms <= 50 else ("warn" if ms <= 200 else "error")
+    return item("gateway", "Gateway ping", "%g ms" % ms, lvl)
+
+
 def _time_items(t):
     st = t.get("state") or "unsynced"
     lvl = {"synced": "ok", "held": "ok", "stale": "warn"}.get(st, "error")
@@ -409,7 +421,10 @@ def from_concentrator(facts):
     sig, sig_lvl = _signal(m.get("rssi"))
     sections = []
     if m:
-        net.append(item("rssi", "Signal", sig, sig_lvl))
+        if m.get("rssi") is not None:
+            net.append(item("rssi", "Signal", sig, sig_lvl))
+        else:                                   # this build cannot report dBm
+            net.append(_gateway_item(link))
         lost = link.get("wifi_lost") or 0
         net.append(item("wifi_lost", "Wi-Fi lost", "%d time%s" % (lost, "" if lost == 1 else "s"),
                         "warn" if lost else "ok",

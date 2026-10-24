@@ -203,16 +203,22 @@ def wifi_ssid():
     return _joined_ssid
 
 
+last_ping_ms = None     # round trip of the last answered gateway ping
+
+
 def gateway_ping(timeout=1.0):
     """True if the Wi-Fi gateway answers a ping, False if not, None if this
-    build cannot ping or has no gateway."""
+    build cannot ping or has no gateway.  Sets last_ping_ms (None on a miss)."""
+    global last_ping_ms
     try:
         gw = wifi.radio.ipv4_gateway
         if gw is None:
             return None
-        return wifi.radio.ping(gw, timeout=timeout) is not None
+        r = wifi.radio.ping(gw, timeout=timeout)
     except Exception:
         return None
+    last_ping_ms = None if r is None else round(r * 1000, 1)
+    return r is not None
 
 
 def _count():

@@ -227,6 +227,7 @@ class Concentrator:
         self._dead_handled = False       # one radio reset per silent spell
         self._gw_at = 0.0                # gateway ping state (link_step)
         self._gw_fail = 0
+        self._gw_ms = None
         self._gw_since = None
         self._gw_seen = False            # a ping has worked since boot: rule applies
         self.boot_at = time.monotonic()
@@ -774,7 +775,7 @@ class Concentrator:
         d = st() if st is not None else {}
         d.update({"wifi_up": self.wifi_up, "wifi_lost": self.wifi_lost,
                   "rejoins": self.rejoins, "radio_resets": self.radio_resets,
-                  "gw_fail": self._gw_fail})
+                  "gw_fail": self._gw_fail, "gw_ms": self._gw_ms})
         return d
 
     def _mimic(self):
@@ -857,6 +858,7 @@ class Concentrator:
         ok = ping()
         if ok is None:
             return
+        self._gw_ms = getattr(farm_ws, "last_ping_ms", None) if ok else None
         if ok:
             self._gw_seen = True
             self._gw_fail = 0
