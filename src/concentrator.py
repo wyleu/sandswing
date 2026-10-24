@@ -77,6 +77,7 @@ from threshold_refresh import refresher_from_cfg
 from ring import Ring, open_midi, FULL, MIN_STROKE_GAP_MS
 import panel
 import report
+
 from board_pins import release
 from watchdog_guard import WatchdogGuard
 from sand_event import Emitter, make_event
@@ -85,6 +86,7 @@ from survey_state import SurveyState, SURVEYING, SETTLED, IDLE as SURVEY_IDLE
 from mux_errors import ChannelBusy
 from laser_measure import counts_to_ma
 from adc_avg import avg as _avg
+from link_health import LinkHealth
 
 RING_WINDOW_S = 0.4
 SETTLE_S = 0.3
@@ -221,6 +223,9 @@ class Concentrator:
         emit("boot reset=%s run=%s" % (self.guard.last_reset, self.guard.run_reason))
         self.pinmap = load_pinmap(cfg)
         self.sense_gps = self.pinmap["sense_gp"]
+        
+        self.link_health = LinkHealth()
+        
         self.n = len(self.sense_gps)          # set n first
         self.link = "no_wifi"
         self.wifi_up = False             # set by start_app; link_task follows it
@@ -758,7 +763,14 @@ class Concentrator:
             self._paint_kinds(kinds, heartbeat_on if rate == 0 else channel_on)
             await asyncio.sleep(0.05)
         
-    # ---- link health ------------------------------------------------------
+    async def link_task(self):
+        """Periodic link supervision."""
+        state = {"lost_at": None, "tried_at": 0}
+        while True:
+            self.link_step(time.monotonic(), state)
+            await asyncio.sleep(LINK_CHECK_S)
+        
+        # ---- link health ------------------------------------------------------
     def link_event(self, what, **info):
         """A "link" sand.event/v1 (stored by Sandbells, kept for replay)."""
         body = {"what": what}
@@ -884,86 +896,90 @@ class Concentrator:
                             sync=self.sntp.state() if self.sntp else None)
             farm_ws.reset_radio()                # next pass: lost -> rejoin
 
-    def link_step(self, now, state):
-        """One supervision pass.  state: {"lost_at", "tried_at"}."""
-        if not farm_ws.wifi_ok():
-            if self.wifi_up:
-                self.wifi_up = False
-                self.wifi_lost += 1
-                self.link = "no_wifi"
-                state["lost_at"] = now
-                state["tried_at"] = now          # give it a moment by itself
-                farm_ws.drop_all("wifi lost")
-                self.link_event("wifi_lost", count=self.wifi_lost)
-            gap = (WIFI_REJOIN_S if self.tower.tower == "inactive"
-                   else WIFI_REJOIN_RINGING_S)
-            if now - state["tried_at"] >= gap:
-                state["tried_at"] = now
-                if self._rejoin():
-                    self.rejoins += 1
-            return
-        if not self.wifi_up:
-            lost = state.get("lost_at")
-            self._wifi_regained(None if lost is None else round(now - lost, 1))
-            return
-        # Wi-Fi says up.  Does the gateway still answer?  (A radio can stop
-        # answering ARP while the Pico still thinks it is joined, and with no
-        # client connecting nothing else would notice.)
-        if self.tower.tower == "inactive":
-            self._gateway_check(now)
-        # Is anything getting through?
-        if not farm_ws.stats.get("hb_seen"):
-            return                               # old Sandbells / bench: no rule
-        age = farm_ws.last_rx_age_s(now)
-        if age is None or age < LINK_DEAD_S:
-            self._dead_handled = False
-            return
-        if self.tower.tower != "inactive":
-            return                               # never during ringing
-        if age >= LINK_DEAD_RESET_S and self.guard.armed:
-            self.link_event("reset", reason="nothing heard %d s" % age)
-            farm_ws.poll()                       # last chance to send it
-            import microcontroller
-            microcontroller.reset()
-        if not self._dead_handled:
-            self._dead_handled = True
-            self.radio_resets += 1
-            self.link_event("link_dead", reason="nothing heard %d s" % age,
-                            sync=self.sntp.state() if self.sntp else None)
-            farm_ws.reset_radio()                # next pass: lost -> rejoin
 
     async def mem_task(self):
-        """Keep the heap from fragmenting.  After a burst of strokes the
-        free memory is in small pieces and the 5 kB /status body cannot be
-        allocated (status payload error ... memory allocation failed), which
-        leaves clients silent.  Collect while the bells are quiet, never in
-        the middle of a stroke, and log the free memory once a minute."""
+        """Keep the heap from fragmenting. Collect while the bells are quiet,
+        never in the middle of a stroke, and log free memory once a minute."""
         import gc
         n = 0
         while True:
             await asyncio.sleep(MEM_CHECK_S)
             try:
-                now = self.ticks.now()
-                busy = [m for m in self.stroke_ms if m is not None
-                        and now - m < MEM_QUIET_MS]
-                if not busy:
+                now_ms = self.ticks.now()
+                recent = [m for m in self.stroke_ms if m is not None]
+                quiet = not recent or (now_ms - max(recent)) >= MEM_QUIET_MS
+                if quiet:
                     gc.collect()
                 n += 1
                 if n % MEM_LOG_EVERY == 0:
                     emit("mem free %d kB%s" % (gc.mem_free() // 1024,
-                                              " (busy)" if busy else ""))
-            except Exception as e:               # never let it kill main()
+                                              "" if quiet else " (busy)"))
+            except Exception as e:
                 emit("mem_task: %r" % e)
 
-    async def link_task(self):
-        state = {"lost_at": None, "tried_at": 0.0}
-        while True:
-            await asyncio.sleep(LINK_CHECK_S)
-            try:
-                self.link_step(time.monotonic(), state)
-            except Exception as e:               # never let it kill main()
-                emit("link_task: %r" % e)
 
+    def link_step(self, now, state):
+        """One supervision pass driven by LinkHealth.
+        state: {"lost_at", "tried_at"}"""
+        now_ms = self.ticks.now()
+        recent = [m for m in self.stroke_ms if m is not None]
+        quiet_ms = 999999 if not recent else int(now_ms - max(recent))
+
+        obs = {
+            "wifi_up": farm_ws.wifi_ok(),
+            "n_clients": len(farm_ws._clients),
+            "hb_seen": farm_ws.stats.get("hb_seen", False),
+            "last_rx_age_s": (
+                now - farm_ws.stats["last_rx_at"]
+                if farm_ws.stats.get("last_rx_at") else None
+            ),
+            "last_gw_ok": self._gw_ms is not None,
+            "gw_fail_count": self._gw_fail,
+            "tower_inactive": self.tower.tower == "inactive",
+            "quiet_ms": quiet_ms,
+            "watchdog_armed": self.guard.armed,
+        }
+        _, events = self.link_health.update(now, obs)
+
+        # Wi-Fi down: signal the loss, then try to rejoin on the usual cadence
+        if not farm_ws.wifi_ok():
+            if "wifi_lost" in events:
+                self.wifi_up = False
+                self.wifi_lost += 1
+                self.link = "no_wifi"
+                state["lost_at"] = now
+                state["tried_at"] = now
+                farm_ws.drop_all("wifi lost")
+                self.link_event("wifi_lost", count=self.wifi_lost)
+            gap = (WIFI_REJOIN_S if self.tower.tower == "inactive"
+                   else WIFI_REJOIN_RINGING_S)
+            if now - state.get("tried_at", 0) >= gap:
+                state["tried_at"] = now
+                if self._rejoin():
+                    self.rejoins += 1
+            return
+
+        # Wi-Fi is up
+        if "wifi_up" in events:
+            lost = state.get("lost_at")
+            self._wifi_regained(None if lost is None else round(now - lost, 1))
+
+        for ev in events:
+            if ev == "radio_reset":
+                self.radio_resets += 1
+                self._dead_handled = True
+                self.link_event("link_dead", reason="link health radio_reset",
+                                sync=self.sntp.state() if self.sntp else None)
+                farm_ws.reset_radio()
+            elif ev == "pico_reset" and self.guard.armed:
+                self.link_event("reset", reason="link health pico_reset")
+                farm_ws.poll()
+                import microcontroller
+                microcontroller.reset()
+
+        # gateway check on its own timer, only while quiet and inactive
+        if self.tower.tower == "inactive" and quiet_ms >= MEM_QUIET_MS:
+            self._gateway_check(now)     
 
 def start_app():
     """Everything up to the steady loop: net, Concentrator (survey,
