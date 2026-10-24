@@ -56,6 +56,7 @@ GATEWAY_FAIL_N = 4
 LINK_DEAD_S = 120.0
 LINK_DEAD_RESET_S = 600.0
 MEM_QUIET_MS = 3000
+RADIO_RESET_SETTLE_S = 60.0
 
 
 class LinkHealth:
@@ -63,6 +64,7 @@ class LinkHealth:
         self.state = DOWN
         self._dead_since = None
         self._radio_reset_at = None
+        self._latched = False       # a radio reset was asked for this silent spell
         self.events = []
 
     def update(self, now_s, obs):
@@ -94,10 +96,18 @@ class LinkHealth:
             self.events.append("wifi_up")
             self.state = UP
 
+        # A radio reset normally drops Wi-Fi, which returns us to DOWN.  If it did
+        # not, do not stay in RADIO_RESET for ever (that blocked every later reset).
+        if self.state == RADIO_RESET and self._radio_reset_at is not None \
+                and now_s - self._radio_reset_at >= RADIO_RESET_SETTLE_S:
+            self.state = UP
+
         # Client liveness
         live = n_clients > 0 and hb_seen and (
             last_rx_age is None or last_rx_age < CLIENT_SILENT_S
         )
+        if hb_seen and last_rx_age is not None and last_rx_age < CLIENT_SILENT_S:
+            self._latched = False   # frames are arriving again: a new spell may start
         if live:
             if self.state != CLIENT_LIVE:
                 self.events.append("client_live")
@@ -113,6 +123,12 @@ class LinkHealth:
             # no clients or no heartbeat yet — stay UP
             if self.state in (CLIENT_LIVE, CLIENT_SILENT):
                 self.state = UP
+            # Heartbeats were heard this boot but nothing has arrived for a
+            # while, even with no client connected (the clients dropped, or
+            # the radio is deaf): the spell began when the last frame did.
+            if hb_seen and last_rx_age is not None and last_rx_age >= CLIENT_SILENT_S \
+                    and self._dead_since is None:
+                self._dead_since = now_s - last_rx_age
 
         # Gateway failures only matter while quiet / inactive (matches current policy)
         if tower_inactive and quiet_ms >= MEM_QUIET_MS and gw_ok is False:
@@ -128,7 +144,9 @@ class LinkHealth:
             if dead_for >= LINK_DEAD_RESET_S and armed and self.state != DEAD:
                 self.events.append("pico_reset")
                 self.state = DEAD
-            elif dead_for >= LINK_DEAD_S and self.state not in (RADIO_RESET, DEAD):
+            elif dead_for >= LINK_DEAD_S and self.state not in (RADIO_RESET, DEAD) \
+                    and not self._latched and tower_inactive:
+                self._latched = True      # one reset per silent spell, not one per rejoin
                 self.events.append("radio_reset")
                 self.state = RADIO_RESET
                 self._radio_reset_at = now_s

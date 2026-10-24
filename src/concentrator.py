@@ -767,7 +767,10 @@ class Concentrator:
         """Periodic link supervision."""
         state = {"lost_at": None, "tried_at": 0}
         while True:
-            self.link_step(time.monotonic(), state)
+            try:
+                self.link_step(time.monotonic(), state)
+            except Exception as e:               # never let it kill main()
+                emit("link_task: %r" % e)
             await asyncio.sleep(LINK_CHECK_S)
         
         # ---- link health ------------------------------------------------------
@@ -851,10 +854,17 @@ class Concentrator:
             farm_ws.connect_wifi(self.cfg, timeout=WIFI_JOIN_TIMEOUT_S)
         return farm_ws.wifi_ok()
 
-    def _wifi_regained(self, down_s):
+    def _wifi_regained(self, down_s, now=None):
         ip = farm_ws.wifi_ip()
         self.wifi_up = True
         self.link = "wifi_only"
+        # A new join starts with a clean gateway record.  Otherwise the misses
+        # counted before the reset are still >= GATEWAY_FAIL_N, and the link
+        # health machine asks for another radio reset on the very next pass.
+        self._gw_fail = 0
+        self._gw_ms = None
+        self._gw_since = None
+        self._gw_at = time.monotonic() if now is None else now   # first ping after a quiet GATEWAY_CHECK_S
         if farm_ws.server_running() and farm_ws.server_host() != ip:
             farm_ws.stop_server()                # new address: rebind
         if not farm_ws.server_running():
@@ -890,11 +900,8 @@ class Concentrator:
             farm_ws.poll()
             import microcontroller
             microcontroller.reset()
-        if self._gw_fail % GATEWAY_FAIL_N == 0:
-            self.radio_resets += 1
-            self.link_event("link_dead", reason="gateway silent %d s" % down,
-                            sync=self.sntp.state() if self.sntp else None)
-            farm_ws.reset_radio()                # next pass: lost -> rejoin
+        # The radio reset for a silent gateway is LinkHealth's decision
+        # (GATEWAY_FAIL_N misses): doing it here as well reset the radio twice.
 
 
     async def mem_task(self):
@@ -925,14 +932,15 @@ class Concentrator:
         recent = [m for m in self.stroke_ms if m is not None]
         quiet_ms = 999999 if not recent else int(now_ms - max(recent))
 
+        # gateway check first, so this pass's decision sees its latest answer
+        if self.tower.tower == "inactive" and quiet_ms >= MEM_QUIET_MS:
+            self._gateway_check(now)
+
         obs = {
             "wifi_up": farm_ws.wifi_ok(),
-            "n_clients": len(farm_ws._clients),
+            "n_clients": farm_ws.ws_clients(),
             "hb_seen": farm_ws.stats.get("hb_seen", False),
-            "last_rx_age_s": (
-                now - farm_ws.stats["last_rx_at"]
-                if farm_ws.stats.get("last_rx_at") else None
-            ),
+            "last_rx_age_s": farm_ws.last_rx_age_s(now),
             "last_gw_ok": self._gw_ms is not None,
             "gw_fail_count": self._gw_fail,
             "tower_inactive": self.tower.tower == "inactive",
@@ -943,8 +951,8 @@ class Concentrator:
 
         # Wi-Fi down: signal the loss, then try to rejoin on the usual cadence
         if not farm_ws.wifi_ok():
-            if "wifi_lost" in events:
-                self.wifi_up = False
+            if self.wifi_up:                     # the Concentrator's own record decides, so a
+                self.wifi_up = False             # state machine that has not caught up cannot miss it
                 self.wifi_lost += 1
                 self.link = "no_wifi"
                 state["lost_at"] = now
@@ -960,14 +968,15 @@ class Concentrator:
             return
 
         # Wi-Fi is up
-        if "wifi_up" in events:
+        if not self.wifi_up:
             lost = state.get("lost_at")
-            self._wifi_regained(None if lost is None else round(now - lost, 1))
+            self._wifi_regained(None if lost is None else round(now - lost, 1), now)
 
         for ev in events:
             if ev == "radio_reset":
                 self.radio_resets += 1
                 self._dead_handled = True
+                self._gw_fail = 0                # this reset answers the misses so far
                 self.link_event("link_dead", reason="link health radio_reset",
                                 sync=self.sntp.state() if self.sntp else None)
                 farm_ws.reset_radio()
@@ -976,10 +985,6 @@ class Concentrator:
                 farm_ws.poll()
                 import microcontroller
                 microcontroller.reset()
-
-        # gateway check on its own timer, only while quiet and inactive
-        if self.tower.tower == "inactive" and quiet_ms >= MEM_QUIET_MS:
-            self._gateway_check(now)     
 
 def start_app():
     """Everything up to the steady loop: net, Concentrator (survey,
