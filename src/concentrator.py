@@ -99,6 +99,9 @@ HEARTBEAT_LENGTH = 1.25
 # Link health (docs/link-health.md).  Code constants, not settings.
 PANEL_SCHEMA = "sand.panel/v1"   # heartbeat frames: Sandbells shows, never stores
 PICO_HEARTBEAT_S = 5.0           # heartbeat (LED mimic + link + sync) to /ws
+MEM_CHECK_S = 3.0                # heap tidy pass (only while the bells are quiet)
+MEM_QUIET_MS = 3000              # ...no stroke for this long
+MEM_LOG_EVERY = 20               # log free memory every 60 s
 LINK_CHECK_S = 2.0               # Wi-Fi supervision pass
 WIFI_REJOIN_S = 30.0             # rejoin attempts while the tower is quiet
 WIFI_REJOIN_RINGING_S = 120.0    # ...and while ringing (a join blocks sensing)
@@ -929,6 +932,29 @@ class Concentrator:
                             sync=self.sntp.state() if self.sntp else None)
             farm_ws.reset_radio()                # next pass: lost -> rejoin
 
+    async def mem_task(self):
+        """Keep the heap from fragmenting.  After a burst of strokes the
+        free memory is in small pieces and the 5 kB /status body cannot be
+        allocated (status payload error ... memory allocation failed), which
+        leaves clients silent.  Collect while the bells are quiet, never in
+        the middle of a stroke, and log the free memory once a minute."""
+        import gc
+        n = 0
+        while True:
+            await asyncio.sleep(MEM_CHECK_S)
+            try:
+                now = self.ticks.now()
+                busy = [m for m in self.stroke_ms if m is not None
+                        and now - m < MEM_QUIET_MS]
+                if not busy:
+                    gc.collect()
+                n += 1
+                if n % MEM_LOG_EVERY == 0:
+                    emit("mem free %d kB%s" % (gc.mem_free() // 1024,
+                                              " (busy)" if busy else ""))
+            except Exception as e:               # never let it kill main()
+                emit("mem_task: %r" % e)
+
     async def link_task(self):
         state = {"lost_at": None, "tried_at": 0.0}
         while True:
@@ -969,6 +995,7 @@ async def main():
         app.refresher.run(),
         app.heartbeat_task(),
         app.link_task(),
+        app.mem_task(),
         ]
     
     if app.sntp is not None:

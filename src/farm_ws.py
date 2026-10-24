@@ -121,6 +121,15 @@ def start_server(cfg, payload_fn):
         def status_route(request: Request):
             try:
                 body = json.dumps(_payload_fn())
+            except MemoryError as e:             # fragmented heap: tidy, retry once
+                print("status payload error", e)
+                try:
+                    import gc
+                    gc.collect()
+                    body = json.dumps(_payload_fn())
+                except Exception as e2:
+                    print("status payload retry failed", e2)
+                    body = '{"error":"payload"}'
             except Exception as e:
                 print("status payload error", e)
                 body = '{"error":"payload"}'
