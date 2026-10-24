@@ -104,6 +104,8 @@ WIFI_REJOIN_S = 30.0             # rejoin attempts while the tower is quiet
 WIFI_REJOIN_RINGING_S = 120.0    # ...and while ringing (a join blocks sensing)
 WIFI_JOIN_TIMEOUT_S = 10         # per network in the list
 LINK_DEAD_S = 120.0              # Wi-Fi "up" but no client heard: radio reset
+GATEWAY_CHECK_S = 30.0           # ping the Wi-Fi gateway (tower quiet only)
+GATEWAY_FAIL_N = 4               # this many misses in a row (after one hit): radio reset
 LINK_DEAD_RESET_S = 600.0        # still nothing: reset the Pico (watchdog armed only)
 
 # Trigger plug (test switch, docs/trigger-plug.md).  Code constants.
@@ -223,6 +225,10 @@ class Concentrator:
         self.rejoins = 0                 # successful rejoins after a loss
         self.radio_resets = 0
         self._dead_handled = False       # one radio reset per silent spell
+        self._gw_at = 0.0                # gateway ping state (link_step)
+        self._gw_fail = 0
+        self._gw_since = None
+        self._gw_seen = False            # a ping has worked since boot: rule applies
         self.boot_at = time.monotonic()
         self.hb_seq = 0                  # heartbeat counter (not the event seq)
         self._frame_args = None
@@ -767,7 +773,8 @@ class Concentrator:
         st = getattr(farm_ws, "link_status", None)
         d = st() if st is not None else {}
         d.update({"wifi_up": self.wifi_up, "wifi_lost": self.wifi_lost,
-                  "rejoins": self.rejoins, "radio_resets": self.radio_resets})
+                  "rejoins": self.rejoins, "radio_resets": self.radio_resets,
+                  "gw_fail": self._gw_fail})
         return d
 
     def _mimic(self):
@@ -842,6 +849,36 @@ class Concentrator:
                 asyncio.create_task(self.sntp.run())
         self.link_event("wifi_back", ip=ip, down_s=down_s, rejoins=self.rejoins)
 
+    def _gateway_check(self, now):
+        ping = getattr(farm_ws, "gateway_ping", None)
+        if ping is None or now - self._gw_at < GATEWAY_CHECK_S:
+            return
+        self._gw_at = now
+        ok = ping()
+        if ok is None:
+            return
+        if ok:
+            self._gw_seen = True
+            self._gw_fail = 0
+            self._gw_since = None
+            return
+        if not self._gw_seen:
+            return                               # router may just ignore pings
+        self._gw_fail += 1
+        if self._gw_since is None:
+            self._gw_since = now
+        down = now - self._gw_since
+        if down >= LINK_DEAD_RESET_S and self.guard.armed:
+            self.link_event("reset", reason="gateway silent %d s" % down)
+            farm_ws.poll()
+            import microcontroller
+            microcontroller.reset()
+        if self._gw_fail % GATEWAY_FAIL_N == 0:
+            self.radio_resets += 1
+            self.link_event("link_dead", reason="gateway silent %d s" % down,
+                            sync=self.sntp.state() if self.sntp else None)
+            farm_ws.reset_radio()                # next pass: lost -> rejoin
+
     def link_step(self, now, state):
         """One supervision pass.  state: {"lost_at", "tried_at"}."""
         if not farm_ws.wifi_ok():
@@ -864,7 +901,12 @@ class Concentrator:
             lost = state.get("lost_at")
             self._wifi_regained(None if lost is None else round(now - lost, 1))
             return
-        # Wi-Fi says up.  Is anything getting through?
+        # Wi-Fi says up.  Does the gateway still answer?  (A radio can stop
+        # answering ARP while the Pico still thinks it is joined, and with no
+        # client connecting nothing else would notice.)
+        if self.tower.tower == "inactive":
+            self._gateway_check(now)
+        # Is anything getting through?
         if not farm_ws.stats.get("hb_seen"):
             return                               # old Sandbells / bench: no rule
         age = farm_ws.last_rx_age_s(now)

@@ -174,6 +174,31 @@ def link(app):
     whats = [o["body"]["what"] for o, k in sent if o.get("type") == "link"]
     res["link_whats"] = whats
     res["link_kept"] = all(k for o, k in sent if o.get("type") == "link")
+    # Gateway silent while no client is connecting: radio reset after
+    # GATEWAY_FAIL_N misses, but never if it has not answered since boot.
+    farm_ws.stats["hb_seen"] = False
+    gw = {"ok": None}
+    farm_ws.gateway_ping = lambda timeout=1.0: gw["ok"]
+    app._dead_handled = False
+    del resets[:]
+    t = 1000.0
+    def gstep():
+        nonlocal t
+        t += concentrator.GATEWAY_CHECK_S
+        app.link_step(t, state)
+    gw["ok"] = False
+    for _ in range(concentrator.GATEWAY_FAIL_N + 1):
+        gstep()
+    res["gw_unseen_resets"] = len(resets)       # never answered: no rule
+    gw["ok"] = True
+    gstep()
+    gw["ok"] = False
+    for _ in range(concentrator.GATEWAY_FAIL_N):
+        gstep()
+    res["gw_resets"] = len(resets)
+    gw["ok"] = True
+    gstep()
+    res["gw_fail_cleared"] = app._gw_fail
     return {"link": res}
 
 
@@ -553,6 +578,10 @@ def main():
           L.get("early_joins") == 0 and L.get("joins") == [10], (L.get("early_joins"), L.get("joins")))
     check("link: back -> wifi_only, server restarted",
           L.get("back") == ["wifi_only", True, 1], L.get("back"))
+    check("link: gateway silent -> radio reset, never without a first answer",
+          L.get("gw_unseen_resets") == 0 and L.get("gw_resets") == 1
+          and L.get("gw_fail_cleared") == 0,
+          [L.get("gw_unseen_resets"), L.get("gw_resets"), L.get("gw_fail_cleared")])
     check("link: silent link -> one radio reset per spell", L.get("radio_resets") == 1,
           L.get("radio_resets"))
     check("link: link events wifi_lost, wifi_back, link_dead (kept for replay)",
