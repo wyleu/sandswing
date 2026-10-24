@@ -185,6 +185,15 @@ def wifi_rssi():
         return None
 
 
+def wifi_ssid():
+    """The network we are joined to (the config's ssid can be a list)."""
+    try:
+        ssid = wifi.radio.ap_info.ssid
+        return ssid.decode() if isinstance(ssid, (bytes, bytearray)) else ssid
+    except Exception:
+        return None
+
+
 def _count():
     return "(%d client%s)" % (len(_clients), "" if len(_clients) == 1 else "s")
 

@@ -279,6 +279,10 @@ def why(app, fh, sent, lines):
     res["fault_seq"] = [e["seq"] for e in sent if e.get("type") == "channel"
                         and e["body"]["ch"] == 2][0]
     res["hb_chan"] = app.heartbeat_doc()["body"]["chan"][:3]
+    doc = app.status_payload()
+    res["panels"] = [x["id"] for x in doc["sections"]]
+    res["panel_ch2"] = [i for x in doc["sections"] if x["id"] == "heads"
+                        for i in x["items"] if i["key"] == "ch2_why"]
     del sent[:], lines[:]
     fh.adc_fn.pop(28, None)                  # short removed
     run_survey(app, "plug", channel=1)
@@ -519,6 +523,9 @@ def main():
           hb[:1] == [["empty", None]] and hb[1][0] == "fault"
           and hb[1][1].startswith("Orange shorted") and len(hb[1][1]) <= 80
           and hb[1][1].endswith("... (l50 0.00 < 0.20)"), hb)
+    check("status panels: network, time, heads, tower, concentrator; fault why shown",
+          W.get("panels") == ["network", "time", "heads", "tower", "concentrator"]
+          and len(W.get("panel_ch2") or []) == 1, (W.get("panels"), W.get("panel_ch2")))
     fe = W.get("fix_events") or []
     check("why: resurvey stores an event only for the changed channel",
           fe == [{"ch": 2, "kind": "empty", "prev_kind": "fault", "why": fe[0]["why"]}]

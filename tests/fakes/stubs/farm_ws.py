@@ -24,6 +24,8 @@ def wifi_ip():
     return None
 def wifi_rssi():
     return None
+def wifi_ssid():
+    return None
 def server_running():
     return False
 def server_host():

@@ -338,6 +338,7 @@ class Concentrator:
         self.last_false = [None] * self.n
         self.edge_at = [None] * self.n
         self.stroke_ms = [None] * self.n     # tick ms of the last accepted stroke
+        self.stroke_n = [0] * self.n         # accepted strokes this boot (status page)
         self._prev_held = [not pin.value for pin in self.inputs]
         self.trig_armed = [False] * self.n   # trigger plug: next press counts
         self.trig_open_ms = [None] * self.n  # tick ms the switch was seen open
@@ -364,11 +365,54 @@ class Concentrator:
             "role": self.cfg.get("device", {}).get("role"),
             "location": self.cfg.get("device", {}).get("location"),
             "ip": str(wifi.radio.ipv4_address),
-            "ssid": self.cfg.get("wifi", {}).get("ssid"),
+            "ssid": farm_ws.wifi_ssid() or self.cfg.get("wifi", {}).get("ssid"),
             "heads": list(self.head),
             "tower": self.tower.tower,          # "active" | "ringing_down" | "inactive"
             "ts": time.time(),                 # TODO(spec T13): utc_ms from sntp
+            "more": self._safe_more(),
         }, parts, panel.payload(self.frame))
+
+    def _safe_more(self):
+        """The extras are only for looking at: never let them break /status."""
+        try:
+            return self.status_more()
+        except Exception as e:
+            emit("status_more: %r" % e)
+            return {}
+
+    def status_more(self):
+        """Extra facts for the farm page's left-hand panels (sand_status
+        .from_concentrator): signal, link drops, time, per-channel strokes,
+        uptime, memory.  Same sources as the heartbeat; all plain values."""
+        sn = self.sntp
+        now_ms = self.ticks.now()
+        link = self.link_status()
+        t = {"state": "unsynced"}
+        if sn is not None:
+            t = {"state": sn.state(), "srv": getattr(sn, "server", None),
+                 "stratum": getattr(sn, "stratum", None),
+                 "peer": getattr(sn, "peer", None),
+                 "last": getattr(sn, "last", None)}
+            lg = getattr(sn, "last_good", None)
+            if lg is not None:
+                t["age_s"] = int((now_ms - lg) / 1000)
+        chans = []
+        for i, c in enumerate(self.chan):
+            last = self.stroke_ms[i] if i < len(self.stroke_ms) else None
+            chans.append({"kind": c["kind"],
+                          "why": c["why"][0] if c["why"] else None,
+                          "n": self.stroke_n[i],
+                          "ago_s": None if last is None else int((now_ms - last) / 1000)})
+        more = {"rssi": farm_ws.wifi_rssi(), "link": link, "time": t,
+                "chans": chans, "uptime_s": int(time.monotonic() - self.boot_at),
+                "last_reset": self.guard.last_reset, "watchdog": self.guard.armed,
+                "boot_id": self.events.boot_id, "seq": self.events.seq}
+        try:
+            import gc
+            more["mem_free"] = gc.mem_free()
+        except (ImportError, AttributeError):
+            pass
+        return more
 
 
     def gps_day(self):
@@ -443,6 +487,7 @@ class Concentrator:
                 print("%.3f ch %d DOUBLE %dms (ignored)" % (now, i + 1, t_ms - last))
             else:
                 self.stroke_ms[i] = t_ms
+                self.stroke_n[i] += 1
                 stroke = True
                 print("%.3f ch %d EDGE" % (now, i + 1))
 
@@ -563,6 +608,7 @@ class Concentrator:
             print("%.3f ch %d TRIGGER %dms after the last (ignored)" % (now, i + 1, t - last))
             return False
         self.stroke_ms[i] = t
+        self.stroke_n[i] += 1
         self.edge_at[i] = now
         self.trig_presses[i] += 1
         print("%.3f ch %d TRIGGER press %d" % (now, i + 1, self.trig_presses[i]))

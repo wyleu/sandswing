@@ -332,28 +332,120 @@ def from_sandswing(facts):
         summary=summary,
         poll_hint_sec=f.get("poll_hint_sec") or 2,
     )
+def _ago(s):
+    """Seconds -> '12 s' / '5 min' / '3 h 10 min' (None -> None)."""
+    if s is None:
+        return None
+    s = int(s)
+    if s < 120:
+        return "%d s" % s
+    if s < 7200:
+        return "%d min" % (s // 60)
+    return "%d h %d min" % (s // 3600, (s % 3600) // 60)
+
+
+def _signal(rssi):
+    """dBm -> (text, level)."""
+    if rssi is None:
+        return None, "unknown"
+    if rssi >= -67:
+        return "%d dBm good" % rssi, "ok"
+    if rssi >= -75:
+        return "%d dBm fair" % rssi, "warn"
+    return "%d dBm weak" % rssi, "error"
+
+
+def _time_items(t):
+    st = t.get("state") or "unsynced"
+    lvl = {"synced": "ok", "held": "ok", "stale": "warn"}.get(st, "error")
+    peer = t.get("peer") or {}
+    srv = t.get("srv") or peer.get("srv")
+    stratum = t.get("stratum")
+    if stratum is None:
+        stratum = peer.get("stratum")
+    src = None if srv is None else "%s stratum %s" % (srv, stratum)
+    items = [item("sync", "Sync", st, lvl), item("source", "Source", src)]
+    if t.get("age_s") is not None:
+        a = t["age_s"]
+        items.append(item("age", "Last good sync", _ago(a) + " ago",
+                          "warn" if a > 600 else "ok"))
+    last = t.get("last") or {}
+    if last.get("ok") is False and last.get("why"):
+        items.append(item("why", "Last attempt", last["why"], "warn"))
+    if peer.get("leap") == 3:
+        items.append(item("leap", "Server", "not synchronised (leap 3)", "warn"))
+    return items, lvl
+
+
+def _head_items(heads, chans):
+    items = []
+    for i, kind in enumerate(heads):
+        c = chans[i] if i < len(chans) else {}
+        v = str(kind)
+        if c.get("n") is not None and kind in ("new", "old", "lb", "trigger"):
+            v += " \u00b7 %d stroke%s" % (c["n"], "" if c["n"] == 1 else "s")
+            if c.get("ago_s") is not None:
+                v += ", last %s ago" % _ago(c["ago_s"])
+        lvl = "error" if kind == "fault" else ("ok" if kind != "unknown" else "warn")
+        items.append(item("ch%d" % (i + 1), "Channel %d" % (i + 1), v, lvl,
+                          hint=c.get("why")))
+        if kind == "fault" and c.get("why"):
+            items.append(item("ch%d_why" % (i + 1), "  why", c["why"], "error"))
+    return items
+
+
 def from_concentrator(facts):
     f = facts or {}
+    m = f.get("more") or {}
     ip = f.get("ip")
     net_level = "error" if not ip else "ok"
     heads = f.get("heads") or []
     tower = f.get("tower") or "unknown"
     tower_level = "ok" if tower == "active" else ("warn" if tower == "ringing_down" else "unknown")
+    link = m.get("link") or {}
 
-    items = []
-    for i, kind in enumerate(heads):
-        items.append(item("ch%d" % (i + 1), "Channel %d" % (i + 1), kind))
-
-    sections = [
-        section("network", "Network", [
-            item("ip", "IP", ip, net_level),
-            item("ssid", "WiFi", f.get("ssid")),
-        ], net_level),
-        section("heads", "Heads", items, "ok"),
-        section("tower", "Tower", [
-            item("state", "State", tower, tower_level),
-        ], tower_level),
-    ]
+    net = [item("ip", "IP", ip, net_level),
+           item("ssid", "WiFi", f.get("ssid"))]
+    sig, sig_lvl = _signal(m.get("rssi"))
+    sections = []
+    if m:
+        net.append(item("rssi", "Signal", sig, sig_lvl))
+        lost = link.get("wifi_lost") or 0
+        net.append(item("wifi_lost", "Wi-Fi lost", "%d time%s" % (lost, "" if lost == 1 else "s"),
+                        "warn" if lost else "ok",
+                        hint="rejoins %s, radio resets %s" % (link.get("rejoins"), link.get("radio_resets"))))
+        net.append(item("clients", "Sandbells clients", "%s connected, %s heard" % (
+            link.get("clients", 0), link.get("live", 0)),
+            "ok" if link.get("live") else "warn"))
+        net.append(item("ws_drops", "Socket drops", link.get("drops", 0),
+                        "warn" if link.get("drops") else "ok"))
+        if link.get("last_drop_reason"):
+            when = _ago(link.get("last_drop_age_s"))
+            net.append(item("drop", "Last drop", "%s%s" % (
+                link["last_drop_reason"], "" if when is None else ", " + when + " ago"), "warn"))
+    sections.append(section("network", "Network", net,
+                            worst_level(net_level, sig_lvl) if m else net_level))
+    if m:
+        titems, tlvl = _time_items(m.get("time") or {})
+        sections.append(section("time", "Time", titems, tlvl))
+    sections.append(section("heads", "Heads",
+                            _head_items(heads, m.get("chans") or []) if m else
+                            [item("ch%d" % (i + 1), "Channel %d" % (i + 1), k)
+                             for i, k in enumerate(heads)], "ok"))
+    sections.append(section("tower", "Tower", [
+        item("state", "State", tower, tower_level),
+    ], tower_level))
+    if m:
+        up = _ago(m.get("uptime_s"))
+        reset = m.get("last_reset")
+        conc = [item("uptime", "Up", up),
+                item("reset", "Last reset", reset,
+                     "warn" if reset and str(reset).upper() == "WATCHDOG" else None),
+                item("watchdog", "Watchdog", "armed" if m.get("watchdog") else "off")]
+        if m.get("mem_free") is not None:
+            conc.append(item("mem", "Free memory", "%d kB" % (m["mem_free"] // 1024)))
+        conc.append(item("boot", "Boot / event", "%s / %s" % (m.get("boot_id"), m.get("seq"))))
+        sections.append(section("concentrator", "Concentrator", conc))
     return document(
         device_id=f.get("id") or "concentrator",
         name=f.get("name") or "concentrator",
@@ -363,6 +455,7 @@ def from_concentrator(facts):
         host=ip or "",
         instance=f.get("location") or "",
         ts=f.get("ts") or 0,
+        uptime_s=m.get("uptime_s"),
         level=net_level,
         summary="heads " + " ".join(str(h) for h in heads),
         poll_hint_sec=f.get("poll_hint_sec") or 2,
