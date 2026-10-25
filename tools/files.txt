@@ -2,6 +2,7 @@ boot.py
 code.py
 config_loader.py
 pins_from_settings.py
+link_health.py
 concentrator.py
 ring.py
 tower_watch.py
@@ -30,6 +31,7 @@ time_servers.py
 time_select.py
 watchdog_guard.py
 farm_ws.py
+ws_bounds.py
 farm_log.py
 sand_status.py
 bell_machine.py

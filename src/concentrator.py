@@ -101,6 +101,7 @@ HEARTBEAT_LENGTH = 1.25
 # Link health (docs/link-health.md).  Code constants, not settings.
 PANEL_SCHEMA = "sand.panel/v1"   # heartbeat frames: Sandbells shows, never stores
 PICO_HEARTBEAT_S = 5.0           # heartbeat (LED mimic + link + sync) to /ws
+LOOP_LATE_S = 1.5               # heartbeat later than this = the loop was held (logged)
 MEM_CHECK_S = 3.0                # heap tidy pass (only while the bells are quiet)
 MEM_QUIET_MS = 3000              # ...no stroke for this long
 MEM_LOG_EVERY = 20               # log free memory every 60 s
@@ -839,8 +840,16 @@ class Concentrator:
         return doc
 
     async def heartbeat_task(self):
+        last = time.monotonic()
         while True:
             await asyncio.sleep(PICO_HEARTBEAT_S)
+            now = time.monotonic()
+            late = now - last - PICO_HEARTBEAT_S
+            last = now
+            if late > LOOP_LATE_S:
+                # the whole loop was held this long: say what else was going on
+                emit("loop late %.1f s (survey %s, clients %d)" % (
+                    late, self.survey_state.phase, len(farm_ws.ws_clients())))
             if farm_ws.ws_clients():
                 try:
                     send(self.heartbeat_doc(), keep=False)

@@ -39,6 +39,7 @@ WS_GOING_AWAY = 1001
 WS_TRY_AGAIN_LATER = 1013
 
 CLIENT_SILENT_S = 20.0         # a heartbeat client silent this long is dead
+SLOW_POLL_S = 2.0              # a poll pass slower than this is logged
 SEND_TIMEOUT_S = 1.0           # most one send may block on a full TCP buffer
 RX_FRAMES_PER_POLL = 4         # frames read per client per poll()
 REPLAY_N = 32                  # recent events replayed to each new client
@@ -110,6 +111,12 @@ def start_server(cfg, payload_fn):
     ).get("enabled_formats", []):
         print("output.ws disabled")
         return None
+    try:
+        import ws_bounds
+        import adafruit_httpserver.response as _resp
+        print("ws bounds:", "on" if ws_bounds.install(_resp) else "NOT installed (library differs)")
+    except ImportError as e:
+        print("ws bounds: not installed:", e)
     try:
         pool = adafruit_connection_manager.get_radio_socketpool(wifi.radio)
         server = Server(pool, debug=False)
@@ -402,6 +409,7 @@ def poll():
     events to new clients, then read each client so pings get a pong, a
     close (or a dead socket) is noticed, and a silent heartbeat client is
     dropped.  A bad client is dropped on its own."""
+    t0 = time.monotonic()
     if _server:
         try:
             _server.poll()
@@ -438,6 +446,11 @@ def poll():
         if m is not None and m["hb"] and now - m["rx"] > CLIENT_SILENT_S:
             stats["silent_drops"] += 1
             _drop(ws, "silent %d s" % CLIENT_SILENT_S)
+    took = time.monotonic() - t0
+    if took > SLOW_POLL_S:
+        # the whole Pico waited on the network this long: say so, with the peers
+        stats["slow_polls"] = stats.get("slow_polls", 0) + 1
+        print("%.3f ws poll took %.1f s (%s)" % (time.monotonic(), took, _count()))
 
 
 def send(obj, keep=True):
