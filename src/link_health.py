@@ -182,7 +182,7 @@ class LinkHealth:
                 self._radio_reset_at = now_s
 
         silent = self._dead_since is not None
-        good = (self.state == CLIENT_LIVE) or (gw_ok is True)
+        good = (self.state == CLIENT_LIVE) or (gw_ok is True and not silent)
         if self._spell(now_s, gw_failing or silent, good, tower_inactive):
             self.events.append("pico_reset")
             self.state = DEAD

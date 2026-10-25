@@ -73,7 +73,6 @@ def test_radio_reset_state_settles_so_a_later_reset_is_possible():
     assert "radio_reset" in ev
 
 
-finish()
 
 
 @case
@@ -135,3 +134,17 @@ def test_a_live_client_ends_the_spell():
     lh.update(60.0, obs(**c))
     _, ev = lh.update(link_health.PICO_RESET_S + 50, obs(**c))
     assert "pico_reset" not in ev
+
+
+@case
+def test_a_working_ping_does_not_hide_a_silent_client():
+    # the radio answers ping but the server/ws is dead: clients silent for good
+    lh = LinkHealth()
+    c = dict(n_clients=1, hb_seen=True, last_gw_ok=True)
+    lh.update(0.0, obs(last_rx_age_s=1.0, **c))
+    lh.update(30.0, obs(last_rx_age_s=30.0, **c))
+    _, ev = lh.update(30.0 + link_health.PICO_RESET_S + 1, obs(last_rx_age_s=400.0, **c))
+    assert "pico_reset" in ev
+
+
+finish()
