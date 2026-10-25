@@ -51,8 +51,15 @@ sandmon GPS NO Lock shows as stratum 16 / leap 3), `last_seq`, `uptime_s`,
   started if boot had no Wi-Fi.
 * Pico: Wi-Fi "up" but nothing heard for `LINK_DEAD_S` (120 s, tower
   inactive, after a heartbeat client was seen this boot): one radio off/on
-  per silent spell.  `LINK_DEAD_RESET_S` (600 s): `microcontroller.reset()`,
-  only if the watchdog is armed (settings `watchdog.enabled`).
+  per silent spell.
+* Pico: an unhealthy spell (Wi-Fi down, gateway ping failing, or a heartbeat
+  client gone silent) is tracked across radio resets and rejoins.  If it lasts
+  `PICO_RESET_S` (300 s) with the tower quiet, `microcontroller.reset()`.  This
+  does not need the hardware watchdog: a wedged Wi-Fi stack never heals itself
+  (it took an mpremote Ctrl-D or a power cycle).  A working gateway ping, a live
+  client, or `CALM_S` (90 s) of Wi-Fi up with no bad sign ends the spell, so a
+  blip with no client and a router that ignores pings never resets.  At most
+  one reset per spell; a rebooted Pico starts a new spell.
 * Pico LED6 (tower inactive): white = synced, amber = holdover (time server
   lost; strokes still carry utc_ms, err_ms grows), red = never synced.
 * Sandbells ingest: hello every 5 s; once a Pico heartbeat was seen on the

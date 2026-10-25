@@ -86,7 +86,7 @@ from survey_state import SurveyState, SURVEYING, SETTLED, IDLE as SURVEY_IDLE
 from mux_errors import ChannelBusy
 from laser_measure import counts_to_ma
 from adc_avg import avg as _avg
-from link_health import LinkHealth
+from link_health import LinkHealth, PICO_RESET_S
 
 RING_WINDOW_S = 0.4
 SETTLE_S = 0.3
@@ -111,7 +111,6 @@ WIFI_JOIN_TIMEOUT_S = 10         # per network in the list
 LINK_DEAD_S = 120.0              # Wi-Fi "up" but no client heard: radio reset
 GATEWAY_CHECK_S = 30.0           # ping the Wi-Fi gateway (tower quiet only)
 GATEWAY_FAIL_N = 4               # this many misses in a row (after one hit): radio reset
-LINK_DEAD_RESET_S = 600.0        # still nothing: reset the Pico (watchdog armed only)
 
 # Trigger plug (test switch, docs/trigger-plug.md).  Code constants.
 # Stroke on the first low sample after the switch has been seen open for
@@ -894,14 +893,9 @@ class Concentrator:
         self._gw_fail += 1
         if self._gw_since is None:
             self._gw_since = now
-        down = now - self._gw_since
-        if down >= LINK_DEAD_RESET_S and self.guard.armed:
-            self.link_event("reset", reason="gateway silent %d s" % down)
-            farm_ws.poll()
-            import microcontroller
-            microcontroller.reset()
-        # The radio reset for a silent gateway is LinkHealth's decision
-        # (GATEWAY_FAIL_N misses): doing it here as well reset the radio twice.
+        # What to do about a silent gateway (radio reset, then a Pico reset when
+        # nothing helps) is LinkHealth's decision; doing it here as well reset
+        # the radio twice.
 
 
     async def mem_task(self):
@@ -943,11 +937,22 @@ class Concentrator:
             "last_rx_age_s": farm_ws.last_rx_age_s(now),
             "last_gw_ok": self._gw_ms is not None,
             "gw_fail_count": self._gw_fail,
+            "gw_failing": self._gw_since is not None,
             "tower_inactive": self.tower.tower == "inactive",
             "quiet_ms": quiet_ms,
-            "watchdog_armed": self.guard.armed,
         }
         _, events = self.link_health.update(now, obs)
+
+        # A wedged Wi-Fi stack never heals itself (it took an mpremote Ctrl-D or
+        # a power cycle): after PICO_RESET_S unhealthy with the tower quiet, reset
+        # the Pico.  Independent of the hardware watchdog, and handled before the
+        # Wi-Fi-down branch below, which returns early.
+        if "pico_reset" in events:
+            self.link_event("reset", reason="link unhealthy %d s: resetting the Pico"
+                            % PICO_RESET_S)
+            farm_ws.poll()
+            import microcontroller
+            microcontroller.reset()
 
         # Wi-Fi down: signal the loss, then try to rejoin on the usual cadence
         if not farm_ws.wifi_ok():
@@ -980,11 +985,6 @@ class Concentrator:
                 self.link_event("link_dead", reason="link health radio_reset",
                                 sync=self.sntp.state() if self.sntp else None)
                 farm_ws.reset_radio()
-            elif ev == "pico_reset" and self.guard.armed:
-                self.link_event("reset", reason="link health pico_reset")
-                farm_ws.poll()
-                import microcontroller
-                microcontroller.reset()
 
 def start_app():
     """Everything up to the steady loop: net, Concentrator (survey,

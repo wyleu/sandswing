@@ -180,6 +180,8 @@ def link(app):
     gw = {"ok": None}
     farm_ws.gateway_ping = lambda timeout=1.0: gw["ok"]
     app._dead_handled = False
+    app.link_health = concentrator.LinkHealth()   # a fresh spell (the Pico would have rebooted)
+    app._gw_since = None
     del resets[:]
     t = 1000.0
     def gstep():

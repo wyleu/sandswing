@@ -17,8 +17,9 @@ States
     CLIENT_SILENT   heartbeat client(s) silent past CLIENT_SILENT_S
     GATEWAY_FAILING gateway ping misses accumulating (quiet periods only)
     RADIO_RESET     radio has been cycled; waiting for rejoin
-    DEAD            link dead long enough that Pico reset is indicated
-                    (only when watchdog is armed)
+    DEAD            link unhealthy for PICO_RESET_S with every softer remedy
+                    tried: reset the Pico (not only when the hardware watchdog
+                    is armed: a wedged Wi-Fi stack never recovers by itself)
 
 Events (returned by update)
 ---------------------------
@@ -36,10 +37,10 @@ Public API
             last_rx_age_s: float or None
             last_gw_ok: bool or None
             gw_fail_count: int
+            gw_failing: bool       # a gateway ping has failed and none has worked since
             tower_inactive: bool
             quiet_ms: int          # ms since last stroke
             free_mem: int or None
-            watchdog_armed: bool
 """
 
 DOWN = "DOWN"
@@ -54,7 +55,8 @@ DEAD = "DEAD"
 CLIENT_SILENT_S = 20.0
 GATEWAY_FAIL_N = 4
 LINK_DEAD_S = 120.0
-LINK_DEAD_RESET_S = 600.0
+PICO_RESET_S = 300.0         # unhealthy this long, tower quiet: reset the Pico
+CALM_S = 90.0                # Wi-Fi up with no bad sign this long: the spell is over
 MEM_QUIET_MS = 3000
 RADIO_RESET_SETTLE_S = 60.0
 
@@ -65,7 +67,35 @@ class LinkHealth:
         self._dead_since = None
         self._radio_reset_at = None
         self._latched = False       # a radio reset was asked for this silent spell
+        self._bad_since = None      # start of the current unhealthy spell (any bad sign)
+        self._calm_since = None
+        self._pico_asked = False
         self.events = []
+
+    def _spell(self, now_s, bad, good, tower_inactive):
+        """Track one unhealthy spell across radio resets and rejoins, and say
+        True once, when it has lasted PICO_RESET_S with the tower quiet.
+        bad: Wi-Fi down, gateway failing, or a client gone silent.
+        good: a gateway ping worked or a client is live: the spell is over.
+        Wi-Fi up with no bad sign for CALM_S also ends it, so a blip with a
+        router that ignores pings (and no client) never causes a reset."""
+        if good:
+            self._bad_since = self._calm_since = None
+            return False
+        if bad:
+            self._calm_since = None
+            if self._bad_since is None:
+                self._bad_since = now_s
+        elif self._calm_since is None:
+            self._calm_since = now_s
+        elif now_s - self._calm_since >= CALM_S:
+            self._bad_since = None
+        if self._bad_since is None or not tower_inactive or self._pico_asked:
+            return False
+        if now_s - self._bad_since >= PICO_RESET_S:
+            self._pico_asked = True
+            return True
+        return False
 
     def update(self, now_s, obs):
         self.events = []
@@ -77,7 +107,7 @@ class LinkHealth:
         gw_fails = int(obs.get("gw_fail_count") or 0)
         tower_inactive = bool(obs.get("tower_inactive"))
         quiet_ms = int(obs.get("quiet_ms") or 0)
-        armed = bool(obs.get("watchdog_armed"))
+        gw_failing = bool(obs.get("gw_failing"))
 
         # Quiet period (for GC / probes) is reported as an event but does not change state
         if quiet_ms >= MEM_QUIET_MS:
@@ -89,6 +119,9 @@ class LinkHealth:
                 self.events.append("wifi_lost")
             self.state = DOWN
             self._dead_since = None
+            if self._spell(now_s, True, False, tower_inactive):
+                self.events.append("pico_reset")
+                self.state = DEAD
             return self.state, list(self.events)
 
         # Wi-Fi is up
@@ -141,14 +174,16 @@ class LinkHealth:
         # Dead-link escalation
         if self._dead_since is not None:
             dead_for = now_s - self._dead_since
-            if dead_for >= LINK_DEAD_RESET_S and armed and self.state != DEAD:
-                self.events.append("pico_reset")
-                self.state = DEAD
-            elif dead_for >= LINK_DEAD_S and self.state not in (RADIO_RESET, DEAD) \
+            if dead_for >= LINK_DEAD_S and self.state not in (RADIO_RESET, DEAD) \
                     and not self._latched and tower_inactive:
                 self._latched = True      # one reset per silent spell, not one per rejoin
                 self.events.append("radio_reset")
                 self.state = RADIO_RESET
                 self._radio_reset_at = now_s
 
+        silent = self._dead_since is not None
+        good = (self.state == CLIENT_LIVE) or (gw_ok is True)
+        if self._spell(now_s, gw_failing or silent, good, tower_inactive):
+            self.events.append("pico_reset")
+            self.state = DEAD
         return self.state, list(self.events)
