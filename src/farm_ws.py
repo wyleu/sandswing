@@ -48,6 +48,7 @@ EAGAIN = 11                    # errno values (CircuitPython has no errno module
 ETIMEDOUT = 110                # on every port, so plain numbers)
 
 _server = None
+_last_route = [None, 0.0]       # name and duration of the slowest-looking handler
 _host = None                   # IP the server is bound to
 _cfg = None
 _clients = []                  # live Websocket objects, oldest first
@@ -126,6 +127,7 @@ def start_server(cfg, payload_fn):
 
         @server.route(path_status, GET)
         def status_route(request: Request):
+            t_route = time.monotonic()
             try:
                 body = json.dumps(_payload_fn())
             except MemoryError as e:             # fragmented heap: tidy, retry once
@@ -140,6 +142,7 @@ def start_server(cfg, payload_fn):
             except Exception as e:
                 print("status payload error", e)
                 body = '{"error":"payload"}'
+            _last_route[0], _last_route[1] = path_status, time.monotonic() - t_route
             return Response(
                 request,
                 body=body,
@@ -415,6 +418,7 @@ def poll():
             _server.poll()
         except Exception as e:
             print("ws poll:", e)
+    t_srv = time.monotonic()
     while _refused:
         _close(_refused.pop(), WS_TRY_AGAIN_LATER)
         stats["refused"] += 1
@@ -432,7 +436,8 @@ def poll():
             except Exception as e:
                 _drop(ws, e)
                 break
-    now = time.monotonic()
+    t_new = time.monotonic()
+    now = t_new
     for ws in list(_clients):
         try:
             _receive(ws, now)
@@ -450,7 +455,13 @@ def poll():
     if took > SLOW_POLL_S:
         # the whole Pico waited on the network this long: say so, with the peers
         stats["slow_polls"] = stats.get("slow_polls", 0) + 1
-        print("%.3f ws poll took %.1f s (%s)" % (time.monotonic(), took, _count()))
+        # say which part held the loop: the library's request handling,
+        # the replay to a new client, or reading the existing clients
+        t_end = time.monotonic()
+        print("%.3f ws poll took %.1f s: server %.1f, replay %.1f, read %.1f %s"
+              % (t_end, took, t_srv - t0, t_new - t_srv, t_end - t_new, _count()))
+        if _last_route[0]:
+            print("  last route %s took %.1f s" % (_last_route[0], _last_route[1]))
 
 
 def send(obj, keep=True):

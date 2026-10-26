@@ -211,4 +211,21 @@ def test_refusal_is_counted_and_noted():
     assert "client_refused" in whats and farm_ws.stats["refused"] == 1
 
 
+@case
+def test_slow_poll_says_where_the_time_went():
+    import io, contextlib
+    fresh(1)
+    ticks = iter([0.0, 5.0, 6.0, 40.0] + [40.0] * 50)    # server 5 s, replay 1 s, read 34 s
+    real = farm_ws.time.monotonic
+    farm_ws.time.monotonic = lambda: next(ticks)
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            farm_ws.poll()
+    finally:
+        farm_ws.time.monotonic = real
+    out = buf.getvalue()
+    assert "ws poll took 40.0 s: server 5.0, replay 1.0, read 34.0 (1 client)" in out, out
+
+
 finish()
