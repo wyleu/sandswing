@@ -125,6 +125,9 @@ def test_lastline_remembers_lines_but_not_the_memory_chatter():
     with contextlib.redirect_stdout(buf):
         lastline.print("2.0 link client_dropped")
         lastline.print("mem free 126 kB")
+        lastline.print("725.1 ch 1 CLEAR")
+        lastline.print("725.2 ch 1 HELD kind=stood")
+        lastline.print("725.3 ch 2 EDGE")
     assert lastline.get() == "2.0 link client_dropped"
 
 

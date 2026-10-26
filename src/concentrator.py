@@ -437,7 +437,10 @@ class Concentrator:
                 "build": _build_id(), "last_line": lastline.get()}
         try:
             import gc
-            more["mem_free"] = gc.mem_free()
+            # free memory straight after the last quiet collection, as the log
+            # prints it; a live reading counts garbage not yet collected and
+            # looks like a leak (73 kB on the page against 126 kB in the log)
+            more["mem_free"] = getattr(self, "mem_free_gc", None) or gc.mem_free()
         except (ImportError, AttributeError):
             pass
         return more
@@ -933,6 +936,7 @@ class Concentrator:
                 quiet = not recent or (now_ms - max(recent)) >= MEM_QUIET_MS
                 if quiet:
                     gc.collect()
+                    self.mem_free_gc = gc.mem_free()     # the page shows this one
                 n += 1
                 if n % MEM_LOG_EVERY == 0:
                     emit("mem free %d kB%s" % (gc.mem_free() // 1024,

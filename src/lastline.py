@@ -7,13 +7,15 @@
 # get() in its top-bar summary, so what mpremote would show last is visible
 # on the Sandbells display without a laptop.
 #
-# Routine noise (the 60 s "mem free" lines) is printed but not remembered,
-# or it would push out the line that matters.
+# Routine noise is printed but not remembered, or it would push out the line
+# that matters: the 60 s "mem free" lines, and the per-channel press chatter
+# (HELD / CLEAR / EDGE / DOUBLE), which the stroke list already shows.
 #
 import builtins
 
 _last = [""]
 QUIET = ("mem free",)
+CHATTER = (" CLEAR", " HELD ", " EDGE", " DOUBLE ")
 MAX_LEN = 100
 
 _print = builtins.print
@@ -25,7 +27,7 @@ def print(*args, **kw):
         s = " ".join(str(a) for a in args)
     except Exception:
         return
-    if s and not s.startswith(QUIET):
+    if s and not s.startswith(QUIET) and not any(w in s for w in CHATTER):
         _last[0] = s.strip()[:MAX_LEN]
 
 
