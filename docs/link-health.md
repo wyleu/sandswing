@@ -40,7 +40,10 @@ sandmon GPS NO Lock shows as stratum 16 / leap 3), `last_seq`, `uptime_s`,
   debug listeners) are not timed out.
 * Pico: every send has a deadline (`SEND_TIMEOUT_S` 1 s).  adafruit_httpserver
   4.8.2 `send_message()` / `close()` retry EAGAIN for ever on a full TCP
-  buffer, which froze the whole concentrator on a dead peer.
+  buffer, which froze the whole concentrator on a dead peer.  `ws_bounds.py`
+  (boot prints `ws bounds: on`, `request bounds: on`) puts deadlines on the
+  library's own waits: send 1.5 s, rest of a frame 1 s, one HTTP request 2 s,
+  replay to a new client 1.5 s.  A bound that passes drops that one client.
 * Pico: the last `REPLAY_N` (32) events are replayed to every new client;
   Sandbells ignores duplicates (UNIQUE src, boot_id, seq).
 * Pico: LED1 green = a heartbeat client heard within 20 s (before any client
@@ -49,7 +52,7 @@ sandmon GPS NO Lock shows as stratum 16 / leap 3), `last_seq`, `uptime_s`,
   dropped, rejoin every 30 s (120 s while ringing; a join blocks sensing up to
   10 s per network, watchdog paused), server rebound if the IP changed, SNTP
   started if boot had no Wi-Fi.
-* Pico: Wi-Fi "up" but nothing heard for `LINK_DEAD_S` (120 s, tower
+* Pico: Wi-Fi "up" but nothing heard for `LINK_DEAD_S` (45 s, tower
   inactive, after a heartbeat client was seen this boot): one radio off/on
   per silent spell.
 * Pico: an unhealthy spell (Wi-Fi down, gateway ping failing, or a heartbeat
@@ -60,9 +63,46 @@ sandmon GPS NO Lock shows as stratum 16 / leap 3), `last_seq`, `uptime_s`,
   client, or `CALM_S` (90 s) of Wi-Fi up with no bad sign ends the spell, so a
   blip with no client and a router that ignores pings never resets.  At most
   one reset per spell; a rebooted Pico starts a new spell.
+* Pico: repeated stalls.  A poll pass that takes `STALL_S` (5 s) or more is a
+  stall (the Wi-Fi chip blocking inside one call: the logs show 10 s).
+  `STALL_N` (3) stalls within `STALL_WINDOW_S` (300 s), tower quiet, ask for a
+  radio reset even if clients keep reconnecting, at most one per
+  `RADIO_RESET_SETTLE_S` (60 s); stalls also count as a bad sign for the 300 s
+  Pico reset.
+* Pico: Wi-Fi up but the server not running (the link dropped between the
+  join and `start_server`: "Cannot start server on None:80") -> try to start
+  it every `SERVER_RETRY_S` (10 s).
+* Pico: a network entry in `settings.json` may carry `"static_ip"`: after the
+  join the Pico keeps DHCP's netmask, gateway and DNS and swaps only its
+  address (an extender hid the Pico's MAC from the router's reservation).
 * Pico LED6 (tower inactive): white = synced, amber = holdover (time server
   lost; strokes still carry utc_ms, err_ms grows), red = never synced.
 * Sandbells ingest: hello every 5 s; once a Pico heartbeat was seen on the
   connection, `PEER_SILENT_S` (20 s) without a frame -> reconnect.  TCP
   keepalive 10/5/3.  Backoff resets only after a connection that delivered
   frames.
+
+## State diagram
+
+The state name is only a label; the reset decisions are guarded by flags
+(see `src/link_health.py`).
+
+```mermaid
+stateDiagram-v2
+    [*] --> DOWN
+    DOWN --> UP: Wi-Fi up
+    UP --> CLIENT_LIVE: heartbeat heard
+    CLIENT_LIVE --> CLIENT_SILENT: silent 20 s
+    CLIENT_SILENT --> CLIENT_LIVE: frames return
+    CLIENT_SILENT --> RADIO_RESET: silent 45 s, tower quiet
+    CLIENT_LIVE --> RADIO_RESET: 3 stalls in 300 s, tower quiet
+    UP --> RADIO_RESET: 4 gateway pings missed, tower quiet
+    RADIO_RESET --> DOWN: radio drops, Wi-Fi lost
+    DOWN --> DOWN: rejoin every 30 s
+    RADIO_RESET --> UP: 60 s settle, no drop
+    DOWN --> DEAD: unhealthy 300 s, tower quiet
+    CLIENT_SILENT --> DEAD: unhealthy 300 s, tower quiet
+    DEAD --> [*]: Pico resets itself
+```
+
+The 300 s timer covers the whole bad spell, across radio resets and rejoins.

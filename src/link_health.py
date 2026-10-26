@@ -15,7 +15,6 @@ States
     UP              Wi-Fi up, clients may or may not be present
     CLIENT_LIVE     at least one heartbeat client heard recently
     CLIENT_SILENT   heartbeat client(s) silent past CLIENT_SILENT_S
-    GATEWAY_FAILING gateway ping misses accumulating (quiet periods only)
     RADIO_RESET     radio has been cycled; waiting for rejoin
     DEAD            link unhealthy for PICO_RESET_S with every softer remedy
                     tried: reset the Pico (not only when the hardware watchdog
@@ -25,6 +24,11 @@ Events (returned by update)
 ---------------------------
     wifi_lost, wifi_up, client_live, client_silent,
     gateway_fail, radio_reset, pico_reset, quiet
+
+The state name is only a label.  What stops a reset repeating are the flags
+(`_latched` for silence, `_stall_reset_at` for stalls, `_radio_reset_at` for
+the settle time, `_pico_asked`), because a live client frame sets the label
+back to CLIENT_LIVE on the next pass.  See docs/link-health.md for the diagram.
 
 Public API
 ----------
@@ -47,7 +51,6 @@ DOWN = "DOWN"
 UP = "UP"
 CLIENT_LIVE = "CLIENT_LIVE"
 CLIENT_SILENT = "CLIENT_SILENT"
-GATEWAY_FAILING = "GATEWAY_FAILING"
 RADIO_RESET = "RADIO_RESET"
 DEAD = "DEAD"
 
