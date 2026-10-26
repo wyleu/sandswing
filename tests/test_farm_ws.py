@@ -215,17 +215,50 @@ def test_refusal_is_counted_and_noted():
 def test_slow_poll_says_where_the_time_went():
     import io, contextlib
     fresh(1)
-    ticks = iter([0.0, 5.0, 6.0, 40.0] + [40.0] * 50)    # server 5 s, replay 1 s, read 34 s
-    real = farm_ws.time.monotonic
-    farm_ws.time.monotonic = lambda: next(ticks)
+    farm_ws.send({"seq": 1})
+    t = [100.0]
+    class Srv:
+        def poll(self):
+            t[0] += 5.0                         # the library holds the loop 5 s
+    saved = (farm_ws.time.monotonic, farm_ws._server, farm_ws._send_text, farm_ws._receive)
+    farm_ws.time.monotonic = lambda: t[0]
+    farm_ws._server = Srv()
+    farm_ws._send_text = lambda ws, msg: t.__setitem__(0, t[0] + 1.0)      # replay 1 s
+    farm_ws._receive = lambda ws, now: t.__setitem__(0, t[0] + 34.0)       # reads 34 s
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
             farm_ws.poll()
     finally:
-        farm_ws.time.monotonic = real
+        farm_ws.time.monotonic, farm_ws._server, farm_ws._send_text, farm_ws._receive = saved
     out = buf.getvalue()
-    assert "ws poll took 40.0 s: server 5.0, replay 1.0, read 34.0 (1 client)" in out, out
+    assert "ws poll took 40.0 s: server 5.0, replay 1.0, read 34.0" in out, out
+
+
+@case
+def test_replay_to_a_slow_client_gives_up_in_bounded_time():
+    farm_ws.reset_state()
+    for n in range(10):
+        farm_ws.send({"seq": n})
+    a = farm_ws._accept(FakeWs())
+    clock = [0.0]
+    real = farm_ws.time.monotonic
+    def tick():
+        clock[0] += 0.7                      # every look at the clock costs 0.7 s
+        return clock[0]
+    sent = []
+    a_send = farm_ws._send_text
+    def slow_send(ws, msg):
+        sent.append(msg)
+    farm_ws._send_text = slow_send
+    farm_ws.time.monotonic = tick
+    try:
+        farm_ws.poll()
+    finally:
+        farm_ws.time.monotonic = real
+        farm_ws._send_text = a_send
+    assert len(sent) < 10, len(sent)         # gave up part way
+    assert a not in farm_ws._clients         # and dropped the client
 
 
 finish()

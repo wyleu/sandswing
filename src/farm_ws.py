@@ -41,6 +41,7 @@ WS_TRY_AGAIN_LATER = 1013
 
 CLIENT_SILENT_S = 20.0         # a heartbeat client silent this long is dead
 SLOW_POLL_S = 2.0              # a poll pass slower than this is logged
+REPLAY_BUDGET_S = 1.5           # most the replay to one new client may take in all
 SEND_TIMEOUT_S = 1.0           # most one send may block on a full TCP buffer
 RX_FRAMES_PER_POLL = 4         # frames read per client per poll()
 REPLAY_N = 32                  # recent events replayed to each new client
@@ -117,6 +118,7 @@ def start_server(cfg, payload_fn):
         import ws_bounds
         import adafruit_httpserver.response as _resp
         print("ws bounds:", "on" if ws_bounds.install(_resp) else "NOT installed (library differs)")
+        print("request bounds:", "on" if ws_bounds.install_server(Server) else "NOT installed (library differs)")
     except ImportError as e:
         print("ws bounds: not installed:", e)
     try:
@@ -369,7 +371,9 @@ def _send_frame(ws, opcode, payload, timeout_s):
             n = 0
         if n:
             done += n
-        elif time.monotonic() > deadline:
+        if done < total and time.monotonic() > deadline:
+            # also when bytes are trickling through: a barely-alive link that
+            # accepts a few bytes at a time held the Pico for 55 s
             raise OSError(ETIMEDOUT, "send timeout %.1f s" % timeout_s)
 
 
@@ -431,8 +435,13 @@ def poll():
         if ws not in _clients:
             continue
         _note("client_connected", peer=_peer(ws), replay=len(_recent))
+        t_replay = time.monotonic()
         for msg in list(_recent):
             try:
+                if time.monotonic() - t_replay > REPLAY_BUDGET_S:
+                    # a slow link: give up on this client (it reconnects)
+                    # rather than hold every other task for the whole replay
+                    raise OSError(ETIMEDOUT, "replay too slow")
                 _send_text(ws, msg)
             except Exception as e:
                 _drop(ws, e)

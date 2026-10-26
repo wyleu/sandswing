@@ -26,6 +26,7 @@ except ImportError:                      # pragma: no cover
 
 SEND_BOUND_S = 1.5          # most a library send may wait on a full TCP buffer
 RECV_BOUND_S = 1.0          # most the rest of a started frame may take
+REQ_BOUND_S = 2.0           # most the library may spend reading one HTTP request
 
 _now = time.monotonic       # tests replace this
 
@@ -48,7 +49,7 @@ def bounded_send_bytes(self, conn, buffer):
             raise
         if n:
             sent += n
-        elif _now() > deadline:
+        if sent < total and _now() > deadline:      # trickling bytes counts too
             raise OSError(ETIMEDOUT, "send timeout %.1f s" % SEND_BOUND_S)
     self._size += sent
 
@@ -139,6 +140,54 @@ def bounded_read_frame(self):
     else:
         payload = bytes(payload)
     return opcode, payload
+
+
+def bounded_receive_header_bytes(self, sock):
+    """Server._receive_header_bytes, but a peer that has closed (recv_into
+    returns 0 at once, for ever) or dribbles bytes ends the read instead of
+    spinning.  Seen: Server.poll() took 49.6 s in here, the whole Pico stalled."""
+    received = b""
+    deadline = _now() + REQ_BOUND_S
+    while b"\r\n\r\n" not in received:
+        try:
+            length = sock.recv_into(self._buffer, len(self._buffer))
+        except OSError as ex:
+            if ex.errno == ETIMEDOUT:
+                break
+            raise
+        if not length:                       # closed by the peer
+            break
+        received += self._buffer[:length]
+        if _now() > deadline:
+            break
+    return received
+
+
+def bounded_receive_body_bytes(self, sock, received_body_bytes, content_length):
+    """Same bound for the request body."""
+    deadline = _now() + REQ_BOUND_S
+    while len(received_body_bytes) < content_length:
+        try:
+            length = sock.recv_into(self._buffer, len(self._buffer))
+        except OSError as ex:
+            if ex.errno == ETIMEDOUT:
+                break
+            raise
+        if not length:
+            break
+        received_body_bytes += self._buffer[:length]
+        if _now() > deadline:
+            break
+    return received_body_bytes[:content_length]
+
+
+def install_server(server_class):
+    """Patch the library's request reading.  True if both methods exist."""
+    if hasattr(server_class, "_receive_header_bytes") and hasattr(server_class, "_receive_body_bytes"):
+        server_class._receive_header_bytes = bounded_receive_header_bytes
+        server_class._receive_body_bytes = bounded_receive_body_bytes
+        return True
+    return False
 
 
 def install(response_module):

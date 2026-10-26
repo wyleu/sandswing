@@ -228,4 +228,72 @@ def test_install_on_4_7_library_patches_read_frame():
     assert m.Websocket._read_frame is ws_bounds.bounded_read_frame
 
 
+class Srv:
+    _buffer = bytearray(64)
+
+
+@case
+def test_header_read_of_a_closed_peer_does_not_spin():
+    class Sock:
+        n = 0
+        def recv_into(self, buf, nbytes=None):
+            Sock.n += 1
+            assert Sock.n < 1000, "spinning"
+            return 0                         # peer closed: returns 0 for ever
+    assert ws_bounds.bounded_receive_header_bytes(Srv(), Sock()) == b""
+
+
+@case
+def test_header_read_gets_a_whole_request():
+    class Sock:
+        parts = [b"GET /status HTTP/1.1\r\nHost: x", b"\r\n\r\n"]
+        def recv_into(self, buf, nbytes=None):
+            p = self.parts.pop(0)
+            buf[:len(p)] = p
+            return len(p)
+    assert ws_bounds.bounded_receive_header_bytes(Srv(), Sock()).endswith(b"\r\n\r\n")
+
+
+@case
+def test_header_read_dribble_is_cut_off():
+    clock = Clock()
+    ws_bounds._now = clock
+    try:
+        class Sock:
+            def recv_into(self, buf, nbytes=None):
+                buf[0] = 65
+                return 1                     # one byte at a time, never the blank line
+        got = ws_bounds.bounded_receive_header_bytes(Srv(), Sock())
+    finally:
+        ws_bounds._now = __import__("time").monotonic
+    assert 0 < len(got) < 100, len(got)
+
+
+@case
+def test_header_read_timeout_ends_quietly():
+    class Sock:
+        def recv_into(self, buf, nbytes=None):
+            raise OSError(errno.ETIMEDOUT, "t")
+    assert ws_bounds.bounded_receive_header_bytes(Srv(), Sock()) == b""
+
+
+@case
+def test_body_read_of_a_closed_peer_does_not_spin():
+    class Sock:
+        n = 0
+        def recv_into(self, buf, nbytes=None):
+            Sock.n += 1
+            assert Sock.n < 1000, "spinning"
+            return 0
+    assert ws_bounds.bounded_receive_body_bytes(Srv(), Sock(), b"ab", 10) == b"ab"
+
+
+@case
+def test_install_server_patches_both_methods():
+    C = type("Server", (), {"_receive_header_bytes": None, "_receive_body_bytes": None})
+    assert ws_bounds.install_server(C)
+    assert C._receive_header_bytes is ws_bounds.bounded_receive_header_bytes
+    assert not ws_bounds.install_server(type("Other", (), {}))
+
+
 finish()
