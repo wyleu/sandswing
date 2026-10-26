@@ -79,6 +79,27 @@ def wifi_candidates(cfg):
 _joined_ssid = None   # remembered because ap_info is not available on every build
 
 
+def apply_static_ip(radio, ip):
+    """Keep our usual address on a network whose DHCP will not give it (an
+    extender hides our MAC from the router's reservation: 2026-10-26 the
+    Pico got .253 instead of .81).  Netmask, gateway and DNS stay as the
+    DHCP lease set them.  Any failure leaves the DHCP address in place.
+    Returns the address now in use."""
+    if not ip:
+        return radio.ipv4_address
+    try:
+        import ipaddress
+        want = ipaddress.ip_address(ip)
+        if str(radio.ipv4_address) != str(want):
+            radio.set_ipv4_address(ipv4=want, netmask=radio.ipv4_subnet,
+                                   gateway=radio.ipv4_gateway,
+                                   ipv4_dns=getattr(radio, "ipv4_dns", None))
+            print("static IP", ip, "(DHCP gave %s)" % radio.ipv4_address)
+    except Exception as e:
+        print("static IP failed:", e)
+    return radio.ipv4_address
+
+
 def connect_wifi(cfg, timeout=None):
     global _joined_ssid
     last = None
@@ -92,6 +113,7 @@ def connect_wifi(cfg, timeout=None):
                 wifi.radio.connect(ssid, password)
             else:
                 wifi.radio.connect(ssid, password, timeout=timeout)
+            apply_static_ip(wifi.radio, n.get("static_ip"))
             print("WiFi OK", ssid, wifi.radio.ipv4_address)
             _joined_ssid = ssid
             return True

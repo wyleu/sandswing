@@ -259,6 +259,29 @@ def test_a_slow_poll_is_counted_as_a_stall_for_link_health():
 
 
 @case
+def test_static_ip_replaces_the_dhcp_address_and_keeps_the_rest():
+    import io, contextlib
+    class R:
+        ipv4_address = "192.168.0.253"
+        ipv4_subnet = "255.255.255.0"
+        ipv4_gateway = "192.168.0.1"
+        ipv4_dns = "192.168.0.1"
+        def set_ipv4_address(self, ipv4, netmask, gateway, ipv4_dns=None):
+            self.got = (str(ipv4), netmask, gateway, ipv4_dns)
+            self.ipv4_address = str(ipv4)
+    r = R()
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert farm_ws.apply_static_ip(r, "192.168.0.81") == "192.168.0.81"
+    assert r.got == ("192.168.0.81", "255.255.255.0", "192.168.0.1", "192.168.0.1"), r.got
+    r2 = R()                                   # no static_ip configured: DHCP stays
+    assert farm_ws.apply_static_ip(r2, None) == "192.168.0.253" and not hasattr(r2, "got")
+    r3 = R()
+    r3.set_ipv4_address = lambda **k: (_ for _ in ()).throw(OSError("no"))
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert farm_ws.apply_static_ip(r3, "192.168.0.81") == "192.168.0.253"   # failure: keep DHCP
+
+
+@case
 def test_replay_to_a_slow_client_gives_up_in_bounded_time():
     farm_ws.reset_state()
     for n in range(10):
