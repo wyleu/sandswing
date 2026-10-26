@@ -112,6 +112,7 @@ LINK_CHECK_S = 2.0               # Wi-Fi supervision pass
 WIFI_REJOIN_S = 30.0             # rejoin attempts while the tower is quiet
 WIFI_REJOIN_RINGING_S = 120.0    # ...and while ringing (a join blocks sensing)
 WIFI_JOIN_TIMEOUT_S = 10         # per network in the list
+SERVER_RETRY_S = 10.0           # Wi-Fi is up but the server is not: try to start it this often
 LINK_DEAD_S = 45.0               # Wi-Fi "up" but no client heard: radio reset
 GATEWAY_CHECK_S = 30.0           # ping the Wi-Fi gateway (tower quiet only)
 GATEWAY_FAIL_N = 4               # this many misses in a row (after one hit): radio reset
@@ -899,6 +900,19 @@ class Concentrator:
                 asyncio.create_task(self.sntp.run())
         self.link_event("wifi_back", ip=ip, down_s=down_s, rejoins=self.rejoins)
 
+    def _ensure_server(self, now, state):
+        """Wi-Fi is up but nothing is listening: the link dropped between the
+        join and the server start (boot log: 'Cannot start server on None:80'),
+        and came back before link_step noticed, so _wifi_regained never ran.
+        Start the server, at most every SERVER_RETRY_S."""
+        if farm_ws.server_running():
+            return
+        if now - state.get("server_at", -SERVER_RETRY_S) < SERVER_RETRY_S:
+            return
+        state["server_at"] = now
+        start_server(self.cfg, self.status_payload)
+        self.link_event("server_retry", running=bool(farm_ws.server_running()))
+
     def _gateway_check(self, now):
         ping = getattr(farm_ws, "gateway_ping", None)
         if ping is None or now - self._gw_at < GATEWAY_CHECK_S:
@@ -1004,6 +1018,8 @@ class Concentrator:
         if not self.wifi_up:
             lost = state.get("lost_at")
             self._wifi_regained(None if lost is None else round(now - lost, 1), now)
+        else:
+            self._ensure_server(now, state)
 
         for ev in events:
             if ev == "radio_reset":
