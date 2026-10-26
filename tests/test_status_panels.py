@@ -23,7 +23,7 @@ MORE = {
               {"kind": "trigger", "why": None, "n": 12, "ago_s": 130},
               {"kind": "fault", "why": "Orange open", "n": 0, "ago_s": None}],
     "uptime_s": 7500, "last_reset": "WATCHDOG", "watchdog": True,
-    "boot_id": "ab12cd34", "seq": 77, "mem_free": 131072,
+    "boot_id": "ab12cd34", "seq": 77, "mem_free": 131072, "build": "6d6d5de",
 }
 FACTS = {"ip": "192.168.0.81", "ssid": "Home", "heads": ["lb", "trigger", "fault"],
          "tower": "inactive", "more": MORE}
@@ -71,6 +71,14 @@ def test_concentrator_panel():
     assert val(doc, "concentrator", "reset")["level"] == "warn"
     assert val(doc, "concentrator", "mem")["value"] == "128 kB"
     assert val(doc, "concentrator", "boot")["value"] == "ab12cd34 / 77"
+    assert val(doc, "concentrator", "build")["value"] == "6d6d5de"
+
+
+@case
+def test_build_unknown_when_not_stamped():
+    facts = dict(FACTS, more=dict(MORE, build=None))
+    doc = sand_status.from_concentrator(facts)
+    assert val(doc, "concentrator", "build")["value"] == "unknown"
 
 
 @case
@@ -93,6 +101,34 @@ def test_no_rssi_shows_gateway_ping():
     d = doc_with(gw_ms=None, gw_fail=3)
     assert val(d, "network", "gateway")["value"] == "no reply (3 missed)"
     assert val(d, "network", "gateway")["level"] == "error"
+
+
+@case
+def test_top_bar_summary_is_the_last_log_line():
+    d = sand_status.from_concentrator(dict(FACTS, more=dict(MORE, last_line="1137.074 ws poll took 31.0 s")))
+    assert d["summary"] == "1137.074 ws poll took 31.0 s", d["summary"]
+    d = sand_status.from_concentrator(dict(FACTS, more=dict(MORE)))   # nothing said yet
+    assert d["summary"].startswith("heads "), d["summary"]
+
+
+@case
+def test_lastline_remembers_lines_but_not_the_memory_chatter():
+    import io, contextlib
+    import lastline
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        lastline.print("1.0 link wifi_back")
+        lastline.print("mem free", 129, "kB")
+        lastline.print("x" * 300)
+    assert buf.getvalue().splitlines()[1] == "mem free 129 kB"      # still printed
+    assert lastline.get() == "x" * lastline.MAX_LEN
+    with contextlib.redirect_stdout(buf):
+        lastline.print("2.0 link client_dropped")
+        lastline.print("mem free 126 kB")
+        lastline.print("725.1 ch 1 CLEAR")
+        lastline.print("725.2 ch 1 HELD kind=stood")
+        lastline.print("725.3 ch 2 EDGE")
+    assert lastline.get() == "2.0 link client_dropped"
 
 
 finish()

@@ -211,4 +211,100 @@ def test_refusal_is_counted_and_noted():
     assert "client_refused" in whats and farm_ws.stats["refused"] == 1
 
 
+@case
+def test_slow_poll_says_where_the_time_went():
+    import io, contextlib
+    fresh(1)
+    farm_ws.send({"seq": 1})
+    t = [100.0]
+    class Srv:
+        def poll(self):
+            t[0] += 5.0                         # the library holds the loop 5 s
+    saved = (farm_ws.time.monotonic, farm_ws._server, farm_ws._send_text, farm_ws._receive)
+    farm_ws.time.monotonic = lambda: t[0]
+    farm_ws._server = Srv()
+    farm_ws._send_text = lambda ws, msg: t.__setitem__(0, t[0] + 1.0)      # replay 1 s
+    farm_ws._receive = lambda ws, now: t.__setitem__(0, t[0] + 34.0)       # reads 34 s
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            farm_ws.poll()
+    finally:
+        farm_ws.time.monotonic, farm_ws._server, farm_ws._send_text, farm_ws._receive = saved
+    out = buf.getvalue()
+    assert "ws poll took 40.0 s: server 5.0, replay 1.0, read 34.0" in out, out
+
+
+@case
+def test_a_slow_poll_is_counted_as_a_stall_for_link_health():
+    import io, contextlib
+    farm_ws.reset_state()
+    t = [100.0]
+    class Srv:
+        def poll(self):
+            t[0] += 10.0
+    saved = (farm_ws.time.monotonic, farm_ws._server)
+    farm_ws.time.monotonic = lambda: t[0]
+    farm_ws._server = Srv()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            farm_ws.poll()
+            farm_ws.poll()
+        assert farm_ws.stalls_since(t[0], 60.0) == 2
+        assert farm_ws.stalls_since(t[0] + 100.0, 60.0) == 0     # old ones age out
+    finally:
+        farm_ws.time.monotonic, farm_ws._server = saved
+    farm_ws.reset_state()
+    assert farm_ws.stalls_since(0.0, 60.0) == 0
+
+
+@case
+def test_static_ip_replaces_the_dhcp_address_and_keeps_the_rest():
+    import io, contextlib
+    class R:
+        ipv4_address = "192.168.0.253"
+        ipv4_subnet = "255.255.255.0"
+        ipv4_gateway = "192.168.0.1"
+        ipv4_dns = "192.168.0.1"
+        def set_ipv4_address(self, ipv4, netmask, gateway, ipv4_dns=None):
+            self.got = (str(ipv4), netmask, gateway, ipv4_dns)
+            self.ipv4_address = str(ipv4)
+    r = R()
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert farm_ws.apply_static_ip(r, "192.168.0.81") == "192.168.0.81"
+    assert r.got == ("192.168.0.81", "255.255.255.0", "192.168.0.1", "192.168.0.1"), r.got
+    r2 = R()                                   # no static_ip configured: DHCP stays
+    assert farm_ws.apply_static_ip(r2, None) == "192.168.0.253" and not hasattr(r2, "got")
+    r3 = R()
+    r3.set_ipv4_address = lambda **k: (_ for _ in ()).throw(OSError("no"))
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert farm_ws.apply_static_ip(r3, "192.168.0.81") == "192.168.0.253"   # failure: keep DHCP
+
+
+@case
+def test_replay_to_a_slow_client_gives_up_in_bounded_time():
+    farm_ws.reset_state()
+    for n in range(10):
+        farm_ws.send({"seq": n})
+    a = farm_ws._accept(FakeWs())
+    clock = [0.0]
+    real = farm_ws.time.monotonic
+    def tick():
+        clock[0] += 0.7                      # every look at the clock costs 0.7 s
+        return clock[0]
+    sent = []
+    a_send = farm_ws._send_text
+    def slow_send(ws, msg):
+        sent.append(msg)
+    farm_ws._send_text = slow_send
+    farm_ws.time.monotonic = tick
+    try:
+        farm_ws.poll()
+    finally:
+        farm_ws.time.monotonic = real
+        farm_ws._send_text = a_send
+    assert len(sent) < 10, len(sent)         # gave up part way
+    assert a not in farm_ws._clients         # and dropped the client
+
+
 finish()

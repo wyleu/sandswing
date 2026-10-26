@@ -96,7 +96,7 @@ def document(
         "instance": instance or "",
         "ts": int(ts) if ts else 0,
         "level": _level(level),
-        "summary": str(summary or "")[:80],
+        "summary": str(summary or "")[:100],
         "poll_hint_sec": int(poll_hint_sec or 5),
         "sections": list(sections),
     }
@@ -456,7 +456,8 @@ def from_concentrator(facts):
         conc = [item("uptime", "Up", up),
                 item("reset", "Last reset", reset,
                      "warn" if reset and str(reset).upper() == "WATCHDOG" else None),
-                item("watchdog", "Watchdog", "armed" if m.get("watchdog") else "off")]
+                item("watchdog", "Watchdog", "armed" if m.get("watchdog") else "off"),
+                item("build", "Build", m.get("build") or "unknown")]
         if m.get("mem_free") is not None:
             conc.append(item("mem", "Free memory", "%d kB" % (m["mem_free"] // 1024)))
         conc.append(item("boot", "Boot / event", "%s / %s" % (m.get("boot_id"), m.get("seq"))))
@@ -472,6 +473,8 @@ def from_concentrator(facts):
         ts=f.get("ts") or 0,
         uptime_s=m.get("uptime_s"),
         level=net_level,
-        summary="heads " + " ".join(str(h) for h in heads),
+        # the Pico's latest log line (what mpremote would show last); the
+        # head kinds are on the Heads panel
+        summary=m.get("last_line") or "heads " + " ".join(str(h) for h in heads),
         poll_hint_sec=f.get("poll_hint_sec") or 2,
     )

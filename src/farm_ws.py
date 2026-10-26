@@ -24,6 +24,7 @@
 #     events (take_link_notes()).
 import json
 import time
+from lastline import print        # print as before, and remember the line
 import wifi
 import adafruit_connection_manager
 
@@ -39,6 +40,10 @@ WS_GOING_AWAY = 1001
 WS_TRY_AGAIN_LATER = 1013
 
 CLIENT_SILENT_S = 20.0         # a heartbeat client silent this long is dead
+STALL_S = 5.0                  # a poll pass this slow counts as a stall (link health)
+_stalls = []                    # monotonic times of recent stalls, newest last
+SLOW_POLL_S = 2.0              # a poll pass slower than this is logged
+REPLAY_BUDGET_S = 1.5           # most the replay to one new client may take in all
 SEND_TIMEOUT_S = 1.0           # most one send may block on a full TCP buffer
 RX_FRAMES_PER_POLL = 4         # frames read per client per poll()
 REPLAY_N = 32                  # recent events replayed to each new client
@@ -47,6 +52,7 @@ EAGAIN = 11                    # errno values (CircuitPython has no errno module
 ETIMEDOUT = 110                # on every port, so plain numbers)
 
 _server = None
+_last_route = [None, 0.0]       # name and duration of the slowest-looking handler
 _host = None                   # IP the server is bound to
 _cfg = None
 _clients = []                  # live Websocket objects, oldest first
@@ -73,6 +79,27 @@ def wifi_candidates(cfg):
 _joined_ssid = None   # remembered because ap_info is not available on every build
 
 
+def apply_static_ip(radio, ip):
+    """Keep our usual address on a network whose DHCP will not give it (an
+    extender hides our MAC from the router's reservation: 2026-10-26 the
+    Pico got .253 instead of .81).  Netmask, gateway and DNS stay as the
+    DHCP lease set them.  Any failure leaves the DHCP address in place.
+    Returns the address now in use."""
+    if not ip:
+        return radio.ipv4_address
+    try:
+        import ipaddress
+        want = ipaddress.ip_address(ip)
+        if str(radio.ipv4_address) != str(want):
+            radio.set_ipv4_address(ipv4=want, netmask=radio.ipv4_subnet,
+                                   gateway=radio.ipv4_gateway,
+                                   ipv4_dns=getattr(radio, "ipv4_dns", None))
+            print("static IP", ip, "(DHCP gave %s)" % radio.ipv4_address)
+    except Exception as e:
+        print("static IP failed:", e)
+    return radio.ipv4_address
+
+
 def connect_wifi(cfg, timeout=None):
     global _joined_ssid
     last = None
@@ -86,6 +113,7 @@ def connect_wifi(cfg, timeout=None):
                 wifi.radio.connect(ssid, password)
             else:
                 wifi.radio.connect(ssid, password, timeout=timeout)
+            apply_static_ip(wifi.radio, n.get("static_ip"))
             print("WiFi OK", ssid, wifi.radio.ipv4_address)
             _joined_ssid = ssid
             return True
@@ -111,6 +139,13 @@ def start_server(cfg, payload_fn):
         print("output.ws disabled")
         return None
     try:
+        import ws_bounds
+        import adafruit_httpserver.response as _resp
+        print("ws bounds:", "on" if ws_bounds.install(_resp) else "NOT installed (library differs)")
+        print("request bounds:", "on" if ws_bounds.install_server(Server) else "NOT installed (library differs)")
+    except ImportError as e:
+        print("ws bounds: not installed:", e)
+    try:
         pool = adafruit_connection_manager.get_radio_socketpool(wifi.radio)
         server = Server(pool, debug=False)
         port = cfg.get_int("network.http_port", 80)
@@ -119,6 +154,7 @@ def start_server(cfg, payload_fn):
 
         @server.route(path_status, GET)
         def status_route(request: Request):
+            t_route = time.monotonic()
             try:
                 body = json.dumps(_payload_fn())
             except MemoryError as e:             # fragmented heap: tidy, retry once
@@ -133,6 +169,7 @@ def start_server(cfg, payload_fn):
             except Exception as e:
                 print("status payload error", e)
                 body = '{"error":"payload"}'
+            _last_route[0], _last_route[1] = path_status, time.monotonic() - t_route
             return Response(
                 request,
                 body=body,
@@ -358,7 +395,9 @@ def _send_frame(ws, opcode, payload, timeout_s):
             n = 0
         if n:
             done += n
-        elif time.monotonic() > deadline:
+        if done < total and time.monotonic() > deadline:
+            # also when bytes are trickling through: a barely-alive link that
+            # accepts a few bytes at a time held the Pico for 55 s
             raise OSError(ETIMEDOUT, "send timeout %.1f s" % timeout_s)
 
 
@@ -402,11 +441,13 @@ def poll():
     events to new clients, then read each client so pings get a pong, a
     close (or a dead socket) is noticed, and a silent heartbeat client is
     dropped.  A bad client is dropped on its own."""
+    t0 = time.monotonic()
     if _server:
         try:
             _server.poll()
         except Exception as e:
             print("ws poll:", e)
+    t_srv = time.monotonic()
     while _refused:
         _close(_refused.pop(), WS_TRY_AGAIN_LATER)
         stats["refused"] += 1
@@ -418,13 +459,19 @@ def poll():
         if ws not in _clients:
             continue
         _note("client_connected", peer=_peer(ws), replay=len(_recent))
+        t_replay = time.monotonic()
         for msg in list(_recent):
             try:
+                if time.monotonic() - t_replay > REPLAY_BUDGET_S:
+                    # a slow link: give up on this client (it reconnects)
+                    # rather than hold every other task for the whole replay
+                    raise OSError(ETIMEDOUT, "replay too slow")
                 _send_text(ws, msg)
             except Exception as e:
                 _drop(ws, e)
                 break
-    now = time.monotonic()
+    t_new = time.monotonic()
+    now = t_new
     for ws in list(_clients):
         try:
             _receive(ws, now)
@@ -438,6 +485,20 @@ def poll():
         if m is not None and m["hb"] and now - m["rx"] > CLIENT_SILENT_S:
             stats["silent_drops"] += 1
             _drop(ws, "silent %d s" % CLIENT_SILENT_S)
+    took = time.monotonic() - t0
+    if took > SLOW_POLL_S:
+        # the whole Pico waited on the network this long: say so, with the peers
+        stats["slow_polls"] = stats.get("slow_polls", 0) + 1
+        if took >= STALL_S:
+            _stalls.append(time.monotonic())
+            del _stalls[:-8]
+        # say which part held the loop: the library's request handling,
+        # the replay to a new client, or reading the existing clients
+        t_end = time.monotonic()
+        print("%.3f ws poll took %.1f s: server %.1f, replay %.1f, read %.1f %s"
+              % (t_end, took, t_srv - t0, t_new - t_srv, t_end - t_new, _count()))
+        if _last_route[0]:
+            print("  last route %s took %.1f s" % (_last_route[0], _last_route[1]))
 
 
 def send(obj, keep=True):
@@ -490,6 +551,11 @@ def sandbells_connected():
     return bool(_clients)
 
 
+def stalls_since(now, window_s):
+    """How many polls took STALL_S or more within the last window_s seconds."""
+    return len([t for t in _stalls if now - t <= window_s])
+
+
 def last_rx_age_s(now=None):
     """Seconds since any client last sent us a frame (heartbeat); None if
     nothing has been heard this boot."""
@@ -502,6 +568,7 @@ def reset_radio():
     """Wi-Fi looks up but nothing gets through: radio off/on so the next
     join starts clean.  Clients and the server go first (their sockets are
     on the old link)."""
+    del _stalls[:]
     stop_server()
     try:
         wifi.radio.enabled = False
@@ -531,6 +598,7 @@ def reset_state():
     del _refused[:]
     del _new[:]
     del _recent[:]
+    del _stalls[:]
     del _notes[:]
     _meta.clear()
     for k in stats:

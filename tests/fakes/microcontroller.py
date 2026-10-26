@@ -65,3 +65,10 @@ class WatchDogTimer:
 
 
 watchdog = WatchDogTimer()
+
+
+resets = []                 # reset() calls (the real one never returns)
+
+
+def reset():
+    resets.append(1)

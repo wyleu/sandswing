@@ -62,14 +62,51 @@ def _name(enum_value):
     return str(enum_value).split(".")[-1]
 
 
-def boot_reasons():
-    """(reset_reason, run_reason) as plain names, None if unknown."""
+# A software reset on the RP2 chips is reported as WATCHDOG, so before our own
+# resets we leave a 4-byte note at the end of non-volatile memory and read it
+# back at the next boot.  A real watchdog reset leaves no note.
+NVM_MARKS = {b"SRST": "SELF-RESET", b"CRSH": "CRASH-RESET"}
+_NO_MARK = b"\0\0\0\0"
+
+
+def mark_reset(kind, nvm=None):
+    """Note why we are about to reset: b"SRST" (link unhealthy) or b"CRSH"."""
+    try:
+        if nvm is None:
+            import microcontroller
+            nvm = microcontroller.nvm
+        nvm[len(nvm) - 4:len(nvm)] = kind
+    except Exception:
+        pass                        # no nvm: the reset just keeps its chip label
+
+
+def take_mark(nvm=None):
+    """The note left before the last reset ("SELF-RESET" ...) or None; clears it."""
+    try:
+        if nvm is None:
+            import microcontroller
+            nvm = microcontroller.nvm
+        n = len(nvm)
+        got = bytes(nvm[n - 4:n])
+        if got != _NO_MARK:
+            nvm[n - 4:n] = _NO_MARK
+        return NVM_MARKS.get(got)
+    except Exception:
+        return None
+
+
+def boot_reasons(nvm=None):
+    """(reset_reason, run_reason) as plain names, None if unknown.  A reset we
+    asked for ourselves is named SELF-RESET / CRASH-RESET, not WATCHDOG."""
     reset = run = None
     try:
         import microcontroller
         reset = _name(microcontroller.cpu.reset_reason)
     except (ImportError, AttributeError):
         pass
+    mark = take_mark(nvm)
+    if mark and reset not in ("POWER_ON", "BROWNOUT"):
+        reset = mark
     try:
         import supervisor
         run = _name(supervisor.runtime.run_reason)

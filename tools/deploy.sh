@@ -19,6 +19,8 @@ if [[ ! -d "$SRC" ]]; then
 fi
 
 HASH="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# a "+" says the files differ from that commit (uncommitted edits)
+git -C "$ROOT" diff --quiet HEAD -- src 2>/dev/null || HASH="$HASH+"
 DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf 'GIT="%s"\nBUILT="%s"\n' "$HASH" "$DATE" > "$SRC/build_info.py"
 echo "build $HASH $DATE"
