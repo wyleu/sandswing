@@ -23,7 +23,7 @@ MORE = {
               {"kind": "trigger", "why": None, "n": 12, "ago_s": 130},
               {"kind": "fault", "why": "Orange open", "n": 0, "ago_s": None}],
     "uptime_s": 7500, "last_reset": "WATCHDOG", "watchdog": True,
-    "boot_id": "ab12cd34", "seq": 77, "mem_free": 131072,
+    "boot_id": "ab12cd34", "seq": 77, "mem_free": 131072, "build": "6d6d5de",
 }
 FACTS = {"ip": "192.168.0.81", "ssid": "Home", "heads": ["lb", "trigger", "fault"],
          "tower": "inactive", "more": MORE}
@@ -71,6 +71,14 @@ def test_concentrator_panel():
     assert val(doc, "concentrator", "reset")["level"] == "warn"
     assert val(doc, "concentrator", "mem")["value"] == "128 kB"
     assert val(doc, "concentrator", "boot")["value"] == "ab12cd34 / 77"
+    assert val(doc, "concentrator", "build")["value"] == "6d6d5de"
+
+
+@case
+def test_build_unknown_when_not_stamped():
+    facts = dict(FACTS, more=dict(MORE, build=None))
+    doc = sand_status.from_concentrator(facts)
+    assert val(doc, "concentrator", "build")["value"] == "unknown"
 
 
 @case

@@ -456,7 +456,8 @@ def from_concentrator(facts):
         conc = [item("uptime", "Up", up),
                 item("reset", "Last reset", reset,
                      "warn" if reset and str(reset).upper() == "WATCHDOG" else None),
-                item("watchdog", "Watchdog", "armed" if m.get("watchdog") else "off")]
+                item("watchdog", "Watchdog", "armed" if m.get("watchdog") else "off"),
+                item("build", "Build", m.get("build") or "unknown")]
         if m.get("mem_free") is not None:
             conc.append(item("mem", "Free memory", "%d kB" % (m["mem_free"] // 1024)))
         conc.append(item("boot", "Boot / event", "%s / %s" % (m.get("boot_id"), m.get("seq"))))

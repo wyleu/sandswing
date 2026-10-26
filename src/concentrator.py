@@ -79,6 +79,7 @@ import panel
 import report
 
 from board_pins import release
+import watchdog_guard
 from watchdog_guard import WatchdogGuard
 from sand_event import Emitter, make_event
 from sntp_pico import TickClock
@@ -214,6 +215,15 @@ async def ws_poll_task(guard=None, app=None):
         if guard is not None:
             guard.checkin("ws_poll")       # a hung ws task stops the feeding
         await asyncio.sleep(0.05)
+
+def _build_id():
+    """Git hash this code was deployed from (tools/deploy.sh writes build_info.py)."""
+    try:
+        import build_info
+        return build_info.GIT
+    except (ImportError, AttributeError):
+        return None
+
 
 class Concentrator:
     def __init__(self, cfg):
@@ -421,7 +431,8 @@ class Concentrator:
         more = {"rssi": farm_ws.wifi_rssi(), "link": link, "time": t,
                 "chans": chans, "uptime_s": int(time.monotonic() - self.boot_at),
                 "last_reset": self.guard.last_reset, "watchdog": self.guard.armed,
-                "boot_id": self.events.boot_id, "seq": self.events.seq}
+                "boot_id": self.events.boot_id, "seq": self.events.seq,
+                "build": _build_id()}
         try:
             import gc
             more["mem_free"] = gc.mem_free()
@@ -961,6 +972,7 @@ class Concentrator:
                             % PICO_RESET_S)
             farm_ws.poll()
             import microcontroller
+            watchdog_guard.mark_reset(b"SRST")
             microcontroller.reset()
 
         # Wi-Fi down: signal the loss, then try to rejoin on the usual cadence
@@ -1059,6 +1071,7 @@ def run():
         time.sleep(3)
         try:
             import microcontroller
+            watchdog_guard.mark_reset(b"CRSH")
             microcontroller.reset()
         except ImportError:
             raise e
