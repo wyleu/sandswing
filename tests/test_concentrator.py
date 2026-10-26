@@ -201,6 +201,36 @@ def link(app):
     gw["ok"] = True
     gstep()
     res["gw_fail_cleared"] = app._gw_fail
+    # heartbeat_task logs when the loop ran late (it once crashed main(): len(int))
+    import asyncio
+    import types
+    clock = {"now": 100.0}
+    stub = types.SimpleNamespace(monotonic=lambda: clock["now"])
+    calls = []
+
+    class _Stop(Exception):
+        pass
+
+    async def fake_sleep(s):
+        calls.append(s)
+        if len(calls) > 1:
+            raise _Stop()
+        clock["now"] += s + 3.0                    # the loop was held 3 s
+
+    notes = []
+    saved = (concentrator.time, concentrator.asyncio.sleep, concentrator.emit,
+             farm_ws.ws_clients)
+    concentrator.time, concentrator.asyncio.sleep = stub, fake_sleep
+    concentrator.emit = notes.append
+    farm_ws.ws_clients = lambda: 1
+    try:
+        asyncio.run(app.heartbeat_task())
+    except _Stop:
+        pass
+    finally:
+        (concentrator.time, concentrator.asyncio.sleep, concentrator.emit,
+         farm_ws.ws_clients) = saved
+    res["loop_late"] = notes
     return {"link": res}
 
 
@@ -567,6 +597,10 @@ def main():
           and L.get("led6_stale") == [[40, 20, 0], "heartbeat_holdover"]
           and L.get("led6_unsynced") == [[40, 0, 0], "heartbeat_nosync"], r.get("exc") or L)
     hb = L.get("hb") or {}
+    check("link: a held loop is logged with phase and client count (no crash)",
+          len(L.get("loop_late") or []) == 1
+          and (L["loop_late"][0] if L.get("loop_late") else "").startswith("loop late 3.0 s")
+          and "clients 1" in L["loop_late"][0], L.get("loop_late") or r.get("exc"))
     check("link: heartbeat is sand.panel/v1 with the event envelope",
           hb.get("schema") == "sand.panel/v1" and hb.get("type") == "heartbeat"
           and hb.get("seq") == 1 and {"src", "id", "boot_id", "seq", "tick_ms",

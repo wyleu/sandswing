@@ -860,7 +860,7 @@ class Concentrator:
             if late > LOOP_LATE_S:
                 # the whole loop was held this long: say what else was going on
                 emit("loop late %.1f s (survey %s, clients %d)" % (
-                    late, self.survey_state.phase, len(farm_ws.ws_clients())))
+                    late, self.survey_state.phase, farm_ws.ws_clients()))
             if farm_ws.ws_clients():
                 try:
                     send(self.heartbeat_doc(), keep=False)
