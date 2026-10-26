@@ -26,12 +26,15 @@ class Conn:
         self.sent += bytes(view[:r])
         return r
 
-    def recv_into(self, view):
+    def recv_into(self, view, nbytes=None):
         r = self.recv_script.pop(0) if self.recv_script else OSError(errno.EAGAIN, "again")
         if isinstance(r, Exception):
             raise r
-        view[:len(r)] = r
-        return len(r)
+        n = min(len(r), len(view), nbytes if nbytes is not None else len(view))
+        view[:n] = r[:n]
+        if n < len(r):
+            self.recv_script.insert(0, r[n:])      # the rest is still queued
+        return n
 
 
 class Resp:
@@ -114,6 +117,115 @@ def test_install_patches_both_classes():
     assert m.Response._send_bytes is ws_bounds.bounded_send_bytes
     assert m.Websocket._recv_exact is ws_bounds.bounded_recv_exact
     assert not ws_bounds.install(types.ModuleType("empty"))
+
+
+class Lib47:
+    """just enough of adafruit_httpserver 4.7.1 Websocket for _read_frame"""
+    FIN = 0x80
+    CONT = 0
+    CLOSE = 8
+    _buffer_size = 1024
+
+    def __init__(self, conn):
+        class Req:
+            pass
+        self._request = Req()
+        self._request.connection = conn
+
+    @staticmethod
+    def _parse_frame_header(header):
+        fin = header[0] & 0x80
+        opcode = header[0] & 0x0F
+        has_mask = header[1] & 0x80
+        length = header[1] & 0x7F
+        if length == 126:
+            length = -2
+        elif length == 127:
+            length = -8
+        return fin, opcode, has_mask, length
+
+
+def read(frames):
+    return ws_bounds.bounded_read_frame(Lib47(Conn(recv=frames)))
+
+
+@case
+def test_frame_read_whole_text_frame():
+    assert read([b"\x81\x05", b"hello"]) == (1, b"hello")
+
+
+@case
+def test_frame_read_masked_frame():
+    key = b"\x01\x02\x03\x04"
+    body = bytes(b ^ key[i % 4] for i, b in enumerate(b"hi!!!"))
+    assert read([b"\x81\x85", key, body]) == (1, b"hi!!!")
+
+
+@case
+def test_frame_read_nothing_waiting_is_eagain():
+    try:
+        read([])
+        assert False
+    except OSError as e:
+        assert e.errno == errno.EAGAIN
+
+
+@case
+def test_frame_read_peer_closed_before_header():
+    try:
+        read([b""])
+        assert False
+    except OSError as e:
+        assert e.errno == errno.ENOTCONN
+
+
+@case
+def test_frame_read_peer_closed_mid_payload_does_not_spin():
+    # the library loops for ever here (recv_into returns 0, length never falls)
+    try:
+        read([b"\x81\x05", b"he", b""])
+        assert False
+    except OSError as e:
+        assert e.errno == errno.ENOTCONN
+
+
+@case
+def test_frame_read_stalled_payload_gives_up():
+    def go():
+        try:
+            read([b"\x81\x05", b"he"])
+        except OSError as e:
+            return e.errno
+    assert with_clock(go) == ws_bounds.ECONNABORTED
+
+
+@case
+def test_frame_read_oversize_frame_is_refused():
+    try:
+        read([b"\x81\x7e", b"\xff\xff"])
+        assert False
+    except OSError as e:
+        assert e.errno == ws_bounds.ECONNABORTED
+
+
+@case
+def test_frame_read_close_frame():
+    assert read([b"\x88\x00"]) == (8, b"")
+
+
+@case
+def test_frame_read_one_byte_header_then_rest():
+    assert read([b"\x81", b"\x02", b"ok"]) == (1, b"ok")
+
+
+@case
+def test_install_on_4_7_library_patches_read_frame():
+    import types
+    m = types.ModuleType("r")
+    m.Response = type("Response", (), {"_send_bytes": None})
+    m.Websocket = type("Websocket", (), {"_read_frame": None})
+    assert ws_bounds.install(m)
+    assert m.Websocket._read_frame is ws_bounds.bounded_read_frame
 
 
 finish()
