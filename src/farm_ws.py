@@ -40,6 +40,8 @@ WS_GOING_AWAY = 1001
 WS_TRY_AGAIN_LATER = 1013
 
 CLIENT_SILENT_S = 20.0         # a heartbeat client silent this long is dead
+STALL_S = 5.0                  # a poll pass this slow counts as a stall (link health)
+_stalls = []                    # monotonic times of recent stalls, newest last
 SLOW_POLL_S = 2.0              # a poll pass slower than this is logged
 REPLAY_BUDGET_S = 1.5           # most the replay to one new client may take in all
 SEND_TIMEOUT_S = 1.0           # most one send may block on a full TCP buffer
@@ -465,6 +467,9 @@ def poll():
     if took > SLOW_POLL_S:
         # the whole Pico waited on the network this long: say so, with the peers
         stats["slow_polls"] = stats.get("slow_polls", 0) + 1
+        if took >= STALL_S:
+            _stalls.append(time.monotonic())
+            del _stalls[:-8]
         # say which part held the loop: the library's request handling,
         # the replay to a new client, or reading the existing clients
         t_end = time.monotonic()
@@ -524,6 +529,11 @@ def sandbells_connected():
     return bool(_clients)
 
 
+def stalls_since(now, window_s):
+    """How many polls took STALL_S or more within the last window_s seconds."""
+    return len([t for t in _stalls if now - t <= window_s])
+
+
 def last_rx_age_s(now=None):
     """Seconds since any client last sent us a frame (heartbeat); None if
     nothing has been heard this boot."""
@@ -536,6 +546,7 @@ def reset_radio():
     """Wi-Fi looks up but nothing gets through: radio off/on so the next
     join starts clean.  Clients and the server go first (their sockets are
     on the old link)."""
+    del _stalls[:]
     stop_server()
     try:
         wifi.radio.enabled = False
@@ -565,6 +576,7 @@ def reset_state():
     del _refused[:]
     del _new[:]
     del _recent[:]
+    del _stalls[:]
     del _notes[:]
     _meta.clear()
     for k in stats:

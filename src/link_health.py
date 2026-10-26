@@ -55,6 +55,8 @@ DEAD = "DEAD"
 CLIENT_SILENT_S = 20.0
 GATEWAY_FAIL_N = 4
 LINK_DEAD_S = 45.0
+STALL_N = 3                  # this many 5 s+ polls within STALL_WINDOW_S: the radio is sick
+STALL_WINDOW_S = 300.0
 PICO_RESET_S = 300.0         # unhealthy this long, tower quiet: reset the Pico
 CALM_S = 90.0                # Wi-Fi up with no bad sign this long: the spell is over
 MEM_QUIET_MS = 3000
@@ -70,6 +72,7 @@ class LinkHealth:
         self._bad_since = None      # start of the current unhealthy spell (any bad sign)
         self._calm_since = None
         self._pico_asked = False
+        self._stall_reset_at = None  # last radio reset asked for because of stalls
         self.events = []
 
     def _spell(self, now_s, bad, good, tower_inactive):
@@ -108,6 +111,7 @@ class LinkHealth:
         tower_inactive = bool(obs.get("tower_inactive"))
         quiet_ms = int(obs.get("quiet_ms") or 0)
         gw_failing = bool(obs.get("gw_failing"))
+        stalled = int(obs.get("stalls") or 0) >= STALL_N
 
         # Quiet period (for GC / probes) is reported as an event but does not change state
         if quiet_ms >= MEM_QUIET_MS:
@@ -181,9 +185,21 @@ class LinkHealth:
                 self.state = RADIO_RESET
                 self._radio_reset_at = now_s
 
+        # Clients that keep reconnecting hide a sick radio: frames arrive, but
+        # sends keep stalling for 10 s.  Repeated stalls ask for a radio reset.
+        if stalled and tower_inactive and quiet_ms >= MEM_QUIET_MS \
+                and self.state not in (RADIO_RESET, DEAD) \
+                and (self._stall_reset_at is None
+                     or now_s - self._stall_reset_at >= RADIO_RESET_SETTLE_S):
+            self._stall_reset_at = now_s
+            self.events.append("radio_reset")
+            self.state = RADIO_RESET
+            self._radio_reset_at = now_s
+
         silent = self._dead_since is not None
-        good = (self.state == CLIENT_LIVE) or (gw_ok is True and not silent)
-        if self._spell(now_s, gw_failing or silent, good, tower_inactive):
+        good = ((self.state == CLIENT_LIVE) or (gw_ok is True and not silent)) \
+            and not stalled
+        if self._spell(now_s, gw_failing or silent or stalled, good, tower_inactive):
             self.events.append("pico_reset")
             self.state = DEAD
         return self.state, list(self.events)

@@ -236,6 +236,29 @@ def test_slow_poll_says_where_the_time_went():
 
 
 @case
+def test_a_slow_poll_is_counted_as_a_stall_for_link_health():
+    import io, contextlib
+    farm_ws.reset_state()
+    t = [100.0]
+    class Srv:
+        def poll(self):
+            t[0] += 10.0
+    saved = (farm_ws.time.monotonic, farm_ws._server)
+    farm_ws.time.monotonic = lambda: t[0]
+    farm_ws._server = Srv()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            farm_ws.poll()
+            farm_ws.poll()
+        assert farm_ws.stalls_since(t[0], 60.0) == 2
+        assert farm_ws.stalls_since(t[0] + 100.0, 60.0) == 0     # old ones age out
+    finally:
+        farm_ws.time.monotonic, farm_ws._server = saved
+    farm_ws.reset_state()
+    assert farm_ws.stalls_since(0.0, 60.0) == 0
+
+
+@case
 def test_replay_to_a_slow_client_gives_up_in_bounded_time():
     farm_ws.reset_state()
     for n in range(10):

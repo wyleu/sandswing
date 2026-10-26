@@ -147,4 +147,27 @@ def test_a_working_ping_does_not_hide_a_silent_client():
     assert "pico_reset" in ev
 
 
+@case
+def test_repeated_stalls_ask_for_a_radio_reset_even_with_live_clients():
+    # 2026-10-26: clients kept reconnecting through 10 s send stalls for 12 minutes
+    lh = LinkHealth()
+    c = dict(n_clients=1, hb_seen=True, last_rx_age_s=1.0)
+    _, ev = lh.update(0.0, obs(stalls=2, **c))
+    assert "radio_reset" not in ev            # two is not yet a pattern
+    _, ev = lh.update(5.0, obs(stalls=3, quiet_ms=1000, **c))
+    assert "radio_reset" not in ev            # a stroke is still happening
+    _, ev = lh.update(10.0, obs(stalls=3, **c))
+    assert "radio_reset" in ev
+    _, ev = lh.update(11.0, obs(stalls=3, **c))
+    assert "radio_reset" not in ev            # asked once, wait for the rejoin
+
+
+@case
+def test_stalls_never_reset_while_the_tower_rings():
+    lh = LinkHealth()
+    _, ev = lh.update(0.0, obs(stalls=5, tower_inactive=False, n_clients=1,
+                               hb_seen=True, last_rx_age_s=1.0))
+    assert "radio_reset" not in ev
+
+
 finish()

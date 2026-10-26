@@ -89,7 +89,7 @@ from survey_state import SurveyState, SURVEYING, SETTLED, IDLE as SURVEY_IDLE
 from mux_errors import ChannelBusy
 from laser_measure import counts_to_ma
 from adc_avg import avg as _avg
-from link_health import LinkHealth, PICO_RESET_S
+from link_health import LinkHealth, PICO_RESET_S, STALL_WINDOW_S
 
 RING_WINDOW_S = 0.4
 SETTLE_S = 0.3
@@ -964,6 +964,7 @@ class Concentrator:
             "last_gw_ok": self._gw_ms is not None,
             "gw_fail_count": self._gw_fail,
             "gw_failing": self._gw_since is not None,
+            "stalls": farm_ws.stalls_since(now, STALL_WINDOW_S),
             "tower_inactive": self.tower.tower == "inactive",
             "quiet_ms": quiet_ms,
         }
