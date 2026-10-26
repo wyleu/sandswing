@@ -54,7 +54,7 @@ DEAD = "DEAD"
 # Defaults matching the constants currently in concentrator.py
 CLIENT_SILENT_S = 20.0
 GATEWAY_FAIL_N = 4
-LINK_DEAD_S = 120.0
+LINK_DEAD_S = 45.0
 PICO_RESET_S = 300.0         # unhealthy this long, tower quiet: reset the Pico
 CALM_S = 90.0                # Wi-Fi up with no bad sign this long: the spell is over
 MEM_QUIET_MS = 3000

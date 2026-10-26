@@ -112,7 +112,7 @@ LINK_CHECK_S = 2.0               # Wi-Fi supervision pass
 WIFI_REJOIN_S = 30.0             # rejoin attempts while the tower is quiet
 WIFI_REJOIN_RINGING_S = 120.0    # ...and while ringing (a join blocks sensing)
 WIFI_JOIN_TIMEOUT_S = 10         # per network in the list
-LINK_DEAD_S = 120.0              # Wi-Fi "up" but no client heard: radio reset
+LINK_DEAD_S = 45.0               # Wi-Fi "up" but no client heard: radio reset
 GATEWAY_CHECK_S = 30.0           # ping the Wi-Fi gateway (tower quiet only)
 GATEWAY_FAIL_N = 4               # this many misses in a row (after one hit): radio reset
 
