@@ -69,6 +69,8 @@ from tower_watch import (
 from pins_from_settings import load_pinmap
 from farm_ws import connect_wifi, start_server, send
 import farm_ws
+from lastline import print        # print as before, and remember the line
+import lastline
 from tower_build import build_from_pins
 from connector_boards import DEFAULT_BOARDS
 from socket_survey import SocketSurvey, survey_all
@@ -432,7 +434,7 @@ class Concentrator:
                 "chans": chans, "uptime_s": int(time.monotonic() - self.boot_at),
                 "last_reset": self.guard.last_reset, "watchdog": self.guard.armed,
                 "boot_id": self.events.boot_id, "seq": self.events.seq,
-                "build": _build_id()}
+                "build": _build_id(), "last_line": lastline.get()}
         try:
             import gc
             more["mem_free"] = gc.mem_free()

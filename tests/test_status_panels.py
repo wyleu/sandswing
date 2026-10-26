@@ -103,4 +103,29 @@ def test_no_rssi_shows_gateway_ping():
     assert val(d, "network", "gateway")["level"] == "error"
 
 
+@case
+def test_top_bar_summary_is_the_last_log_line():
+    d = sand_status.from_concentrator(dict(FACTS, more=dict(MORE, last_line="1137.074 ws poll took 31.0 s")))
+    assert d["summary"] == "1137.074 ws poll took 31.0 s", d["summary"]
+    d = sand_status.from_concentrator(dict(FACTS, more=dict(MORE)))   # nothing said yet
+    assert d["summary"].startswith("heads "), d["summary"]
+
+
+@case
+def test_lastline_remembers_lines_but_not_the_memory_chatter():
+    import io, contextlib
+    import lastline
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        lastline.print("1.0 link wifi_back")
+        lastline.print("mem free", 129, "kB")
+        lastline.print("x" * 300)
+    assert buf.getvalue().splitlines()[1] == "mem free 129 kB"      # still printed
+    assert lastline.get() == "x" * lastline.MAX_LEN
+    with contextlib.redirect_stdout(buf):
+        lastline.print("2.0 link client_dropped")
+        lastline.print("mem free 126 kB")
+    assert lastline.get() == "2.0 link client_dropped"
+
+
 finish()

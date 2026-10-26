@@ -32,6 +32,7 @@ time_select.py
 watchdog_guard.py
 farm_ws.py
 ws_bounds.py
+lastline.py
 farm_log.py
 sand_status.py
 bell_machine.py

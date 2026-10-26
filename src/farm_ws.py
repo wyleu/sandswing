@@ -24,6 +24,7 @@
 #     events (take_link_notes()).
 import json
 import time
+from lastline import print        # print as before, and remember the line
 import wifi
 import adafruit_connection_manager
 
