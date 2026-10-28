@@ -25,6 +25,11 @@ Events (returned by update)
     wifi_lost, wifi_up, client_live, client_silent,
     gateway_fail, radio_reset, pico_reset, quiet
 
+A second, independent machine (SendPath, below) models the /ws send path:
+SEND_OK, SEND_BACKOFF, SEND_DEGRADED.  It is table-driven: SEND_LEVELS and
+SEND_TRANSITIONS are the whole policy, farm_ws.py only asks it "may I accept?
+how many events do I replay, how fast, with what send budget?" and obeys.
+
 The state name is only a label.  What stops a reset repeating are the flags
 (`_latched` for silence, `_stall_reset_at` for stalls, `_radio_reset_at` for
 the settle time, `_pico_asked`), because a live client frame sets the label
@@ -64,6 +69,172 @@ PICO_RESET_S = 300.0         # unhealthy this long, tower quiet: reset the Pico
 CALM_S = 90.0                # Wi-Fi up with no bad sign this long: the spell is over
 MEM_QUIET_MS = 3000
 RADIO_RESET_SETTLE_S = 60.0
+
+
+# ---------------------------------------------------------------------------
+# Send path (/ws writes).  One table, no logic elsewhere.
+#
+# Why: CircuitPython 10.0.3 lwip_tcp_send() sleeps up to 200 x 50 ms = 10 s
+# *inside one socket.send()* when lwIP's tcp_write() returns ERR_MEM (send
+# queue full of unacknowledged segments, typical when 32 replay frames are
+# pushed at a new client over an extender).  A Python deadline is only looked
+# at after send() returns, so the only defences are (1) never queue more than
+# the link takes (pace and shrink the replay), (2) notice a slow send at once
+# and (3) refuse the instant reconnect that would repeat it.  See
+# docs/link-health.md "Send path".
+# ---------------------------------------------------------------------------
+SEND_OK = "SEND_OK"                  # replay and pace as configured at level 0
+SEND_BACKOFF = "SEND_BACKOFF"        # a send was slow/failed: refuse new clients (503)
+SEND_DEGRADED = "SEND_DEGRADED"      # accepting again, but gentler replay until calm
+
+# Per-poll hard budget and the bounds every blocking wait must sit under.
+# ws_bounds.py and farm_ws.py take their numbers from here.
+POLL_BUDGET_S = 1.0          # farm_ws.poll() total, aim; phases stop when it is spent
+REQ_BOUND_S = 0.3            # the library reading one HTTP request (ws_bounds)
+REPLY_BOUND_S = 0.3          # the library sending a reply / handshake / 503 (ws_bounds)
+FRAME_BOUND_S = 0.3          # the rest of a started client frame (ws_bounds)
+SEND_TIMEOUT_S = 0.4         # one frame to one client (replay or live)
+CLOSE_TIMEOUT_S = 0.1        # a close frame to a stuck peer
+MIN_SLICE_S = 0.05           # not worth starting a send with less budget than this
+
+# A call that took this long counts as a bad send, whether or not it raised.
+SLOW_S = {"replay": 0.2, "live": 0.3, "server": 1.0, "close": 0.15, "poll": 1.5}
+
+# Level 0 is SEND_OK.  A bad send raises the level by one (capped at the last
+# row); SEND_BACKOFF lasts hold_s; SEND_DEGRADED then lasts calm_s at that
+# level without a bad send, after which the level falls by one, down to 0.
+# calm_s is long on purpose (hours): a level that was needed once must not be
+# given up again within the same ringing session, or a link that needs it
+# would flap between levels and stall once per calm_s.
+#   level: (hold_s, replay_n, chunk_frames, chunk_gap_s, calm_s)
+# replay_n events are replayed to a new client, chunk_frames per poll turn,
+# at least chunk_gap_s between turns (about 0.5 kB per frame, so level 0 is
+# ~5 kB/s into the TCP queue, level 1 ~2 kB/s, level 4 ~0.5 kB/s, level 5 none).
+SEND_LEVELS = (
+    (0.0,  32, 1, 0.10,    0.0),
+    (2.0,  32, 1, 0.25, 7200.0),
+    (4.0,  16, 1, 0.50, 7200.0),
+    (8.0,   8, 1, 0.50, 3600.0),
+    (16.0,  4, 1, 1.00, 1800.0),
+    (30.0,  0, 0, 1.00, 1800.0),     # cap: hold 30 s, no replay at all
+)
+SEND_MAX_LEVEL = len(SEND_LEVELS) - 1
+
+# (state, event) -> (next state, level change).  A pair not listed changes
+# nothing.  Events: bad (slow or failed send), hold_over (hold_s elapsed),
+# calm (calm_s without a bad send), level0 (calm brought the level to 0).
+SEND_TRANSITIONS = {
+    (SEND_OK,       "bad"):       (SEND_BACKOFF, +1),
+    (SEND_DEGRADED, "bad"):       (SEND_BACKOFF, +1),
+    (SEND_BACKOFF,  "bad"):       (SEND_BACKOFF, 0),    # existing clients failing: no extra escalation
+    (SEND_BACKOFF,  "hold_over"): (SEND_DEGRADED, 0),
+    (SEND_DEGRADED, "calm"):      (SEND_DEGRADED, -1),
+    (SEND_DEGRADED, "level0"):    (SEND_OK, 0),
+}
+# What each state lets farm_ws do.
+SEND_ACCEPTS = {SEND_OK: True, SEND_DEGRADED: True, SEND_BACKOFF: False}
+
+
+class SendPlan:
+    """The model's answer to farm_ws: obey it."""
+    def __init__(self, state, level, accept, retry_after_s, replay_n,
+                 chunk_frames, chunk_gap_s):
+        self.state = state
+        self.level = level
+        self.accept = accept
+        self.retry_after_s = retry_after_s
+        self.replay_n = replay_n
+        self.chunk_frames = chunk_frames
+        self.chunk_gap_s = chunk_gap_s
+        self.poll_s = POLL_BUDGET_S
+        self.send_s = SEND_TIMEOUT_S
+        self.close_s = CLOSE_TIMEOUT_S
+
+
+class SendPath:
+    """Table-driven /ws send-path health.  Time and observations in, plan and
+    log events out; no sockets.
+
+        plan(now)                      -> SendPlan (also runs the timed transitions)
+        observe(now, kind, took_s, ok) -> True if that send counted as bad
+        take_events()                  -> [(what, info)] for `link` log lines
+    """
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.state = SEND_OK
+        self.level = 0
+        self.hold_until = None
+        self.last_bad = None
+        self.level_since = None        # when the current level began (calm timer)
+        self.refused = 0               # refused during the current spell
+        self.bad_count = 0
+        self.events = []
+
+    def _fire(self, now, event, why=None):
+        key = (self.state, event)
+        if key not in SEND_TRANSITIONS:
+            return
+        nxt, delta = SEND_TRANSITIONS[key]
+        before = self.state
+        self.state = nxt
+        self.level = min(SEND_MAX_LEVEL, max(0, self.level + delta))
+        if delta:
+            self.level_since = now
+        if nxt == SEND_BACKOFF and before != SEND_BACKOFF:
+            self.hold_until = now + SEND_LEVELS[self.level][0]
+            self.events.append(("send_backoff", {
+                "level": self.level, "hold_s": SEND_LEVELS[self.level][0],
+                "replay": SEND_LEVELS[self.level][1], "why": why}))
+        elif before == SEND_BACKOFF and nxt == SEND_DEGRADED:
+            self.events.append(("send_degraded", {
+                "level": self.level, "replay": SEND_LEVELS[self.level][1],
+                "refused": self.refused}))
+        elif nxt == SEND_OK:
+            self.events.append(("send_ok", {"refused": self.refused}))
+            self.refused = 0
+        elif event == "calm":
+            self.events.append(("send_calmer", {
+                "level": self.level, "replay": SEND_LEVELS[self.level][1]}))
+        if self.state == SEND_DEGRADED and self.level == 0:
+            self._fire(now, "level0")
+
+    def _timed(self, now):
+        """Transitions that only need the clock."""
+        if self.state == SEND_BACKOFF and now >= self.hold_until:
+            self._fire(now, "hold_over")
+        if self.state == SEND_DEGRADED:
+            calm_s = SEND_LEVELS[self.level][4]
+            since = max(self.last_bad or 0.0, self.level_since or 0.0,
+                        self.hold_until or 0.0)
+            if now - since >= calm_s:
+                self._fire(now, "calm")
+
+    def plan(self, now):
+        self._timed(now)
+        hold, replay_n, frames, gap, _ = SEND_LEVELS[self.level]
+        accept = SEND_ACCEPTS[self.state]
+        retry = 0.0 if accept else max(1.0, round(self.hold_until - now, 1))
+        return SendPlan(self.state, self.level, accept, retry, replay_n, frames, gap)
+
+    def observe(self, now, kind, took_s, ok=True):
+        """One send/serve call finished (or failed) after took_s.  True if bad."""
+        self._timed(now)
+        bad = (not ok) or took_s >= SLOW_S.get(kind, SEND_TIMEOUT_S)
+        if bad:
+            self.bad_count += 1
+            self.last_bad = now
+            self._fire(now, "bad", "%s %s %.2f s" % (
+                kind, "slow" if ok else "failed", took_s))
+        return bad
+
+    def note_refused(self):
+        self.refused += 1
+
+    def take_events(self):
+        out, self.events = self.events, []
+        return out
 
 
 class LinkHealth:
