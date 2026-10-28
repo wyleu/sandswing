@@ -39,4 +39,3 @@ bell_machine.py
 sand_event.py
 survey_state.py
 fake_strokes.py
-link_health.py
