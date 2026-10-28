@@ -19,6 +19,13 @@
 #   * The last REPLAY_N events are kept and replayed to every new client, so
 #     strokes made while the link was down still arrive (Sandbells ignores
 #     re-sends: UNIQUE(src, boot_id, seq)).
+#   * What a new client gets (accepted or refused with a 503, how many events,
+#     how fast, with what send budget) is decided by link_health.SendPath, not
+#     here: see its SEND_LEVELS / SEND_TRANSITIONS table.  This file reports
+#     every send's duration to it and does what the plan says.
+#   * A poll() is bounded (link_health.POLL_BUDGET_S): the replay is sent a
+#     frame or two per poll turn and resumes next turn, so one slow send
+#     cannot hold the sense loop for the rest of a replay.
 #   * Every connect / drop / refusal is counted, kept as last_drop_reason,
 #     and queued as a link note: concentrator.py turns notes into "link"
 #     events (take_link_notes()).
@@ -27,6 +34,7 @@ import time
 from lastline import print        # print as before, and remember the line
 import wifi
 import adafruit_connection_manager
+import link_health                 # the send-path state model: this file obeys it
 
 try:
     from adafruit_httpserver import Server, Request, Response, GET, Websocket
@@ -39,17 +47,22 @@ WS_NORMAL = 1000               # close codes (RFC 6455)
 WS_GOING_AWAY = 1001
 WS_TRY_AGAIN_LATER = 1013
 
+try:
+    from errno import EAGAIN, ETIMEDOUT   # the Pico's newlib: ETIMEDOUT is 116, not 110
+except ImportError:                     # pragma: no cover
+    EAGAIN = 11
+    ETIMEDOUT = 110
+
 CLIENT_SILENT_S = 20.0         # a heartbeat client silent this long is dead
 STALL_S = 5.0                  # a poll pass this slow counts as a stall (link health)
 _stalls = []                    # monotonic times of recent stalls, newest last
+_turn = [0]                     # poll() count: which client is read first
 SLOW_POLL_S = 2.0              # a poll pass slower than this is logged
-REPLAY_BUDGET_S = 1.5           # most the replay to one new client may take in all
-SEND_TIMEOUT_S = 1.0           # most one send may block on a full TCP buffer
+SEND_TIMEOUT_S = link_health.SEND_TIMEOUT_S   # most one send may block on a full TCP buffer
 RX_FRAMES_PER_POLL = 4         # frames read per client per poll()
-REPLAY_N = 32                  # recent events replayed to each new client
+REPLAY_N = link_health.SEND_LEVELS[0][1]      # recent events kept for replay (level 0 size)
+TODO_MAX = 2 * REPLAY_N        # events waiting behind a replay in progress, per client
 NOTES_MAX = 16                 # link notes waiting for concentrator.py
-EAGAIN = 11                    # errno values (CircuitPython has no errno module
-ETIMEDOUT = 110                # on every port, so plain numbers)
 
 _server = None
 _last_route = [None, 0.0]       # name and duration of the slowest-looking handler
@@ -61,9 +74,11 @@ _new = []                      # accepted this poll: replay + note in poll()
 _meta = {}                     # id(ws) -> {"at", "rx", "hb"}
 _recent = []                   # last REPLAY_N event messages (json str)
 _notes = []                    # (what, info) for concentrator.py
+_path = link_health.SendPath() # send-path state model: plan(now) says what is allowed
 _payload_fn = lambda: {}
 stats = {"connects": 0, "drops": 0, "refused": 0, "send_timeouts": 0,
-         "silent_drops": 0, "last_drop_reason": None, "last_drop_at": None,
+         "silent_drops": 0, "refused_backoff": 0, "replays_done": 0,
+         "last_drop_reason": None, "last_drop_at": None,
          "hb_seen": False, "last_rx_at": None}
 
 
@@ -179,7 +194,7 @@ def start_server(cfg, payload_fn):
 
         @server.route(path_ws, GET)
         def ws_route(request: Request):
-            return _accept(Websocket(request))
+            return route_ws(request)
 
         host = str(wifi.radio.ipv4_address)
         server.start(host=host, port=port)
@@ -291,6 +306,26 @@ def _peer(ws):
         return None
 
 
+def _busy_response(request, retry_after_s):
+    """A short HTTP 503 for a /ws request refused by the send-path model: no
+    handshake, no socket kept, a few hundred bytes through the bounded reply
+    path.  A browser or websocket-client sees a failed connect and backs off."""
+    return Response(request, body="busy", status=(503, "Service Unavailable"),
+                    headers={"Retry-After": str(int(retry_after_s + 0.999)),
+                             "Connection": "close",
+                             "Access-Control-Allow-Origin": "*"})
+
+
+def route_ws(request):
+    """GET /ws: ask the send-path model, obey the answer."""
+    plan = _path.plan(time.monotonic())
+    if not plan.accept:
+        _path.note_refused()
+        stats["refused_backoff"] += 1
+        return _busy_response(request, plan.retry_after_s)
+    return _accept(Websocket(request))
+
+
 def _accept(ws):
     """Add a client, or queue it for a polite refusal when full.  The
     handshake must go out first, so the refusal close (and the replay of
@@ -299,14 +334,15 @@ def _accept(ws):
         _refused.append(ws)
     else:
         _clients.append(ws)
-        _meta[id(ws)] = {"at": time.monotonic(), "rx": None, "hb": False}
+        _meta[id(ws)] = {"at": time.monotonic(), "rx": None, "hb": False,
+                         "todo": [], "left": 0, "next_at": 0.0}
         _new.append(ws)
         stats["connects"] += 1
         print("%.3f WS client connected %s" % (time.monotonic(), _count()))
     return ws
 
 
-CLOSE_TIMEOUT_S = 0.2          # a close frame to a stuck peer is not worth more
+CLOSE_TIMEOUT_S = link_health.CLOSE_TIMEOUT_S   # a close frame to a stuck peer is not worth more
 
 
 def _close(ws, code):
@@ -322,11 +358,16 @@ def _close(ws, code):
             pass
         return
     if not getattr(ws, "closed", False):
+        t0 = time.monotonic()
+        ok = False
         try:
             payload = b"" if code is None else int(code).to_bytes(2, "big")
             _send_frame(ws, 8, payload, CLOSE_TIMEOUT_S)     # 8 = CLOSE
+            ok = True
         except Exception:
             pass
+        t1 = time.monotonic()
+        _path.observe(t1, "close", t1 - t0, ok)
     try:
         conn.close()
     except Exception:
@@ -335,7 +376,8 @@ def _close(ws, code):
 
 
 _ERRNO_WORDS = {32: "broken pipe", 104: "connection reset", 107: "not connected",
-                110: "timed out", 113: "no route to host", 128: "not connected"}
+                110: "timed out", 113: "no route to host", 116: "timed out",
+                128: "not connected"}
 
 
 def _why(why):
@@ -401,23 +443,34 @@ def _send_frame(ws, opcode, payload, timeout_s):
             raise OSError(ETIMEDOUT, "send timeout %.1f s" % timeout_s)
 
 
-def _send_text(ws, msg):
+def _send_text(ws, msg, timeout_s=None, kind="live"):
     """One text frame with a deadline.  adafruit_httpserver 4.8.2
     send_message() retries EAGAIN forever (Response._send_bytes), so a dead
     peer with a full TCP buffer hangs everything; this gives up after
-    SEND_TIMEOUT_S and raises, so the caller drops the client.  Falls back
-    to send_message() if the library internals are not there."""
-    prep = getattr(ws, "_prepare_frame", None)
-    conn = getattr(getattr(ws, "_request", None), "connection", None)
-    if prep is None or conn is None:
-        ws.send_message(msg, fail_silently=True)
-        return
+    timeout_s (SEND_TIMEOUT_S) and raises, so the caller drops the client.
+    Falls back to send_message() if the library internals are not there.
+    How long it took is reported to the send-path model (kind: "replay" or
+    "live"); True is returned when the model counts the send as bad (slow)."""
+    timeout_s = SEND_TIMEOUT_S if timeout_s is None else timeout_s
+    t0 = time.monotonic()
+    ok = False
     try:
-        _send_frame(ws, 1, msg.encode("utf-8"), SEND_TIMEOUT_S)   # 1 = TEXT
-    except OSError as e:
-        if e.errno == ETIMEDOUT:
-            stats["send_timeouts"] += 1
-        raise
+        prep = getattr(ws, "_prepare_frame", None)
+        conn = getattr(getattr(ws, "_request", None), "connection", None)
+        if prep is None or conn is None:
+            ws.send_message(msg, fail_silently=True)
+        else:
+            try:
+                _send_frame(ws, 1, msg.encode("utf-8"), timeout_s)   # 1 = TEXT
+            except OSError as e:
+                if e.errno == ETIMEDOUT:
+                    stats["send_timeouts"] += 1
+                raise
+        ok = True
+    finally:
+        t1 = time.monotonic()
+        bad = _path.observe(t1, kind, t1 - t0, ok)
+    return bad
 
 
 def _receive(ws, now):
@@ -436,19 +489,71 @@ def _receive(ws, now):
                 stats["hb_seen"] = True
 
 
+def _flush_path_events():
+    for what, info in _path.take_events():
+        _note(what, **info)           # concentrator.py prints it as a `link ...` line
+
+
+def _begin_replay(ws, plan):
+    """A new client: queue the newest plan.replay_n events (none at the cap)."""
+    m = _meta.get(id(ws))
+    if m is None:
+        return
+    todo = list(_recent)[-plan.replay_n:] if plan.replay_n > 0 else []
+    m["todo"], m["left"], m["next_at"] = todo, len(todo), 0.0
+    _note("client_connected", peer=_peer(ws), replay=len(todo),
+          level=plan.level)
+
+
+def _pump(ws, m, plan, now, deadline):
+    """Send this client's next chunk: plan.chunk_frames replay frames, then,
+    once the replay part is out, whatever live events queued behind it, all
+    inside the poll budget.  A bad (slow) send drops the client; the model
+    has already been told and decides the backoff."""
+    sent = 0
+    while m["todo"]:
+        left = deadline - time.monotonic() - plan.close_s    # keep room to drop it
+        if left < link_health.MIN_SLICE_S:
+            return                                  # resume next turn
+        replaying = m["left"] > 0
+        if replaying and sent >= plan.chunk_frames:
+            break
+        try:
+            bad = _send_text(ws, m["todo"][0], min(plan.send_s, left),
+                             "replay" if replaying else "live")
+        except Exception as e:
+            _drop(ws, e)
+            return
+        if bad and replaying:
+            _drop(ws, OSError(ETIMEDOUT, "replay slow"))
+            return
+        m["todo"].pop(0)
+        sent += 1
+        if replaying:
+            m["left"] -= 1
+            if m["left"] == 0:
+                stats["replays_done"] += 1
+    m["next_at"] = now + plan.chunk_gap_s
+
+
 def poll():
     """Accept HTTP/WS requests, refuse clients over the limit, replay recent
-    events to new clients, then read each client so pings get a pong, a
-    close (or a dead socket) is noticed, and a silent heartbeat client is
-    dropped.  A bad client is dropped on its own."""
+    events to new clients (a chunk per turn), then read each client so pings
+    get a pong, a close (or a dead socket) is noticed, and a silent heartbeat
+    client is dropped.  A bad client is dropped on its own.  Every phase
+    stops when link_health.POLL_BUDGET_S is spent and carries on next turn."""
     t0 = time.monotonic()
+    plan = _path.plan(t0)
+    deadline = t0 + plan.poll_s
     if _server:
         try:
             _server.poll()
         except Exception as e:
             print("ws poll:", e)
     t_srv = time.monotonic()
-    while _refused:
+    _path.observe(t_srv, "server", t_srv - t0, True)
+    while _refused and (deadline - time.monotonic()
+                        >= link_health.MIN_SLICE_S + plan.close_s):
         _close(_refused.pop(), WS_TRY_AGAIN_LATER)
         stats["refused"] += 1
         _note("client_refused", reason="max %d clients" % MAX_WS_CLIENTS)
@@ -456,23 +561,25 @@ def poll():
               % (time.monotonic(), MAX_WS_CLIENTS, _count()))
     while _new:
         ws = _new.pop(0)
-        if ws not in _clients:
-            continue
-        _note("client_connected", peer=_peer(ws), replay=len(_recent))
-        t_replay = time.monotonic()
-        for msg in list(_recent):
-            try:
-                if time.monotonic() - t_replay > REPLAY_BUDGET_S:
-                    # a slow link: give up on this client (it reconnects)
-                    # rather than hold every other task for the whole replay
-                    raise OSError(ETIMEDOUT, "replay too slow")
-                _send_text(ws, msg)
-            except Exception as e:
-                _drop(ws, e)
-                break
+        if ws in _clients:
+            _begin_replay(ws, _path.plan(time.monotonic()))
+    now = time.monotonic()
+    for ws in list(_clients):
+        m = _meta.get(id(ws))
+        if m is not None and m["todo"] and now >= m["next_at"] and ws in _clients:
+            _pump(ws, m, plan, now, deadline)
     t_new = time.monotonic()
     now = t_new
-    for ws in list(_clients):
+    clients = list(_clients)
+    _turn[0] += 1
+    if clients:                                     # rotate: a spent budget must not starve the last
+        r = _turn[0] % len(clients)
+        clients = clients[r:] + clients[:r]
+    for ws in clients:
+        if ws not in _clients:
+            continue
+        if deadline - time.monotonic() < link_health.FRAME_BOUND_S + plan.close_s:
+            break                                   # reads resume next turn (silence limit is 20 s)
         try:
             _receive(ws, now)
         except Exception as e:
@@ -485,7 +592,10 @@ def poll():
         if m is not None and m["hb"] and now - m["rx"] > CLIENT_SILENT_S:
             stats["silent_drops"] += 1
             _drop(ws, "silent %d s" % CLIENT_SILENT_S)
-    took = time.monotonic() - t0
+    t_end = time.monotonic()
+    took = t_end - t0
+    _path.observe(t_end, "poll", took, True)
+    _flush_path_events()
     if took > SLOW_POLL_S:
         # the whole Pico waited on the network this long: say so, with the peers
         stats["slow_polls"] = stats.get("slow_polls", 0) + 1
@@ -516,6 +626,17 @@ def send(obj, keep=True):
     for ws in list(_clients):
         if ws.closed:
             _drop(ws, "closed", WS_NORMAL)
+            continue
+        m = _meta.get(id(ws))
+        if m is not None and m["todo"]:
+            # a replay is still going out: keep the order, queue behind it.
+            # Heartbeats (keep=False) are state, not events: skip them.
+            if keep:
+                if len(m["todo"]) >= TODO_MAX:
+                    _drop(ws, "replay backlog")
+                else:
+                    m["todo"].append(msg)
+            sent = True
             continue
         try:
             _send_text(ws, msg)
@@ -585,6 +706,8 @@ def link_status():
     d["clients"] = len(_clients)
     d["live"] = live_clients(now)
     d["rx_age_s"] = last_rx_age_s(now)
+    d["send_state"] = _path.state
+    d["send_level"] = _path.level
     if d["last_drop_at"] is not None:
         d["last_drop_age_s"] = round(now - d["last_drop_at"], 1)
     del d["last_drop_at"]
@@ -600,6 +723,7 @@ def reset_state():
     del _recent[:]
     del _stalls[:]
     del _notes[:]
+    _path.reset()
     _meta.clear()
     for k in stats:
         stats[k] = 0

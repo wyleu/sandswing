@@ -14,6 +14,7 @@
 # A bounded wait raises OSError; farm_ws.poll() drops that one client and
 # carries on.  Runs on CPython (tests) and CircuitPython.
 import time
+import link_health      # the numbers below are the model's table, one place
 
 try:
     from errno import EAGAIN, ECONNRESET, ENOTCONN, ETIMEDOUT
@@ -24,9 +25,9 @@ try:
 except ImportError:                      # pragma: no cover
     ECONNABORTED = 103
 
-SEND_BOUND_S = 1.5          # most a library send may wait on a full TCP buffer
-RECV_BOUND_S = 1.0          # most the rest of a started frame may take
-REQ_BOUND_S = 2.0           # most the library may spend reading one HTTP request
+SEND_BOUND_S = link_health.REPLY_BOUND_S   # most a library send may wait on a full TCP buffer
+RECV_BOUND_S = link_health.FRAME_BOUND_S   # most the rest of a started frame may take
+REQ_BOUND_S = link_health.REQ_BOUND_S      # most the library may spend reading one HTTP request
 
 _now = time.monotonic       # tests replace this
 
