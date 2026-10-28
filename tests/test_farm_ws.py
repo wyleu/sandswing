@@ -306,6 +306,11 @@ def test_static_ip_replaces_the_dhcp_address_and_keeps_the_rest():
     assert r.got == ("192.168.0.81", "255.255.255.0", "192.168.0.1", "192.168.0.1"), r.got
     r2 = R()                                   # no static_ip configured: DHCP stays
     assert farm_ws.apply_static_ip(r2, None) == "192.168.0.253" and not hasattr(r2, "got")
+    r4 = R()                                   # DHCP already agrees: still set it, so DHCP stops
+    r4.ipv4_address = "192.168.0.81"
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert farm_ws.apply_static_ip(r4, "192.168.0.81") == "192.168.0.81"
+    assert hasattr(r4, "got"), "the address must be set even when DHCP gave the same one"
     r3 = R()
     r3.set_ipv4_address = lambda **k: (_ for _ in ()).throw(OSError("no"))
     with contextlib.redirect_stdout(io.StringIO()):

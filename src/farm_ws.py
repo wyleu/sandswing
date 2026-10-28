@@ -98,18 +98,21 @@ def apply_static_ip(radio, ip):
     """Keep our usual address on a network whose DHCP will not give it (an
     extender hides our MAC from the router's reservation: 2026-10-26 the
     Pico got .253 instead of .81).  Netmask, gateway and DNS stay as the
-    DHCP lease set them.  Any failure leaves the DHCP address in place.
-    Returns the address now in use."""
+    DHCP lease set them.  Always set the address when one is configured,
+    even if DHCP happens to hand out the same one: setting it is what stops
+    the DHCP client, and 2026-10-28 13:52 a lease that agreed at the join
+    moved to .253 two seconds later.  Any failure leaves the DHCP address in
+    place.  Returns the address now in use."""
     if not ip:
         return radio.ipv4_address
     try:
         import ipaddress
         want = ipaddress.ip_address(ip)
-        if str(radio.ipv4_address) != str(want):
-            radio.set_ipv4_address(ipv4=want, netmask=radio.ipv4_subnet,
-                                   gateway=radio.ipv4_gateway,
-                                   ipv4_dns=getattr(radio, "ipv4_dns", None))
-            print("static IP", ip, "(DHCP gave %s)" % radio.ipv4_address)
+        was = str(radio.ipv4_address)
+        radio.set_ipv4_address(ipv4=want, netmask=radio.ipv4_subnet,
+                               gateway=radio.ipv4_gateway,
+                               ipv4_dns=getattr(radio, "ipv4_dns", None))
+        print("static IP", ip, "(DHCP gave %s)" % was)
     except Exception as e:
         print("static IP failed:", e)
     return radio.ipv4_address

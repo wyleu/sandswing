@@ -84,6 +84,9 @@ sandmon GPS NO Lock shows as stratum 16 / leap 3), `last_seq`, `uptime_s`,
 * Pico: a network entry in `settings.json` may carry `"static_ip"`: after the
   join the Pico keeps DHCP's netmask, gateway and DNS and swaps only its
   address (an extender hid the Pico's MAC from the router's reservation).
+  The address is set even when DHCP gave the same one: setting it stops the
+  DHCP client, which otherwise moved a matching lease to .253 two seconds
+  after the join (2026-10-28 13:52).
 * Pico LED6 (tower inactive): white = synced, amber = holdover (time server
   lost; strokes still carry utc_ms, err_ms grows), red = never synced.
 * Sandbells ingest: hello every 5 s; once a Pico heartbeat was seen on the
