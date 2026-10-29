@@ -87,12 +87,16 @@ _new = []                      # accepted this poll: replay + note in poll()
 _meta = {}                     # id(ws) -> {"at", "rx", "hb"}
 _recent = []                   # last REPLAY_N event messages (json str)
 _notes = []                    # (what, info) for concentrator.py
+_replies = []                  # queued HTTP replies (/status), oldest first: see _pump_replies
 _path = link_health.SendPath() # send-path state model: plan(now) says what is allowed
+_gate = link_health.StatusGate() # /status full or held, from the tower state: set_tower()
 _payload_fn = lambda: {}
 stats = {"connects": 0, "drops": 0, "refused": 0, "send_timeouts": 0,
          "silent_drops": 0, "refused_backoff": 0, "replays_done": 0,
          "cuts": 0, "lagging": 0, "superseded": 0, "starved": 0,
-         "stalls_answered": 0,
+         "stalls_answered": 0, "replies": 0, "replies_done": 0,
+         "replies_cancelled": 0, "replies_held": 0,
+         "last_reply_s": None, "last_reply_b": None,
          "last_drop_reason": None, "last_drop_at": None,
          "hb_seen": False, "last_rx_at": None}
 
@@ -192,28 +196,7 @@ def start_server(cfg, payload_fn):
 
         @server.route(path_status, GET)
         def status_route(request: Request):
-            t_route = time.monotonic()
-            try:
-                body = json.dumps(_payload_fn())
-            except MemoryError as e:             # fragmented heap: tidy, retry once
-                print("status payload error", e)
-                try:
-                    import gc
-                    gc.collect()
-                    body = json.dumps(_payload_fn())
-                except Exception as e2:
-                    print("status payload retry failed", e2)
-                    body = '{"error":"payload"}'
-            except Exception as e:
-                print("status payload error", e)
-                body = '{"error":"payload"}'
-            _last_route[0], _last_route[1] = path_status, time.monotonic() - t_route
-            return Response(
-                request,
-                body=body,
-                content_type="application/json",
-                headers={"Access-Control-Allow-Origin": "*"},
-            )
+            return route_status(request, path_status)
 
         @server.route(path_ws, GET)
         def ws_route(request: Request):
@@ -327,6 +310,198 @@ def _peer(ws):
         return str(ws._request.client_address[0])
     except Exception:
         return None
+
+
+_queued_cls = []
+
+
+def _queued_response_class():
+    """A Response whose _send() collects the bytes the library would have
+    written (headers, then body) and queues them as one reply job for
+    _pump_replies, leaving the socket open.  Built once, from the library's
+    Response, so the headers are exactly the library's."""
+    if not _queued_cls:
+        class QueuedResponse(Response):
+            def _send_bytes(self, conn, buffer):
+                self._out.append(bytes(buffer))
+
+            def _close_connection(self):
+                pass
+
+            def _send(self):
+                self._out = []
+                body = self._body.encode("utf-8") if isinstance(self._body, str) else self._body
+                self._send_headers(len(body), self._content_type)
+                self._out.append(body)
+                req = self._request
+                try:
+                    peer = str(req.client_address[0])
+                except Exception:
+                    peer = None
+                data = b"".join(self._out)
+                self._out = None
+                self._size = len(data)
+                _queue_reply(req.connection, data, peer)
+        _queued_cls.append(QueuedResponse)
+    return _queued_cls[0]
+
+
+def route_status(request, path_status="/status"):
+    """GET /status: the full document, or the held one while the tower
+    rings (StatusGate); either way queued for the reply writer."""
+    t_route = time.monotonic()
+    if _gate.state == link_health.STATUS_HELD:
+        # the tower is ringing: a few hundred bytes, no payload built
+        stats["replies_held"] += 1
+        _last_route[0], _last_route[1] = path_status, time.monotonic() - t_route
+        return _queued_response_class()(
+            request,
+            body=held_body(),
+            content_type="application/json",
+            headers={"Access-Control-Allow-Origin": "*",
+                     "Retry-After": str(link_health.STATUS_HELD_RETRY_S)},
+        )
+    try:
+        body = json.dumps(_payload_fn())
+    except MemoryError as e:             # fragmented heap: tidy, retry once
+        print("status payload error", e)
+        try:
+            import gc
+            gc.collect()
+            body = json.dumps(_payload_fn())
+        except Exception as e2:
+            print("status payload retry failed", e2)
+            body = '{"error":"payload"}'
+    except Exception as e:
+        print("status payload error", e)
+        body = '{"error":"payload"}'
+    _last_route[0], _last_route[1] = path_status, time.monotonic() - t_route
+    # not written here: queued, and written a chunk per poll turn
+    # (link_health REPLY_TRANSITIONS; one 5964 B send() stalled 10 s)
+    return _queued_response_class()(
+        request,
+        body=body,
+        content_type="application/json",
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+
+def held_body():
+    """The /status answer while the tower rings: a valid sand.status/v1
+    document (renders as one Tower section even in an unpatched Sandbells)
+    with held set, so a patched page keeps the last full status on screen."""
+    tower = _gate.tower
+    return json.dumps({
+        "schema": "sand.status/v1", "family": "sandswing", "held": "ringing",
+        "tower": tower, "retry_after_s": link_health.STATUS_HELD_RETRY_S,
+        "level": "ok",
+        "summary": "Ringing (%s): full status paused so strokes have the link" % tower,
+        "sections": [{"id": "tower", "title": "Tower", "items": [
+            {"key": "tower", "label": "Tower", "value": tower,
+             "level": "ok" if tower == "active" else "warn"}]}]})
+
+
+def set_tower(tower, now=None):
+    """TowerWatch's tower state, every tower step; StatusGate acts on changes."""
+    now = time.monotonic() if now is None else now
+    action = _gate.fire(tower, now)
+    if action == "hold":
+        cut = [j for j in _replies]
+        for job in cut:
+            _reply_event(job, "held", "tower %s" % tower)
+        _note("status_held", tower=tower, cancelled=len(cut))
+    elif action == "resume":
+        _note("status_resumed", tower=tower, held_replies=stats["replies_held"])
+    return action
+
+
+def _queue_reply(conn, data, peer=None, now=None):
+    """Hand a finished reply to the single writer (or turn it away)."""
+    now = time.monotonic() if now is None else now
+    job = {"conn": conn, "data": data, "done": 0, "at": now, "peer": peer,
+           "path": link_health.ReplyPath()}
+    stats["replies"] += 1
+    if len(_replies) >= link_health.REPLY_QUEUE_MAX:
+        _reply_event(job, "overflow", "%d replies queued" % len(_replies))
+        return job
+    try:
+        conn.setblocking(False)       # EAGAIN, not a wait, when lwIP has no room
+    except Exception:
+        pass
+    _replies.append(job)
+    return job
+
+
+def _reply_event(job, event, why=None):
+    """Tell a reply's ReplyPath what happened; do what REPLY_TRANSITIONS says."""
+    action = job["path"].fire(event)
+    if action in ("close", "abort"):
+        if job in _replies:
+            _replies.remove(job)
+        try:
+            job["conn"].close()
+        except Exception:
+            pass
+        took = round(time.monotonic() - job["at"], 2)
+        if action == "close":
+            stats["replies_done"] += 1
+            stats["last_reply_s"], stats["last_reply_b"] = took, len(job["data"])
+        else:
+            stats["replies_cancelled"] += 1
+            _note("reply_cancelled", why=event if why is None else str(why),
+                  sent_b=job["done"], size_b=len(job["data"]), took_s=took,
+                  peer=job["peer"])
+            print("%.3f /status reply cancelled (%s): %d of %d B in %.1f s"
+                  % (time.monotonic(), event if why is None else why,
+                     job["done"], len(job["data"]), took))
+    return action
+
+
+def _pump_replies(plan, deadline):
+    """The single reply writer: deadlines for every queued reply, then at
+    most REPLY_CHUNKS_PER_TURN chunks of REPLY_CHUNK_B for the oldest one,
+    inside the poll budget.  Nothing is written while the send path drains."""
+    now = time.monotonic()
+    for job in list(_replies):
+        if now - job["at"] > link_health.REPLY_DEADLINE_S:
+            _reply_event(job, "deadline", "deadline %.1f s" % link_health.REPLY_DEADLINE_S)
+    if not _replies or not plan.writes:
+        return
+    job = _replies[0]
+    _reply_event(job, "turn")
+    for _ in range(link_health.REPLY_CHUNKS_PER_TURN):
+        if deadline - time.monotonic() < link_health.MIN_SLICE_S:
+            return
+        chunk = memoryview(job["data"])[job["done"]:job["done"] + link_health.REPLY_CHUNK_B]
+        t0 = time.monotonic()
+        try:
+            n = job["conn"].send(chunk)
+        except OSError as e:
+            t1 = time.monotonic()
+            if e.errno == EAGAIN:                   # no room in lwIP now: next turn
+                _path.observe(t1, "reply", t1 - t0, True)
+                _reply_event(job, "blocked")
+                return
+            _path.observe(t1, "reply", t1 - t0, False)
+            _reply_event(job, "failed", _why(e))
+            return
+        t1 = time.monotonic()
+        job["done"] += n or 0
+        _path.observe(t1, "reply", t1 - t0, True)
+        if t1 - t0 >= link_health.STARVED_S:
+            # lwIP's ERR_MEM sleep, and we know which write it was: this
+            # stall is the reply's, answered by cancelling it and draining
+            _answered[0] += 1
+            _reply_event(job, "starved", "one %d B chunk took %.1f s" % (len(chunk), t1 - t0))
+            _starved("reply", t1 - t0)
+            return
+        if job["done"] >= len(job["data"]):
+            _reply_event(job, "done")
+            return
+        if not n or n < len(chunk):
+            _reply_event(job, "blocked")
+            return
+        _reply_event(job, "sent")
 
 
 def _busy_response(request, retry_after_s):
@@ -448,6 +623,7 @@ def _drop(ws, why, code=WS_GOING_AWAY, frame=True, how=None):
         if how is not None:                  # the ClientPath decided: say how, and
             info["how"] = how                # what was written since it was last heard
             info["peer"] = None if m is None else m["path"].peer
+            info["src"] = None if m is None else m.get("src")
             info["unheard_b"] = None if m is None else m["unheard_b"]
         _note("client_dropped", **info)
     print("%.3f WS client dropped: %s %s" % (time.monotonic(), why, _count()))
@@ -483,7 +659,7 @@ def _event(ws, event, why=None):
               how="%s %s->%s" % (action, before, event))
     elif action == link_health.HOLD:
         stats["lagging"] += 1
-        _note("client_lagging", peer=path.peer, unheard_b=m["unheard_b"],
+        _note("client_lagging", peer=path.peer, src=m.get("src"), unheard_b=m["unheard_b"],
               quiet_s=None if m["rx"] is None else round(time.monotonic() - m["rx"], 1))
         print("%.3f WS client lagging (%s): no frame for %d s, holding sends %s"
               % (time.monotonic(), path.peer, CLIENT_LAG_S, _count()))
@@ -610,6 +786,11 @@ def _receive(ws, now):
         if m is not None:
             m["rx"] = now
             m["unheard_b"] = 0
+            if m.get("src") is None and isinstance(msg, str) and '"src"' in msg:
+                try:                              # who it is: sandbells-page, the ingest...
+                    m["src"] = str(json.loads(msg).get("src"))[:24]
+                except Exception:
+                    m["src"] = "?"
             if not m["hb"]:
                 m["hb"] = True
                 stats["hb_seen"] = True
@@ -677,8 +858,13 @@ def poll():
             print("ws poll:", e)
         t_srv = time.monotonic()
         _path.observe(t_srv, "server", t_srv - t0, True)
+        if ws_bounds is not None and ws_bounds.last["reply_s"] >= link_health.STARVED_S:
+            _answered[0] += 1         # the library's own reply (handshake, 503): cause known
         _starved("server", t_srv - t0)
+    t_rep = time.monotonic()
+    _pump_replies(plan, deadline)
     t_srv = time.monotonic()
+    t_rep = t_srv - t_rep
     while plan.writes and _refused and (deadline - time.monotonic()
                                         >= link_health.MIN_SLICE_S + plan.close_s):
         _close(_refused.pop(), WS_TRY_AGAIN_LATER)
@@ -738,8 +924,8 @@ def poll():
         # say which part held the loop: the library's request handling,
         # the replay to a new client, or reading the existing clients
         t_end = time.monotonic()
-        print("%.3f ws poll took %.1f s: server %.1f, replay %.1f, read %.1f %s"
-              % (t_end, took, t_srv - t0, t_new - t_srv, t_end - t_new, _count()))
+        print("%.3f ws poll took %.1f s: server %.1f, replay %.1f, read %.1f, of which /status reply %.1f %s"
+              % (t_end, took, t_srv - t0, t_new - t_srv, t_end - t_new, t_rep, _count()))
         if _last_route[0]:
             print("  last route %s took %.1f s" % (_last_route[0], _last_route[1]))
         if ws_bounds is not None and t_srv - t0 > SLOW_POLL_S:
@@ -879,6 +1065,8 @@ def reset_state():
     del _recent[:]
     del _stalls[:]
     del _notes[:]
+    del _replies[:]
+    _gate.reset()
     _answered[0] = 0
     _path.reset()
     _meta.clear()
@@ -887,4 +1075,5 @@ def reset_state():
     stats["last_drop_reason"] = None
     stats["last_drop_at"] = None
     stats["last_rx_at"] = None
+    stats["last_reply_s"] = stats["last_reply_b"] = None
     stats["hb_seen"] = False

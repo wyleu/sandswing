@@ -439,6 +439,75 @@ def test_drain_constants_come_from_the_lwip_source():
 
 
 @case
+def test_reply_path_single_writer_table():
+    r = link_health.ReplyPath()
+    assert r.fire("sent") is None and r.state == link_health.R_WAITING   # not its turn yet
+    assert r.fire("turn") == "write" and r.state == link_health.R_SENDING
+    assert r.fire("blocked") == "yield" and r.fire("sent") == "write"
+    assert r.fire("done") == "close" and r.state == link_health.R_DONE
+    for ev in ("deadline", "failed", "starved"):
+        for st in (link_health.R_WAITING, link_health.R_SENDING):
+            r = link_health.ReplyPath()
+            r.state = st
+            assert r.fire(ev) == "abort" and r.state == link_health.R_CANCELLED, (st, ev)
+    r = link_health.ReplyPath()
+    assert r.fire("overflow") == "abort"
+
+
+@case
+def test_reply_constants_come_from_lwipopts_and_the_sandbells_proxy():
+    assert link_health.REPLY_CHUNK_B == link_health.TCP_MSS == 1460
+    assert link_health.REPLY_DEADLINE_S < 3.0          # Sandbells STATUS_TRY_TIMEOUT_S
+    assert link_health.STARVED_S < link_health.LWIP_ERR_MEM_S
+
+
+@case
+def test_a_failed_close_is_not_a_bad_send_but_a_slow_one_is():
+    sp = SendPath()
+    assert not sp.observe(1.0, "close", 0.0, False)       # EBADF at once: nothing about the link
+    assert sp.plan(1.0).state == SEND_OK
+    assert sp.observe(1.0, "close", link_health.SLOW_S["close"], False)
+    assert sp.plan(1.0).state == SEND_BACKOFF
+    assert SendPath().observe(1.0, "live", 0.0, False)    # other kinds: a failure still counts
+
+
+@case
+def test_doc_diagram_lists_every_reply_transition():
+    import os
+    doc = open(os.path.join(os.path.dirname(__file__), "..", "docs", "link-health.md")).read()
+    block = doc[doc.index("stateDiagram-v2", doc.index("## /status reply")):]
+    block = block[:block.index("```")]
+    for (st, ev), (nxt, action) in link_health.REPLY_TRANSITIONS.items():
+        assert "%s --> %s: %s" % (st, nxt, ev) in block, (st, ev, nxt)
+
+
+@case
+def test_status_gate_holds_while_the_tower_rings():
+    g = link_health.StatusGate()
+    assert g.fire("inactive") is None and g.state == link_health.STATUS_SERVE
+    assert g.fire("active") == "hold" and g.state == link_health.STATUS_HELD
+    assert g.fire("ringing_down") is None and g.state == link_health.STATUS_HELD
+    assert g.fire("active") is None
+    assert g.fire("bogus") is None and g.state == link_health.STATUS_HELD
+    assert g.fire("inactive") == "resume" and g.state == link_health.STATUS_SERVE
+    assert g.fire("ringing_down") == "hold"                  # amber alone holds too
+    for st in (link_health.R_WAITING, link_health.R_SENDING):
+        r = link_health.ReplyPath()
+        r.state = st
+        assert r.fire("held") == "abort"
+
+
+@case
+def test_doc_diagram_lists_every_status_gate_transition():
+    import os
+    doc = open(os.path.join(os.path.dirname(__file__), "..", "docs", "link-health.md")).read()
+    block = doc[doc.index("stateDiagram-v2", doc.index("### /status while the tower rings")):]
+    block = block[:block.index("```")]
+    for (st, ev), (nxt, action) in link_health.STATUS_TRANSITIONS.items():
+        assert "%s --> %s: %s" % (st, nxt, ev) in block, (st, ev, nxt)
+
+
+@case
 def test_existing_link_states_are_unchanged_by_the_send_path():
     # the Wi-Fi/client machine does not know about SendPath: same labels, same flow
     lh = LinkHealth()

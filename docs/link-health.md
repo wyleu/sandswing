@@ -282,6 +282,124 @@ night and a ringing session) shows no `ws poll took` of 5 s or more and no
 `timeout_s` 8 and `heartbeats {"ws_poll": 5}`.
 
 
+## /status reply: one 5964 B send() held the Pico 10 s (15:06 / 15:07)
+
+After send-deadline the slow-poll line named the cause:
+
+```
+ws poll took 10.1 s: server 10.1 ...
+server: request read 0.0 s, reply send 10.0 s (5964 B)
+link send_drain {'level': 3, ...} ... {'level': 4, ...} ... link_dead radio_reset
+```
+
+The library writes the whole /status body with one `send()`.  In CircuitPython
+10.0.3 `lwip_tcp_send()` hands it to `tcp_write()`; `lwipopts.h` for the
+raspberrypi port has `LWIP_NETIF_TX_SINGLE_PBUF 1`, so every new segment is a
+full `TCP_MSS` (1460 B) pbuf, taken from the port heap (`MEM_CUSTOM_ALLOCATOR`,
+`MEMP_MEM_MALLOC`), and the write is all or nothing: about 5 pbufs at once for
+5964 B.  When that fails (`ERR_MEM`) the C code steps the length down to an
+MSS multiple and sleeps 200 x 50 ms = `LWIP_ERR_MEM_S` (10 s) whatever the
+socket timeout.  `TCP_SND_BUF` (8 x MSS = 11680) would have room; it is the
+allocation, not the window.
+
+So `/status` is no longer written by the library.  The route builds the same
+reply (same headers, same JSON) and hands it to a **reply job** that the poll
+loop writes, a state model of its own (`REPLY_TRANSITIONS`):
+
+| constant | value | from |
+|---|---|---|
+| `REPLY_CHUNK_B` | 1460 | `TCP_MSS`: each `send()` needs at most one new pbuf |
+| `REPLY_CHUNKS_PER_TURN` | 1 | the gap to the next poll lets lwIP send, get the ACK and free |
+| `REPLY_DEADLINE_S` | 2.5 s | Sandbells `STATUS_TRY_TIMEOUT_S` is 3 s: a reply later than that is read by nobody |
+| `REPLY_QUEUE_MAX` | 2 | one being written, one waiting; a third is closed unanswered |
+
+* **Single writer**: only the oldest reply is written; the others wait in
+  `WAITING` (their deadline still runs).
+* The socket is non-blocking: no room in lwIP is `EAGAIN` -> `blocked`, the
+  writer yields to the next turn instead of waiting.
+* Nothing is written while the send path is in `SEND_DRAIN` (`plan.writes`).
+* `deadline`, `failed` or `starved` (one chunk took `STARVED_S` or more)
+  cancel the reply and close its socket; Sandbells shows the farm as
+  unreachable for one poll and asks again.
+
+```mermaid
+stateDiagram-v2
+    [*] --> WAITING
+    WAITING --> SENDING: turn
+    SENDING --> SENDING: turn
+    SENDING --> SENDING: sent
+    SENDING --> SENDING: blocked
+    SENDING --> DONE: done
+    WAITING --> CANCELLED: overflow
+    WAITING --> CANCELLED: deadline
+    SENDING --> CANCELLED: deadline
+    WAITING --> CANCELLED: failed
+    SENDING --> CANCELLED: failed
+    WAITING --> CANCELLED: starved
+    SENDING --> CANCELLED: starved
+    WAITING --> CANCELLED: held
+    SENDING --> CANCELLED: held
+```
+
+### /status while the tower rings (StatusGate)
+
+While TowerWatch says `active` (green) or `ringing_down` (amber) the stroke
+events get the link to themselves.  `concentrator._sync_ringing()` passes the
+tower state to `farm_ws.set_tower()` every tower step, and `StatusGate`
+(`STATUS_TRANSITIONS`) acts on the changes:
+
+```mermaid
+stateDiagram-v2
+    [*] --> SERVE
+    SERVE --> HELD: ringing
+    HELD --> SERVE: quiet
+```
+
+* `hold`: every full reply queued or being written is cancelled (`held`),
+  note `status_held {'tower': 'active', 'cancelled': N}`.
+* While `HELD`, `/status` builds no payload and answers 200 with a tiny
+  `sand.status/v1` document (under `STATUS_HELD_BODY_MAX` 512 B, one chunk,
+  through the same reply writer) and `Retry-After: 15`:
+  `{"schema": "sand.status/v1", "held": "ringing", "tower": "active",
+  "retry_after_s": 15, "level": "ok", "summary": "Ringing (active): ...",
+  "sections": [Tower]}`.  200, not 503: Sandbells' proxy treats any error
+  as "try the other address" and then 504 "Offline", so a 503 would double
+  the requests and show the farm offline during every ringing session.
+* `resume` (tower `inactive`): note `status_resumed`; the next poll gets the
+  full document.  Sandbells polls every `poll_hint_sec`, so the page is full
+  again within one poll; there are no status deltas to hold or resend.
+* Sandbells (patched, `sandbells-status-held.patch`): a `held` document
+  keeps the last full status on screen with the summary "Ringing: status
+  paused" instead of replacing it.  Unpatched it renders the one Tower
+  section; neither marks the device lost (that verdict comes from the
+  ingest WebSocket heartbeat, not /status).
+
+A chunk can still hit `ERR_MEM` (one pbuf not available): that is one 10 s
+stall, but its cause is known.  It cancels the reply, starts `SEND_DRAIN`, and
+counts as **answered** (`stalls_answered`), like a client cut, so reply stalls
+do not reach the radio reset.  The same goes for a server phase whose time
+went into the library's own reply (a handshake or a 503:
+`reply_s >= STARVED_S`).  A stall with no known cause still counts, and three
+in 300 s still reset the radio.
+
+`close` failures no longer raise the send backoff (`FAILURE_IS_BAD`): an
+`EBADF` close at 0.00 s (15:04:30, `close NEW->failed`) says the socket was
+already gone, not that lwIP is short; a *slow* close still counts.
+
+Log after deploy:
+
+* `ws poll took` lines should be gone; if one appears its tail says
+  `of which /status reply X`.
+* `/status reply cancelled (deadline 2.5 s): 2920 of 5964 B in 2.5 s` and
+  `link reply_cancelled {...}`: lwIP was slow to drain; rare is fine.
+* `/status reply cancelled (one 1460 B chunk took 10.0 s)`: the heap was out
+  even for one pbuf; expect `send_drain` and **no** `link_dead` after it.
+* `net` in /status and the heartbeat: `replies`, `replies_done`,
+  `replies_cancelled`, `last_reply_s` (expect well under 1 s),
+  `last_reply_b`.
+* `client_lagging` / `client_dropped` now carry `src` from the client's hello
+  (`sandbells-page` for the kiosk page; the ingest's own `src`).
+
 ## State diagram (Wi-Fi and clients)
 
 The state name is only a label; the reset decisions are guarded by flags

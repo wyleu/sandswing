@@ -108,7 +108,13 @@ CLOSE_TIMEOUT_S = 0.1        # a close frame to a stuck peer
 MIN_SLICE_S = 0.05           # not worth starting a send with less budget than this
 
 # A call that took this long counts as a bad send, whether or not it raised.
-SLOW_S = {"replay": 0.2, "live": 0.3, "server": 1.0, "close": 0.15, "poll": 1.5}
+SLOW_S = {"replay": 0.2, "live": 0.3, "server": 1.0, "close": 0.15, "poll": 1.5,
+          "reply": 0.3}
+# A call that RAISED counts as a bad send only for these kinds.  A close frame
+# that fails at once (2026-10-29 15:04:30: EBADF, 0.00 s, on a socket the
+# library had already shut) says nothing about the link: only a slow close
+# counts.  (Every other kind: a failure is bad, as before.)
+FAILURE_IS_BAD = {"close": False}
 
 # CircuitPython 10.0.3 ports/raspberrypi/common-hal/socketpool/Socket.c
 # lwip_tcp_send(): `for (i = 0; i < 200; ++i) { tcp_write(); ... if ERR_MEM:
@@ -272,7 +278,8 @@ class SendPath:
     def observe(self, now, kind, took_s, ok=True):
         """One send/serve call finished (or failed) after took_s.  True if bad."""
         self._timed(now)
-        bad = (not ok) or took_s >= SLOW_S.get(kind, SEND_TIMEOUT_S)
+        bad = (not ok and FAILURE_IS_BAD.get(kind, True)) \
+            or took_s >= SLOW_S.get(kind, SEND_TIMEOUT_S)
         if bad:
             self.bad_count += 1
             self.last_bad = now
@@ -376,6 +383,124 @@ class ClientPath:
 
     def writes(self):
         return CLIENT_WRITES[self.state]
+
+
+# ---------------------------------------------------------------------------
+# HTTP replies (/status) written by farm_ws, not by the library.  One table.
+#
+# Why: 2026-10-29 15:06:41 and 15:07:17, `server: request read 0.0 s, reply
+# send 10.0 s (5964 B)`: the /status reply that Sandbells' proxy fetches
+# (bells/views.py farm_device_status, every poll_hint_sec per visible farm
+# page) went to lwIP as ONE socket.send() of the whole body.  lwip_tcp_send()
+# (Socket.c) hands tcp_write() up to the free send buffer (TCP_SND_BUF =
+# 8 x TCP_MSS = 11680 B, lwipopts.h), so all 5964 B in one call.  The Pico W
+# build sets LWIP_NETIF_TX_SINGLE_PBUF 1, so tcp_write() allocates every new
+# segment as a full TCP_MSS pbuf (lwIP tcp_out.c tcp_pbuf_prealloc: "alloc =
+# max_length"), from CircuitPython's port heap (MEM_CUSTOM_ALLOCATOR,
+# lwip_mem.c port_malloc; MEMP_MEM_MALLOC 1, so segment records too), and it
+# is all or nothing: ~5 MSS pbufs at once for 5964 B.  One that cannot be had
+# is ERR_MEM; the C loop steps the length down to one MSS and then sleeps
+# 200 x 50 ms.  Nothing in Python can cut that sleep short.
+#
+# So a reply is a job of its own: the library's Response._send only collects
+# the bytes, farm_ws writes them, ONE chunk per poll turn, on a non-blocking
+# socket.  A chunk of at most TCP_MSS needs at most one new pbuf (it first
+# fills the free tail of the last unsent segment), and the turn between
+# chunks lets lwIP send, get the ACK and free the one before.  One reply is
+# written at a time (a single writer); a send that would block (EAGAIN, a
+# short write) yields to the next turn; REPLY_DEADLINE_S ends it whatever.
+# ---------------------------------------------------------------------------
+TCP_MSS = 1460                   # lwipopts.h
+REPLY_CHUNK_B = TCP_MSS          # at most one new pbuf per send(): 5964 B in 5 turns
+REPLY_CHUNKS_PER_TURN = 1
+# Sandbells' proxy gives a device STATUS_TRY_TIMEOUT_S = 3 s per address
+# (8 s when it has only one): a reply later than that is read by nobody.
+REPLY_DEADLINE_S = 2.5
+REPLY_QUEUE_MAX = 2              # one being written, one waiting; more are closed unanswered
+
+R_WAITING = "WAITING"            # queued behind the reply being written
+R_SENDING = "SENDING"            # the single writer: REPLY_CHUNKS_PER_TURN chunks per turn
+R_DONE = "DONE"                  # all bytes handed to lwIP; socket closed
+R_CANCELLED = "CANCELLED"        # deadline, error, lwIP starved, or no room: socket closed
+
+# Actions: write (go on writing this turn), yield (stop until the next turn),
+# close (finished: close the socket), abort (give up: close it, count it).
+# Events: turn (the writer is free), sent (a whole chunk went), blocked
+# (EAGAIN or a short write: lwIP has no room now), done (last byte went),
+# deadline (REPLY_DEADLINE_S passed), failed (a socket error), starved (one
+# send took STARVED_S+), overflow (REPLY_QUEUE_MAX replies already queued).
+REPLY_TRANSITIONS = {
+    (R_WAITING, "turn"):     (R_SENDING, "write"),
+    (R_SENDING, "turn"):     (R_SENDING, "write"),
+    (R_SENDING, "sent"):     (R_SENDING, "write"),
+    (R_SENDING, "blocked"):  (R_SENDING, "yield"),
+    (R_SENDING, "done"):     (R_DONE, "close"),
+    (R_WAITING, "overflow"): (R_CANCELLED, "abort"),
+}
+for _st in (R_WAITING, R_SENDING):
+    REPLY_TRANSITIONS[(_st, "deadline")] = (R_CANCELLED, "abort")
+    REPLY_TRANSITIONS[(_st, "failed")] = (R_CANCELLED, "abort")
+    REPLY_TRANSITIONS[(_st, "starved")] = (R_CANCELLED, "abort")
+    REPLY_TRANSITIONS[(_st, "held")] = (R_CANCELLED, "abort")     # the tower started ringing
+del _st
+
+
+class ReplyPath:
+    """One queued HTTP reply.  fire(event) -> action or None."""
+    def __init__(self):
+        self.state = R_WAITING
+        self.last_event = None
+
+    def fire(self, event):
+        nxt = REPLY_TRANSITIONS.get((self.state, event))
+        if nxt is None:
+            return None
+        self.state, action = nxt
+        self.last_event = event
+        return action
+
+
+# --- /status gated by the tower -------------------------------------------
+#
+# While the tower rings (TowerWatch "active" green, "ringing_down" amber) the
+# stroke events get the link to themselves: /status is answered with a tiny
+# sand.status/v1 document (STATUS_HELD_BODY_MAX bytes at most, one chunk) and
+# a Retry-After, and a full reply being written when the ringing starts is
+# cancelled ("held").  Back to "inactive", the next /status is the full one.
+# There are no status deltas to hold: Sandbells polls the full document.
+
+STATUS_SERVE = "SERVE"           # full /status, through the reply writer
+STATUS_HELD = "HELD"             # tower ringing: tiny "held" reply only
+
+TOWER_EVENT = {"active": "ringing", "ringing_down": "ringing", "inactive": "quiet"}
+
+STATUS_TRANSITIONS = {
+    (STATUS_SERVE, "ringing"): (STATUS_HELD, "hold"),      # cancel full replies in flight
+    (STATUS_HELD, "quiet"):    (STATUS_SERVE, "resume"),   # next request gets the full page
+}
+
+STATUS_HELD_RETRY_S = 15         # Retry-After: Sandbells' default poll_hint_sec
+STATUS_HELD_BODY_MAX = 512       # well inside one REPLY_CHUNK_B
+
+
+class StatusGate:
+    """fire(tower) with TowerWatch's tower string -> action or None."""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.state = STATUS_SERVE
+        self.tower = "inactive"
+        self.since = None
+
+    def fire(self, tower, now=None):
+        self.tower = tower
+        nxt = STATUS_TRANSITIONS.get((self.state, TOWER_EVENT.get(tower)))
+        if nxt is None:
+            return None
+        self.state, action = nxt
+        self.since = now
+        return action
 
 
 class LinkHealth:

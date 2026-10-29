@@ -652,6 +652,8 @@ class Concentrator:
         ringing = self.tower.tower in ("active", "ringing_down")
         if self.sntp is not None:
             self.sntp.set_ringing(ringing)
+        if hasattr(farm_ws, "set_tower"):    # /status held while ringing (link_health StatusGate)
+            farm_ws.set_tower(self.tower.tower)
 
     def _tower_step(self):
         self._sync_ringing()

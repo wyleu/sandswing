@@ -755,6 +755,303 @@ def test_nothing_is_written_while_lwip_drains_and_it_all_goes_out_after():
     assert conn.data[before:].endswith(b'{"seq": 1}') and b'"hb"' not in conn.data[before:]
 
 
+# --- 2026-10-29 15:06/15:07: the /status reply, 5964 B in one send() -------
+
+class ReplyConn:
+    """An accepted /status socket.  `cost(n)` -> seconds one send() of n bytes
+    sleeps inside lwIP; `eagain` makes every send raise EAGAIN."""
+    def __init__(self, clock, cost=None, eagain=False):
+        self.clock, self.cost, self.eagain = clock, cost, eagain
+        self.sends = []                 # (clock time, bytes asked)
+        self.data = bytearray()
+        self.closed = False
+        self.blocking = True
+
+    def setblocking(self, flag):
+        self.blocking = flag
+
+    def send(self, view):
+        self.sends.append((self.clock.t, len(view)))
+        if self.eagain:
+            raise OSError(farm_ws.EAGAIN, "EAGAIN")
+        if self.cost:
+            self.clock.t += self.cost(len(view))
+        self.data.extend(bytes(view))
+        return len(view)
+
+    def close(self):
+        self.closed = True
+
+
+STATUS_B = 5964                         # the logged reply size
+
+
+def lh_obs(clock, n_clients=0):
+    return {"wifi_up": True, "n_clients": n_clients, "hb_seen": True, "last_rx_age_s": 1.0,
+            "tower_inactive": True, "quiet_ms": 999999,
+            "stalls": farm_ws.stalls_since(clock.t, 300.0)}
+
+
+@case
+def test_status_reply_goes_out_one_mss_chunk_per_turn_and_never_blocks_the_poll():
+    farm_ws.reset_state()
+    with fake_clock() as clock:
+        conn = ReplyConn(clock)
+        farm_ws._queue_reply(conn, b"x" * STATUS_B, "192.168.0.125")
+        assert not conn.blocking                          # EAGAIN, not a wait
+        turns = 0
+        while not conn.closed and turns < 50:
+            n_before = len(conn.sends)
+            farm_ws.poll()
+            assert len(conn.sends) - n_before <= link_health.REPLY_CHUNKS_PER_TURN
+            turns += 1
+            clock.t += 0.05
+    assert bytes(conn.data) == b"x" * STATUS_B
+    assert max(n for _, n in conn.sends) <= link_health.REPLY_CHUNK_B == link_health.TCP_MSS
+    assert turns == -(-STATUS_B // link_health.REPLY_CHUNK_B) == 5, turns
+    assert farm_ws.stats["replies_done"] == 1 and farm_ws.stats["last_reply_b"] == STATUS_B
+
+
+@case
+def test_reply_under_a_starved_lwip_is_cancelled_drained_and_answered_not_reset():
+    """15:06:41 and 15:07:17 again, with the writer: a chunk sleeps 10 s in
+    lwIP.  The reply is cancelled, the send path drains, the stall is the
+    reply's (answered), and two of them do not reach the radio reset."""
+    import io, contextlib
+    farm_ws.reset_state()
+    lh = link_health.LinkHealth()
+    real = farm_ws.time.monotonic
+    clock = Clock()
+    farm_ws.time.monotonic = clock
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            for n in range(3):
+                conn = ReplyConn(clock, cost=lambda b: link_health.LWIP_ERR_MEM_S)
+                farm_ws._queue_reply(conn, b"x" * STATUS_B, "192.168.0.125")
+                farm_ws.poll()
+                assert conn.closed and len(conn.sends) == 1, n     # one chunk, then cancelled
+                assert farm_ws._path.state == link_health.SEND_DRAIN
+                _, ev = lh.update(clock.t, lh_obs(clock))
+                assert "radio_reset" not in ev, (n, ev)
+                clock.t += 36.0                                    # 15:06:41 -> 15:07:17
+                farm_ws.poll()
+    finally:
+        farm_ws.time.monotonic = real
+    assert farm_ws.stats["replies_cancelled"] == 3 and farm_ws.stats["stalls_answered"] == 3
+    assert farm_ws.stalls_since(clock.t, 300.0) == 0
+    notes = [i for w, i in farm_ws.take_link_notes() if w == "reply_cancelled"]
+    assert notes and "took 10.0 s" in notes[0]["why"] and notes[0]["size_b"] == STATUS_B, notes
+
+
+@case
+def test_reply_that_lwip_never_takes_is_cancelled_at_its_deadline():
+    farm_ws.reset_state()
+    with fake_clock(step=0.001) as clock:
+        conn = ReplyConn(clock, eagain=True)
+        farm_ws._queue_reply(conn, b"x" * STATUS_B)
+        t0, worst = clock.t, 0.0
+        while not conn.closed and clock.t - t0 < 10.0:
+            a = clock.t
+            farm_ws.poll()
+            worst = max(worst, clock.t - a)
+            clock.t += 0.05
+    assert conn.closed and farm_ws.stats["replies_cancelled"] == 1
+    assert link_health.REPLY_DEADLINE_S <= clock.t - t0 <= link_health.REPLY_DEADLINE_S + 0.2
+    assert worst < 0.1, worst                         # EAGAIN yields: the poll is never held
+    notes = dict(farm_ws.take_link_notes())
+    assert "deadline" in notes["reply_cancelled"]["why"], notes
+
+
+@case
+def test_one_reply_is_written_at_a_time_and_a_third_is_turned_away():
+    farm_ws.reset_state()
+    with fake_clock() as clock:
+        a, b, c = ReplyConn(clock), ReplyConn(clock), ReplyConn(clock)
+        farm_ws._queue_reply(a, b"a" * 3000)
+        farm_ws._queue_reply(b, b"b" * 3000)
+        farm_ws._queue_reply(c, b"c" * 3000)              # REPLY_QUEUE_MAX = 2: closed at once
+        assert c.closed and not c.sends
+        farm_ws.poll()
+        assert a.sends and not b.sends                    # the single writer
+        while not a.closed:
+            clock.t += 0.05
+            farm_ws.poll()
+            assert not b.sends or a.closed
+        while not b.closed:
+            clock.t += 0.05
+            farm_ws.poll()
+    assert bytes(a.data) == b"a" * 3000 and bytes(b.data) == b"b" * 3000
+    assert farm_ws.stats["replies_done"] == 2 and farm_ws.stats["replies_cancelled"] == 1
+
+
+@case
+def test_nothing_of_a_reply_is_written_while_the_send_path_drains():
+    farm_ws.reset_state()
+    with fake_clock() as clock:
+        farm_ws._path.observe(clock.t, "server", link_health.LWIP_ERR_MEM_S, True)
+        assert farm_ws._path.state == link_health.SEND_DRAIN
+        conn = ReplyConn(clock)
+        farm_ws._queue_reply(conn, b"x" * 1000)
+        run_polls(clock, 1.0)
+    assert not conn.sends                             # held, and its deadline still runs
+
+
+@case
+def test_queued_response_collects_the_librarys_headers_and_body():
+    class LibResponse:                                # the part of 4.7.1 Response it uses
+        def __init__(self, request, body="", content_type=None, headers=None):
+            self._request, self._body, self._content_type = request, body, content_type
+        def _send_headers(self, content_length=None, content_type=None):
+            self._send_bytes(self._request.connection,
+                             ("HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % content_length).encode())
+        def _send_bytes(self, conn, buf):
+            raise AssertionError("must not write")
+    farm_ws.reset_state()
+    saved = (farm_ws.Response, list(farm_ws._queued_cls))
+    farm_ws.Response = LibResponse
+    del farm_ws._queued_cls[:]
+    try:
+        with fake_clock() as clock:
+            conn = ReplyConn(clock)
+            req = types.SimpleNamespace(connection=conn, client_address=("192.168.0.125", 5))
+            resp = farm_ws._queued_response_class()(req, body='{"a": 1}', content_type="application/json")
+            resp._send()                              # what Server.poll() calls
+            assert not conn.sends and not conn.closed and len(farm_ws._replies) == 1
+            run_polls(clock, 0.5)
+    finally:
+        farm_ws.Response = saved[0]
+        farm_ws._queued_cls[:] = saved[1]
+    assert bytes(conn.data) == b'HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n{"a": 1}' and conn.closed
+
+
+@case
+def test_a_server_phase_stall_in_the_librarys_own_reply_is_answered():
+    import io, contextlib
+    import ws_bounds
+    farm_ws.reset_state()
+    with fake_clock() as clock:
+        class Srv:
+            def poll(self):
+                clock.t += link_health.LWIP_ERR_MEM_S
+                ws_bounds.last["reply_s"] = link_health.LWIP_ERR_MEM_S    # a handshake / 503
+        farm_ws._server = Srv()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                farm_ws.poll()
+        finally:
+            farm_ws._server = None
+    assert farm_ws.stalls_since(clock.t, 300.0) == 0 and farm_ws.stats["stalls_answered"] == 1
+
+
+@case
+def test_a_close_frame_that_fails_at_once_does_not_raise_the_backoff():
+    """15:04:30: 'close NEW->failed' EBADF, then send_backoff 'close failed 0.00 s'."""
+    farm_ws.reset_state()
+    class DeadConn(FakeConn):
+        def send(self, view):
+            raise OSError(9, "EBADF")
+        def close(self):
+            pass
+    ws = farm_ws._accept(peer_ws(DeadConn(), DISPLAY))
+    farm_ws._event(ws, "failed", OSError(9, "EBADF"))
+    assert farm_ws._path.state == link_health.SEND_OK, farm_ws._path.state
+    assert not [w for w, _ in farm_ws.take_link_notes() if w == "send_backoff"]
+
+
+@case
+def test_hello_src_says_which_client_it_was():
+    farm_ws.reset_state()
+    with fake_clock() as clock:
+        page = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))
+        page.on_receive = ['{"schema":"sand.hello/v1","type":"heartbeat","src":"sandbells-page"}']
+        farm_ws.poll()
+        clock.t += link_health.CLIENT_LAG_S + 1
+        farm_ws.poll()
+    lag = [i for w, i in farm_ws.take_link_notes() if w == "client_lagging"][0]
+    assert lag["src"] == "sandbells-page", lag
+
+
+# --- tower ringing: /status held so strokes have the link ------------------
+
+class _HdrResponse:                        # the part of the library Response used
+    def __init__(self, request, body="", content_type=None, headers=None):
+        self._request, self._body, self._content_type = request, body, content_type
+        self._headers = dict(headers or {})
+    def _send_headers(self, content_length=None, content_type=None):
+        h = "".join("%s: %s\r\n" % kv for kv in sorted(self._headers.items()))
+        self._send_bytes(self._request.connection,
+                         ("HTTP/1.1 200 OK\r\nContent-Length: %d\r\n%s\r\n"
+                          % (content_length, h)).encode())
+    def _send_bytes(self, conn, buf):
+        raise AssertionError("must not write")
+
+
+def _status_get(clock, payload_calls):
+    """One GET /status through route_status and the reply writer -> raw bytes."""
+    saved = (farm_ws.Response, list(farm_ws._queued_cls), farm_ws._payload_fn)
+    farm_ws.Response = _HdrResponse
+    del farm_ws._queued_cls[:]
+    farm_ws._payload_fn = lambda: payload_calls.append(1) or {"schema": "sand.status/v1",
+                                                                "pad": "x" * 5800}
+    try:
+        conn = ReplyConn(clock)
+        req = types.SimpleNamespace(connection=conn, client_address=("192.168.0.125", 5))
+        farm_ws.route_status(req)._send()
+        turns = 0
+        while not conn.closed and turns < 20:
+            farm_ws.poll()
+            clock.t += 0.05
+            turns += 1
+    finally:
+        farm_ws.Response, farm_ws._payload_fn = saved[0], saved[2]
+        farm_ws._queued_cls[:] = saved[1]
+    return bytes(conn.data), turns
+
+
+@case
+def test_while_the_tower_rings_status_is_a_tiny_held_document_with_retry_after():
+    farm_ws.reset_state()
+    calls = []
+    with fake_clock() as clock:
+        full, turns_full = _status_get(clock, calls)
+        assert farm_ws.set_tower("active") == "hold"
+        held, turns_held = _status_get(clock, calls)
+        assert farm_ws.set_tower("ringing_down") is None          # still ringing: still held
+        held2, _ = _status_get(clock, calls)
+        assert farm_ws.set_tower("inactive") == "resume"
+        back, _ = _status_get(clock, calls)
+    assert len(calls) == 2                                    # no payload built while held
+    assert turns_full >= 5 and turns_held == 1
+    head, body = held.split(b"\r\n\r\n", 1)
+    assert b"Retry-After: %d" % link_health.STATUS_HELD_RETRY_S in head
+    assert len(held) <= link_health.STATUS_HELD_BODY_MAX <= link_health.REPLY_CHUNK_B, len(held)
+    doc = json.loads(body)
+    assert doc["schema"] == "sand.status/v1" and doc["held"] == "ringing" and doc["tower"] == "active"
+    assert doc["sections"][0]["items"][0]["value"] == "active"
+    assert json.loads(held2.split(b"\r\n\r\n", 1)[1])["tower"] == "ringing_down"
+    assert b'"pad"' in back and b"Retry-After" not in back       # full page again
+    notes = [w for w, _ in farm_ws.take_link_notes()]
+    assert "status_held" in notes and "status_resumed" in notes
+    assert farm_ws.stats["replies_held"] == 2
+
+
+@case
+def test_ringing_cancels_the_full_reply_being_written():
+    farm_ws.reset_state()
+    with fake_clock() as clock:
+        conn = ReplyConn(clock)
+        farm_ws._queue_reply(conn, b"x" * STATUS_B)
+        farm_ws.poll()                                      # one chunk out
+        assert len(conn.sends) == 1 and not conn.closed
+        farm_ws.set_tower("active")
+        assert conn.closed and not farm_ws._replies
+        clock.t += 0.05
+        farm_ws.poll()
+    assert len(conn.sends) == 1                             # nothing more written
+    held = [i for w, i in farm_ws.take_link_notes() if w == "status_held"]
+    assert held and held[0]["cancelled"] == 1, held
+
+
 def kiosk_session(seconds, drain_bps, cap=3000):
     """A display that reconnects half a second after every drop, against an lwIP
     queue model.  Returns (stall times, 503 count, replays done, connects)."""
