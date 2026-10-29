@@ -296,4 +296,31 @@ def test_install_server_patches_both_methods():
     assert not ws_bounds.install_server(type("Other", (), {}))
 
 
+@case
+def test_reply_send_and_request_read_say_what_they_cost():
+    """A 10 s server phase in the log is split into the request read and the
+    reply send (where lwIP's ERR_MEM sleep would be)."""
+    class SleepyConn(Conn):
+        def send(self, view):
+            ws_bounds._now.t += 10.0                  # the C sleep inside one send()
+            return Conn.send(self, view)
+    ws_bounds.clear_last()
+    conn = SleepyConn(send=[5])
+    try:
+        with_clock(lambda: ws_bounds.bounded_send_bytes(Resp(), conn, b"hello"))
+    except OSError:
+        pass
+    assert ws_bounds.last["reply_s"] >= 10.0 and ws_bounds.last["reply_b"] == 5, ws_bounds.last
+
+    class Srv:
+        _buffer = bytearray(64)
+    ws_bounds.clear_last()
+    got = with_clock(lambda: ws_bounds.bounded_receive_header_bytes(
+        Srv(), Conn(recv=[OSError(errno.ETIMEDOUT, "t")])))
+    assert got == b"" and 0 < ws_bounds.last["read_s"] < 1.0, ws_bounds.last
+    ws_bounds.clear_last()
+    assert ws_bounds.last == {"read_s": 0.0, "reply_s": 0.0, "reply_b": 0}
+
+
+
 finish()

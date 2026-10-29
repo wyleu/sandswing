@@ -31,27 +31,43 @@ REQ_BOUND_S = link_health.REQ_BOUND_S      # most the library may spend reading 
 
 _now = time.monotonic       # tests replace this
 
+# What the library's last request cost, by part, so a slow "server" phase in
+# farm_ws's log says which part held it: reading the request (socket timeout
+# per recv, REQ_BOUND_S overall) or sending the reply (where lwIP's ERR_MEM
+# sleep lives).  farm_ws clears it before each Server.poll().
+last = {"read_s": 0.0, "reply_s": 0.0, "reply_b": 0}
+
+
+def clear_last():
+    last["read_s"] = last["reply_s"] = 0.0
+    last["reply_b"] = 0
+
 
 def bounded_send_bytes(self, conn, buffer):
     sent = 0
     total = len(buffer)
     view = memoryview(buffer)
-    deadline = _now() + SEND_BOUND_S
-    while sent < total:
-        try:
-            n = conn.send(view[sent:])
-        except OSError as exc:
-            if exc.errno == EAGAIN:
-                if _now() > deadline:
-                    raise OSError(ETIMEDOUT, "send timeout %.1f s" % SEND_BOUND_S)
-                continue
-            if exc.errno == ECONNRESET:
-                return
-            raise
-        if n:
-            sent += n
-        if sent < total and _now() > deadline:      # trickling bytes counts too
-            raise OSError(ETIMEDOUT, "send timeout %.1f s" % SEND_BOUND_S)
+    t0 = _now()
+    deadline = t0 + SEND_BOUND_S
+    try:
+        while sent < total:
+            try:
+                n = conn.send(view[sent:])
+            except OSError as exc:
+                if exc.errno == EAGAIN:
+                    if _now() > deadline:
+                        raise OSError(ETIMEDOUT, "send timeout %.1f s" % SEND_BOUND_S)
+                    continue
+                if exc.errno == ECONNRESET:
+                    return
+                raise
+            if n:
+                sent += n
+            if sent < total and _now() > deadline:      # trickling bytes counts too
+                raise OSError(ETIMEDOUT, "send timeout %.1f s" % SEND_BOUND_S)
+    finally:
+        last["reply_s"] += _now() - t0
+        last["reply_b"] += sent
     self._size += sent
 
 
@@ -148,19 +164,23 @@ def bounded_receive_header_bytes(self, sock):
     returns 0 at once, for ever) or dribbles bytes ends the read instead of
     spinning.  Seen: Server.poll() took 49.6 s in here, the whole Pico stalled."""
     received = b""
-    deadline = _now() + REQ_BOUND_S
-    while b"\r\n\r\n" not in received:
-        try:
-            length = sock.recv_into(self._buffer, len(self._buffer))
-        except OSError as ex:
-            if ex.errno == ETIMEDOUT:
+    t0 = _now()
+    deadline = t0 + REQ_BOUND_S
+    try:
+        while b"\r\n\r\n" not in received:
+            try:
+                length = sock.recv_into(self._buffer, len(self._buffer))
+            except OSError as ex:
+                if ex.errno == ETIMEDOUT:
+                    break
+                raise
+            if not length:                       # closed by the peer
                 break
-            raise
-        if not length:                       # closed by the peer
-            break
-        received += self._buffer[:length]
-        if _now() > deadline:
-            break
+            received += self._buffer[:length]
+            if _now() > deadline:
+                break
+    finally:
+        last["read_s"] += _now() - t0
     return received
 
 
