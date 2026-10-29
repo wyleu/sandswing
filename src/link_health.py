@@ -26,9 +26,17 @@ Events (returned by update)
     gateway_fail, radio_reset, pico_reset, quiet
 
 A second, independent machine (SendPath, below) models the /ws send path:
-SEND_OK, SEND_BACKOFF, SEND_DEGRADED.  It is table-driven: SEND_LEVELS and
-SEND_TRANSITIONS are the whole policy, farm_ws.py only asks it "may I accept?
-how many events do I replay, how fast, with what send budget?" and obeys.
+SEND_OK, SEND_BACKOFF, SEND_DEGRADED, SEND_DRAIN.  It is table-driven:
+SEND_LEVELS and SEND_TRANSITIONS are the whole policy, farm_ws.py only asks it
+"may I serve requests, accept, write?  how many events do I replay, how fast,
+with what send budget?" and obeys.
+
+A third (ClientPath, below) is one small machine per /ws client: NEW, LIVE,
+LAGGING, GONE.  CLIENT_TRANSITIONS says what happens to THAT client when it
+is heard, goes quiet, misses a send deadline, or is replaced by a newer
+connection from the same peer; farm_ws.py only reports the facts and does the
+action the table returns (hold, resume, close, cut).  A client that is not
+reading is cut on its own; the radio and the other clients are not touched.
 
 The state name is only a label.  What stops a reset repeating are the flags
 (`_latched` for silence, `_stall_reset_at` for stalls, `_radio_reset_at` for
@@ -86,6 +94,8 @@ RADIO_RESET_SETTLE_S = 60.0
 SEND_OK = "SEND_OK"                  # replay and pace as configured at level 0
 SEND_BACKOFF = "SEND_BACKOFF"        # a send was slow/failed: refuse new clients (503)
 SEND_DEGRADED = "SEND_DEGRADED"      # accepting again, but gentler replay until calm
+SEND_DRAIN = "SEND_DRAIN"            # lwIP ran out of buffers: no request served, nothing
+                                     # written, until lwIP has aborted what was closed
 
 # Per-poll hard budget and the bounds every blocking wait must sit under.
 # ws_bounds.py and farm_ws.py take their numbers from here.
@@ -99,6 +109,28 @@ MIN_SLICE_S = 0.05           # not worth starting a send with less budget than t
 
 # A call that took this long counts as a bad send, whether or not it raised.
 SLOW_S = {"replay": 0.2, "live": 0.3, "server": 1.0, "close": 0.15, "poll": 1.5}
+
+# CircuitPython 10.0.3 ports/raspberrypi/common-hal/socketpool/Socket.c
+# lwip_tcp_send(): `for (i = 0; i < 200; ++i) { tcp_write(); ... if ERR_MEM:
+# mp_hal_delay_ms(50); }`.  The worst one socket.send() can block, whatever
+# the socket timeout; the logs show it: "server slow 10.06 s".
+LWIP_ERR_MEM_S = 200 * 0.050
+# A single send/serve call this long can only be that C sleep: the longest
+# Python-side wait is SEND_TIMEOUT_S (0.4 s) for a frame, REQ_BOUND_S +
+# REPLY_BOUND_S (0.6 s) for the library, and a healthy Pico never logs a
+# poll slower than SLOW_POLL_S (2.0 s, farm_ws).  lwIP is out of buffers.
+STARVED_S = 2.0
+
+# Same file: a closed TCP socket that has not finished closing cleanly is
+# aborted by lwIP (and its queued segments freed) after
+# MICROPY_PY_LWIP_TCP_CLOSE_TIMEOUT_MS = 10000, checked by tcp_poll every
+# 2 x 250 ms lwIP slow-timer ticks.  Until then whatever was written to a peer
+# that is not acknowledging stays in lwIP's shared pools (MEMP_NUM_TCP_SEG 16,
+# ports/raspberrypi/lwip_inc/lwipopts.h): every further send, to anyone,
+# risks the 10 s sleep again.  SEND_DRAIN waits that out, plus one tcp_poll step.
+CLOSE_ABORT_S = 10.0
+TCP_POLL_STEP_S = 0.5
+DRAIN_S = CLOSE_ABORT_S + TCP_POLL_STEP_S
 
 # Level 0 is SEND_OK.  A bad send raises the level by one (capped at the last
 # row); SEND_BACKOFF lasts hold_s; SEND_DEGRADED then lasts calm_s at that
@@ -121,9 +153,16 @@ SEND_LEVELS = (
 SEND_MAX_LEVEL = len(SEND_LEVELS) - 1
 
 # (state, event) -> (next state, level change).  A pair not listed changes
-# nothing.  Events: bad (slow or failed send), hold_over (hold_s elapsed),
-# calm (calm_s without a bad send), level0 (calm brought the level to 0).
+# nothing.  Events: bad (slow or failed send), starved (one call took
+# STARVED_S or more: lwIP out of buffers), drained (DRAIN_S elapsed),
+# hold_over (hold_s elapsed), calm (calm_s without a bad send), level0 (calm
+# brought the level to 0).
 SEND_TRANSITIONS = {
+    (SEND_OK,       "starved"):   (SEND_DRAIN, +1),
+    (SEND_DEGRADED, "starved"):   (SEND_DRAIN, +1),
+    (SEND_BACKOFF,  "starved"):   (SEND_DRAIN, 0),
+    (SEND_DRAIN,    "starved"):   (SEND_DRAIN, 0),    # cannot happen (nothing is sent); harmless
+    (SEND_DRAIN,    "drained"):   (SEND_DEGRADED, 0),
     (SEND_OK,       "bad"):       (SEND_BACKOFF, +1),
     (SEND_DEGRADED, "bad"):       (SEND_BACKOFF, +1),
     (SEND_BACKOFF,  "bad"):       (SEND_BACKOFF, 0),    # existing clients failing: no extra escalation
@@ -131,8 +170,12 @@ SEND_TRANSITIONS = {
     (SEND_DEGRADED, "calm"):      (SEND_DEGRADED, -1),
     (SEND_DEGRADED, "level0"):    (SEND_OK, 0),
 }
-# What each state lets farm_ws do.
-SEND_ACCEPTS = {SEND_OK: True, SEND_DEGRADED: True, SEND_BACKOFF: False}
+# What each state lets farm_ws do: accept a /ws client; run the library's
+# Server.poll() at all (accept, read a request, send its reply: a 503 or a
+# /status body is a send too); write frames to clients (else they queue).
+SEND_ACCEPTS = {SEND_OK: True, SEND_DEGRADED: True, SEND_BACKOFF: False, SEND_DRAIN: False}
+SEND_SERVES = {SEND_OK: True, SEND_DEGRADED: True, SEND_BACKOFF: True, SEND_DRAIN: False}
+SEND_WRITES = {SEND_OK: True, SEND_DEGRADED: True, SEND_BACKOFF: True, SEND_DRAIN: False}
 
 
 class SendPlan:
@@ -149,6 +192,8 @@ class SendPlan:
         self.poll_s = POLL_BUDGET_S
         self.send_s = SEND_TIMEOUT_S
         self.close_s = CLOSE_TIMEOUT_S
+        self.serve = SEND_SERVES[state]
+        self.writes = SEND_WRITES[state]
 
 
 class SendPath:
@@ -182,12 +227,16 @@ class SendPath:
         self.level = min(SEND_MAX_LEVEL, max(0, self.level + delta))
         if delta:
             self.level_since = now
-        if nxt == SEND_BACKOFF and before != SEND_BACKOFF:
+        if nxt == SEND_DRAIN and before != SEND_DRAIN:
+            self.hold_until = now + DRAIN_S
+            self.events.append(("send_drain", {
+                "level": self.level, "hold_s": DRAIN_S, "why": why}))
+        elif nxt == SEND_BACKOFF and before != SEND_BACKOFF:
             self.hold_until = now + SEND_LEVELS[self.level][0]
             self.events.append(("send_backoff", {
                 "level": self.level, "hold_s": SEND_LEVELS[self.level][0],
                 "replay": SEND_LEVELS[self.level][1], "why": why}))
-        elif before == SEND_BACKOFF and nxt == SEND_DEGRADED:
+        elif before in (SEND_BACKOFF, SEND_DRAIN) and nxt == SEND_DEGRADED:
             self.events.append(("send_degraded", {
                 "level": self.level, "replay": SEND_LEVELS[self.level][1],
                 "refused": self.refused}))
@@ -204,6 +253,8 @@ class SendPath:
         """Transitions that only need the clock."""
         if self.state == SEND_BACKOFF and now >= self.hold_until:
             self._fire(now, "hold_over")
+        if self.state == SEND_DRAIN and now >= self.hold_until:
+            self._fire(now, "drained")
         if self.state == SEND_DEGRADED:
             calm_s = SEND_LEVELS[self.level][4]
             since = max(self.last_bad or 0.0, self.level_since or 0.0,
@@ -225,8 +276,10 @@ class SendPath:
         if bad:
             self.bad_count += 1
             self.last_bad = now
-            self._fire(now, "bad", "%s %s %.2f s" % (
-                kind, "slow" if ok else "failed", took_s))
+            why = "%s %s %.2f s" % (kind, "slow" if ok else "failed", took_s)
+            # one call this long is lwIP's ERR_MEM sleep, not a slow peer
+            self._fire(now, "starved" if took_s >= STARVED_S and kind != "poll"
+                       else "bad", why)
         return bad
 
     def note_refused(self):
@@ -235,6 +288,94 @@ class SendPath:
     def take_events(self):
         out, self.events = self.events, []
         return out
+
+
+# ---------------------------------------------------------------------------
+# Per-client path (one ClientPath per /ws client).  One table, no logic elsewhere.
+#
+# Why: 2026-10-29 14:26-14:30 the server phase of a poll took 10.1 s three
+# times ("ws poll: [Errno 116] ETIMEDOUT: send timeout 0.3 s", "server 10.1")
+# while the display at .125 held two connections, one of them no longer
+# sending (dropped "silent 20 s" seven seconds later).  The 0.3 s bound
+# (ws_bounds, REPLY_BOUND_S) is only looked at after socket.send() returns,
+# and lwip_tcp_send() sleeps up to LWIP_ERR_MEM_S inside one send() when
+# tcp_write() says ERR_MEM.  lwIP's segment pool is shared by every socket
+# (MEMP_NUM_TCP_SEG 16 on the Pico W), so the data queued to a peer that is
+# not acknowledging starves the /status reply or handshake of an innocent
+# one.  Python cannot shorten the C sleep; what it can do is stop queueing
+# to a peer that has stopped talking (LAGGING), and when a send does overrun,
+# cut the client it overran on and every LAGGING client (the likely cause),
+# without a close frame, which would only queue more.  3 such stalls used to
+# reach the LinkHealth stall rule and reset the radio; a stall the client
+# model answered by cutting a client is no longer counted (farm_ws).
+# ---------------------------------------------------------------------------
+C_NEW = "NEW"            # connected, nothing heard yet (old ingest, debug listeners stay here)
+C_LIVE = "LIVE"          # a frame heard within CLIENT_LAG_S
+C_LAGGING = "LAGGING"    # a heartbeat client unheard CLIENT_LAG_S: nothing more is written to it
+C_GONE = "GONE"          # dropped
+
+# Sandbells ingest and the page-3 widget send sand.hello/v1 every 5 s
+# (Sandbells events/constants.py CLIENT_HEARTBEAT_S; docs/link-health.md "Wire").
+CLIENT_HB_S = 5.0
+CLIENT_LAG_S = 2 * CLIENT_HB_S    # two heartbeats missed: not one late frame
+# CLIENT_SILENT_S (20 s, above) still ends a silent client, as before.
+
+# LWIP_ERR_MEM_S and STARVED_S: see the send path section above.
+
+# What farm_ws does for a transition.
+HOLD = "hold"        # write nothing more; events queue (bounded), heartbeats are skipped
+RESUME = "resume"    # write again; what queued goes out first, in order
+CLOSE = "close"      # drop politely: close frame (bounded), then the socket
+CUT = "cut"          # drop without a close frame: the peer is not reading, a
+                     # frame would only sit in lwIP's queue (and could hit ERR_MEM)
+
+# Events: heard (a frame arrived), quiet (heartbeat client unheard CLIENT_LAG_S),
+# silent (unheard CLIENT_SILENT_S), overran (a send to it missed its deadline
+# or ran slow during its replay), backlog (its queue passed TODO_MAX),
+# starved (a send elsewhere took STARVED_S+: lwIP is out of buffers),
+# superseded (a newer connection from the same peer address exists),
+# failed (a socket error), closed (the peer closed).
+# (state, event) -> (next state, action).  A pair not listed changes nothing:
+# a LIVE or NEW client ignores starved and superseded (Sandbells ingest and
+# the page-3 widget may share one address; only a client that has stopped
+# talking is blamed or replaced).
+_OPEN = (C_NEW, C_LIVE, C_LAGGING)
+CLIENT_TRANSITIONS = {
+    (C_NEW, "heard"):          (C_LIVE, None),
+    (C_LIVE, "quiet"):         (C_LAGGING, HOLD),
+    (C_LAGGING, "heard"):      (C_LIVE, RESUME),
+    (C_LAGGING, "starved"):    (C_GONE, CUT),
+    (C_LAGGING, "superseded"): (C_GONE, CUT),
+}
+for _st in _OPEN:
+    CLIENT_TRANSITIONS[(_st, "silent")] = (C_GONE, CUT)
+    CLIENT_TRANSITIONS[(_st, "overran")] = (C_GONE, CUT)
+    CLIENT_TRANSITIONS[(_st, "backlog")] = (C_GONE, CUT)
+    CLIENT_TRANSITIONS[(_st, "failed")] = (C_GONE, CLOSE)
+    CLIENT_TRANSITIONS[(_st, "closed")] = (C_GONE, CLOSE)
+del _st
+# What each state lets farm_ws do with a new frame for that client.
+CLIENT_WRITES = {C_NEW: True, C_LIVE: True, C_LAGGING: False, C_GONE: False}
+
+
+class ClientPath:
+    """One /ws client's state.  fire(event) -> action or None (see
+    CLIENT_TRANSITIONS).  No sockets, no clock: farm_ws reports facts."""
+    def __init__(self, peer=None):
+        self.peer = peer
+        self.state = C_NEW
+        self.last_event = None
+
+    def fire(self, event):
+        nxt = CLIENT_TRANSITIONS.get((self.state, event))
+        if nxt is None:
+            return None
+        self.state, action = nxt
+        self.last_event = event
+        return action
+
+    def writes(self):
+        return CLIENT_WRITES[self.state]
 
 
 class LinkHealth:
@@ -361,6 +502,8 @@ class LinkHealth:
 
         # Clients that keep reconnecting hide a sick radio: frames arrive, but
         # sends keep stalling for 10 s.  Repeated stalls ask for a radio reset.
+        # Only stalls the client model could not answer count (farm_ws: a
+        # stall that cut a LAGGING or overrunning client was that client's).
         if stalled and tower_inactive and quiet_ms >= MEM_QUIET_MS \
                 and self.state not in (RADIO_RESET, DEAD) \
                 and (self._stall_reset_at is None

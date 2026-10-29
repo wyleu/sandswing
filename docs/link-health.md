@@ -36,8 +36,10 @@ sandmon GPS NO Lock shows as stratum 16 / leap 3), `last_seq`, `uptime_s`,
 
 ## Rules (code constants, no settings)
 
-* Pico: a client that has sent a text frame must keep sending; silent
-  `CLIENT_SILENT_S` (20 s) -> dropped.  Clients that never send (old ingest,
+* Pico: a client that has sent a text frame must keep sending; quiet
+  `CLIENT_LAG_S` (10 s, two missed 5 s hellos) -> LAGGING: nothing more is
+  written to it until it is heard again; silent `CLIENT_SILENT_S` (20 s) ->
+  cut.  Clients that never send (old ingest,
   debug listeners) are not timed out.
 * Pico: every send has a deadline (`SEND_TIMEOUT_S` 0.4 s).  adafruit_httpserver
   4.8.2 `send_message()` / `close()` retry EAGAIN for ever on a full TCP
@@ -73,7 +75,10 @@ sandmon GPS NO Lock shows as stratum 16 / leap 3), `last_seq`, `uptime_s`,
   blip with no client and a router that ignores pings never resets.  At most
   one reset per spell; a rebooted Pico starts a new spell.
 * Pico: repeated stalls.  A poll pass that takes `STALL_S` (5 s) or more is a
-  stall (the Wi-Fi chip blocking inside one call: the logs show 10 s).
+  stall (the Wi-Fi chip blocking inside one call: the logs show 10 s).  A stall
+  the per-client model answered (it cut the client the send overran on, or a
+  LAGGING client when lwIP starved) is that client's, not the radio's, and is
+  not counted (`stalls_answered` in the heartbeat); see "Per-client path".
   `STALL_N` (3) stalls within `STALL_WINDOW_S` (300 s), tower quiet, ask for a
   radio reset even if clients keep reconnecting, at most one per
   `RADIO_RESET_SETTLE_S` (60 s); stalls also count as a bad sign for the 300 s
@@ -93,6 +98,189 @@ sandmon GPS NO Lock shows as stratum 16 / leap 3), `last_seq`, `uptime_s`,
   connection, `PEER_SILENT_S` (20 s) without a frame -> reconnect.  TCP
   keepalive 10/5/3.  Backoff resets only after a connection that delivered
   frames.
+
+## Per-client path: one client that is not reading must not hold the Pico
+
+Observed 2026-10-29 14:26-14:30 (desk Pi serial log; the Sandbells display at
+192.168.0.125 held two /ws connections):
+
+```
+14:26:31 ws poll: [Errno 116] ETIMEDOUT: send timeout 0.3 s
+14:26:31 ws poll took 10.1 s: server 10.1, replay 0.0, read 0.0 (2 clients)
+14:26:31 link send_backoff {'why': 'server slow 10.06 s', 'level': 1, ...}
+14:26:38 WS client dropped: silent 20 s
+14:29:43 ws poll took 10.1 s: server 10.1 ... send_backoff level 2
+14:30:10 ... send_backoff level 3
+14:30:11 link link_dead {'reason': 'link health radio_reset'}
+```
+
+Why a send with a 0.3 s timeout took 10 s: the `send timeout 0.3 s` text is
+`ws_bounds.bounded_send_bytes` (`REPLY_BOUND_S`), i.e. the library's reply to
+a new request (/status body, /ws handshake or 503) inside `Server.poll()`, the
+"server" phase.  That bound is looked at only after `conn.send()` returns, and
+`lwip_tcp_send()` (CircuitPython 10.0.3, `Socket.c`) sleeps 200 x 50 ms
+(`LWIP_ERR_MEM_S`, 10 s) inside one call when `tcp_write()` returns `ERR_MEM`,
+whatever the socket's timeout.  The accepted socket's own timeout (1 s,
+`adafruit_httpserver` `Server.poll`: `conn.settimeout(self._timeout)`) only
+covers the wait for send-buffer space, not that loop.  `ERR_MEM` on a brand-new
+connection means lwIP's shared pools were empty: the Pico W build has
+`MEMP_NUM_TCP_SEG 16` queued segments for all sockets together
+(`lwipopts.h`), and every byte written to a peer that is not acknowledging
+stays queued (and, after `close()`, for up to 10 s more until lwIP aborts the
+connection).  The display's stale second connection is the likely holder: it
+was dropped as silent seven seconds after the first stall.  Three such stalls
+in 300 s reached the `STALL_N` rule and reset the radio.
+
+Python cannot shorten the C sleep.  So: stop writing to a client that has
+stopped talking before it fills lwIP, never send a close frame to one that is
+not reading, and when a send does overrun, treat it as that client's failure
+(and the lagging clients'), not the radio's.  That policy is `ClientPath` in
+`src/link_health.py`; `farm_ws.py` reports facts through `_event()` and does
+what `CLIENT_TRANSITIONS` returns.
+
+| state | written to | meaning |
+|---|---|---|
+| `NEW` | yes | connected, nothing heard yet (old ingest and debug listeners stay here) |
+| `LIVE` | yes | a frame heard within `CLIENT_LAG_S` |
+| `LAGGING` | **no**: events queue (`TODO_MAX`), heartbeats are skipped | a heartbeat client unheard `CLIENT_LAG_S` |
+| `GONE` | no | dropped: `close` (close frame, then the socket) or `cut` (socket only) |
+
+```mermaid
+stateDiagram-v2
+    [*] --> NEW
+    NEW --> LIVE: heard
+    LIVE --> LAGGING: quiet
+    LAGGING --> LIVE: heard
+    LAGGING --> GONE: starved
+    LAGGING --> GONE: superseded
+    NEW --> GONE: silent
+    LIVE --> GONE: silent
+    LAGGING --> GONE: silent
+    NEW --> GONE: overran
+    LIVE --> GONE: overran
+    LAGGING --> GONE: overran
+    NEW --> GONE: backlog
+    LIVE --> GONE: backlog
+    LAGGING --> GONE: backlog
+    NEW --> GONE: failed
+    LIVE --> GONE: failed
+    LAGGING --> GONE: failed
+    NEW --> GONE: closed
+    LIVE --> GONE: closed
+    LAGGING --> GONE: closed
+```
+
+Events: `heard` a frame arrived; `quiet` unheard `CLIENT_LAG_S`; `silent`
+unheard `CLIENT_SILENT_S`; `overran` a frame to it was not done by its
+deadline (also when the send completed late), or a replay frame ran slow;
+`backlog` its queue reached `TODO_MAX`; `starved` some send or serve call
+took `STARVED_S` or more (lwIP out of buffers); `superseded` a newer
+connection from the same address exists; `failed` a socket error; `closed`
+the peer closed.  `failed` and `closed` close politely; every other drop is a
+`cut`.  A `NEW` or `LIVE` client ignores `starved` and `superseded`: Sandbells
+ingest and the page-3 widget can share one address, and only a client that
+has stopped talking is blamed or replaced.  A test checks that this diagram
+lists every entry of the table.
+
+Numbers (all in `link_health.py`):
+
+* `CLIENT_HB_S` 5 s: Sandbells sends `sand.hello/v1` every 5 s
+  (`CLIENT_HEARTBEAT_S`, the "Wire" table).  `CLIENT_LAG_S` = 2 x that: one
+  late hello never holds a client.
+* `LWIP_ERR_MEM_S` 10 s: 200 x 50 ms in `lwip_tcp_send()`; the log's
+  "server slow 10.06 s".
+* `STARVED_S` 2 s: above every Python-side wait (frame 0.4 s, library
+  request + reply 0.3 + 0.3 s) and at `SLOW_POLL_S`, which a healthy Pico never
+  logs; well below the 10 s signature.
+* A broadcast (`send()`) is held to `POLL_BUDGET_S` (1 s) in all; a client
+  not reached in it gets the frame on the next poll turn, in order.
+
+### The server phase with no client at all (14:45)
+
+Later the same day: `ws poll took 10.1 s: server 10.1, replay 0.0, read 0.0
+(0 clients)`, then `link_dead ... radio_reset`.  With no client, the server
+phase is only the library's `Server.poll()`: `accept()` on the listening
+socket (non-blocking: `EAGAIN` at once), `recv` of the request on the
+accepted socket (each call waits at most the socket timeout, 1 s by the
+library's default, then `ETIMEDOUT`; `ws_bounds` stops the read after
+`REQ_BOUND_S`), the route, and the reply (`/status` body, /ws handshake, or the
+503 that `SEND_BACKOFF` answers with; `refused` 8-10 in `send_degraded` means
+several of those).  In the CircuitPython source the only wait that lasts 10 s
+in any of these is the reply's `ERR_MEM` loop; accept and recv are bounded by
+the socket timeout.  So the reply to a new request found lwIP's pools empty,
+with nobody connected: they are held by connections already closed (cut or
+refused clients, earlier replies) whose peers have not acknowledged, until
+lwIP aborts them 10 s after the close (`MICROPY_PY_LWIP_TCP_CLOSE_TIMEOUT_MS`).
+Each further 503 or /status reply in that window is one more send into the
+empty pool.  To confirm on the Pico, a slow server phase now prints a second
+line, `server: request read X s, reply send Y s (N B)`; expect Y near 10.
+
+So the send path has a fourth state, `SEND_DRAIN`: one call of `STARVED_S`
+(2 s) or more moves there from any state; for `DRAIN_S` (10 s close-abort
+time plus one 0.5 s tcp_poll step) `farm_ws` does not call `Server.poll()`
+(incoming connections wait in lwIP's accept queue: no reply, no 503, nothing
+sent), writes nothing to any client (events queue in order, heartbeats are
+skipped), and keeps reading clients (their heartbeats still count).  Then
+`SEND_DEGRADED` at the raised level, as after a backoff.  The request read is
+also bounded per call now: `server.socket_timeout = REQ_BOUND_S` (0.3 s,
+was the library's 1 s), so a connection that never sends its request costs
+0.3 s and is closed by the library; it cannot carry over to the next poll
+(the library reads a request in one go, there is no half-open request state
+to keep).
+
+What a stall costs now: a send that hits `ERR_MEM` still blocks once for up
+to 10 s (nothing in Python can stop it), but it ends with the client it
+overran on and every LAGGING client cut, `SEND_DRAIN` makes sure no second
+send goes into the empty pool, and a peer that has stopped talking no longer
+has frames written to it, so the pool should not empty in the first place.
+A stall answered by cutting a client is not counted towards the radio reset.
+A stall with nobody to blame (0 clients, as at 14:45) still counts: if
+`SEND_DRAIN` works there is no second one, and three in 300 s, which now means
+the pool keeps emptying even with nothing written, still reset the radio as
+the last resort.
+
+### What to look for in the serial log after deploy
+
+```
+WS client lagging (192.168.0.125): no frame for 10 s, holding sends (2 clients)
+link client_lagging {'peer': '192.168.0.125', 'unheard_b': 1430, 'quiet_s': 10.6, 'clients': 2}
+link client_dropped {'reason': 'superseded by a new connection from 192.168.0.125', 'how': 'cut LAGGING->superseded', 'peer': '192.168.0.125', 'unheard_b': 1430, ...}
+link client_dropped {'reason': 'not reading while lwIP starved (server took 10.1 s)', 'how': 'cut LAGGING->starved', ...}
+link client_dropped {'reason': 'not reading: send timeout 0.4 s (errno 116)', 'how': 'cut LIVE->overran', ...}
+link client_resumed {'peer': ..., 'queued': 2, ...}
+```
+
+* Expected: `client_lagging` followed by `cut LAGGING->superseded` about once
+  a minute while the display keeps reconnecting, and **no** `ws poll took`.
+* `cut LAGGING->starved` with `ws poll took 10.x s`: the C sleep still
+  happened once, and the client behind it went; there should be no
+  `link_dead ... radio_reset` after it.  `unheard_b` says how much was
+  written to that client since it last spoke.
+* `link send_drain {'level': N, 'hold_s': 10.5, 'why': 'server slow 10.06 s'}`
+  then `send_degraded` about 10.5 s later and **no** second `ws poll took`
+  in between or right after: the drain worked.  The line after `ws poll
+  took` says where the server phase went (`reply send 10.0 s` = lwIP).
+* `ws poll took 10 s` with no `cut` near it: a stall nobody could be blamed
+  for; three in 300 s still reset the radio, as before.
+* The heartbeat / `/status` `net` has `clients_by_state`, `cuts`, `lagging`,
+  `superseded`, `starved` and `stalls_answered`.
+
+### The hardware watchdog
+
+`watchdog_guard` feeds only from `loop_tick()` in the sense loop, and only
+while the `ws_poll` check-in is younger than `heartbeats.ws_poll` (5 s).  With
+this model every Python-side wait is bounded: one poll is held to
+`POLL_BUDGET_S` (1 s) plus at most one frame's overshoot (`SEND_TIMEOUT_S`
+0.4 s), a broadcast to `POLL_BUDGET_S` (1 s), so the ws_poll check-in is never
+older than about 2.5 s plus whatever the sense step takes: `ws_poll: 5` keeps
+twice that margin.  But one `lwip_tcp_send()` that hits `ERR_MEM` still
+blocks `LWIP_ERR_MEM_S` (10 s), longer than the RP2350's longest watchdog
+(`MAX_TIMEOUT_S` 8 s, hardware 8.388 s), so if the pool empties even once the
+watchdog resets the Pico.  Leave `watchdog.enabled` false until a soak (a
+night and a ringing session) shows no `ws poll took` of 5 s or more and no
+`cut LAGGING->starved` / `->overran` with a 10 s poll; then enable it with
+`timeout_s` 8 and `heartbeats {"ws_poll": 5}`.
+
 
 ## State diagram (Wi-Fi and clients)
 
@@ -169,12 +357,14 @@ obeys.
 | `SEND_OK` | yes | `REPLAY_N` 32, 1 frame / 0.1 s | no bad send lately (level 0) |
 | `SEND_BACKOFF` | **no**: 503 + `Retry-After`, a few hundred bytes, no handshake | n/a | a send was slow or failed; hold `hold_s` of the current level |
 | `SEND_DEGRADED` | yes | per level (table) | hold over; gentler replay until `calm_s` without a bad send |
+| `SEND_DRAIN` | **no**: `Server.poll()` is not called at all (no accept, no /status, no 503), nothing is written to any client (events queue, heartbeats skipped) | n/a | one call took `STARVED_S` (2 s) or more: lwIP is out of buffers; wait `DRAIN_S` (10.5 s) for lwIP to abort what was closed |
 
 A *bad send* is a send, handshake, close or whole poll that failed, or took at
 least `SLOW_S[kind]` (replay 0.2 s, live 0.3 s, server 1.0 s, close 0.15 s,
 poll 1.5 s) even though it succeeded.  A slow replay frame drops that client;
-a slow live frame only informs the model (a live client is never dropped for
-being slow, only when the send times out, as before).
+a slow live frame only informs the model.  A live frame that misses its own
+deadline (`SEND_TIMEOUT_S`, also when it completed late) is an `overran` event
+for that client's `ClientPath`, which cuts it (see "Per-client path").
 
 ### Levels (`SEND_LEVELS`)
 
@@ -206,6 +396,10 @@ stateDiagram-v2
     SEND_DEGRADED --> SEND_BACKOFF: bad send, level + 1 (cap 5)
     SEND_DEGRADED --> SEND_DEGRADED: calm_s without a bad send, level - 1
     SEND_DEGRADED --> SEND_OK: level reaches 0
+    SEND_OK --> SEND_DRAIN: starved, level + 1
+    SEND_DEGRADED --> SEND_DRAIN: starved, level + 1
+    SEND_BACKOFF --> SEND_DRAIN: starved
+    SEND_DRAIN --> SEND_DEGRADED: DRAIN_S elapsed
 ```
 
 Transitions are the `SEND_TRANSITIONS` dict; a (state, event) pair that is not

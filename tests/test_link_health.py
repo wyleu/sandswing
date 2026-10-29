@@ -176,7 +176,8 @@ from link_health import SendPath, SEND_OK, SEND_BACKOFF, SEND_DEGRADED
 
 
 def bad(sp, now, kind="replay"):
-    return sp.observe(now, kind, 10.0, True)       # the 10 s lwIP sleep, send "succeeded"
+    # slow, but short of STARVED_S (a 10 s lwIP sleep is SEND_DRAIN: see below)
+    return sp.observe(now, kind, link_health.SLOW_S[kind] + 0.5, True)
 
 
 @case
@@ -302,10 +303,12 @@ def test_events_say_what_happened_in_link_log_words():
 
 @case
 def test_send_table_is_complete_and_consistent():
-    states = {SEND_OK, SEND_BACKOFF, SEND_DEGRADED}
+    states = {SEND_OK, SEND_BACKOFF, SEND_DEGRADED, link_health.SEND_DRAIN}
     assert set(link_health.SEND_ACCEPTS) == states
+    assert set(link_health.SEND_SERVES) == set(link_health.SEND_WRITES) == states
     for (st, ev), (nxt, delta) in link_health.SEND_TRANSITIONS.items():
-        assert st in states and nxt in states and ev in ("bad", "hold_over", "calm", "level0")
+        assert st in states and nxt in states and ev in (
+            "bad", "starved", "drained", "hold_over", "calm", "level0")
     rows = link_health.SEND_LEVELS
     holds = [r[0] for r in rows]
     replays = [r[1] for r in rows]
@@ -326,6 +329,113 @@ def test_doc_diagram_lists_every_send_transition():
     for (st, ev), (nxt, delta) in link_health.SEND_TRANSITIONS.items():
         if st != nxt or delta:
             assert "%s --> %s" % (st, nxt) in block, (st, nxt)
+
+
+# --- ClientPath: one machine per /ws client --------------------------------
+
+@case
+def test_client_path_every_open_state_cuts_a_client_that_misses_a_deadline():
+    for st in (link_health.C_NEW, link_health.C_LIVE, link_health.C_LAGGING):
+        c = link_health.ClientPath("10.0.0.1")
+        c.state = st
+        assert c.fire("overran") == link_health.CUT and c.state == link_health.C_GONE, st
+    c = link_health.ClientPath()
+    assert c.fire("overran") == link_health.CUT
+    assert c.fire("overran") is None and c.state == link_health.C_GONE   # gone stays gone
+
+
+@case
+def test_client_path_quiet_holds_and_heard_resumes():
+    c = link_health.ClientPath("10.0.0.1")
+    assert c.fire("heard") is None and c.state == link_health.C_LIVE and c.writes()
+    assert c.fire("quiet") == link_health.HOLD and c.state == link_health.C_LAGGING
+    assert not c.writes()                     # nothing more is queued in lwIP for it
+    assert c.fire("heard") == link_health.RESUME and c.writes()
+
+
+@case
+def test_client_path_only_a_lagging_client_is_blamed_or_replaced():
+    # Sandbells ingest and the page-3 widget can share one address: a talking
+    # client is never cut for lwIP starving or for a newer connection
+    for ev in ("starved", "superseded"):
+        for st in (link_health.C_NEW, link_health.C_LIVE):
+            c = link_health.ClientPath("10.0.0.1")
+            c.state = st
+            assert c.fire(ev) is None and c.state == st, (st, ev)
+        c = link_health.ClientPath("10.0.0.1")
+        c.state = link_health.C_LAGGING
+        assert c.fire(ev) == link_health.CUT, ev
+
+
+@case
+def test_client_path_errors_close_politely_but_not_reading_is_cut():
+    assert link_health.CLIENT_TRANSITIONS[(link_health.C_LIVE, "failed")][1] == link_health.CLOSE
+    assert link_health.CLIENT_TRANSITIONS[(link_health.C_LIVE, "closed")][1] == link_health.CLOSE
+    for ev in ("silent", "overran", "backlog", "starved", "superseded"):
+        assert link_health.CLIENT_TRANSITIONS[(link_health.C_LAGGING, ev)][1] == link_health.CUT, ev
+
+
+@case
+def test_client_constants_come_from_the_wire_and_the_lwip_source():
+    assert link_health.CLIENT_LAG_S == 2 * link_health.CLIENT_HB_S == 10.0
+    assert link_health.CLIENT_LAG_S < link_health.CLIENT_SILENT_S
+    assert abs(link_health.LWIP_ERR_MEM_S - 10.0) < 1e-9
+    # the starved mark sits above every Python-side bound and below the C sleep
+    assert link_health.STARVED_S > link_health.REQ_BOUND_S + link_health.REPLY_BOUND_S
+    assert link_health.STARVED_S > link_health.SEND_TIMEOUT_S
+    assert link_health.STARVED_S < link_health.LWIP_ERR_MEM_S
+
+
+@case
+def test_doc_diagram_lists_every_client_transition():
+    import os
+    doc = open(os.path.join(os.path.dirname(__file__), "..", "docs", "link-health.md")).read()
+    block = doc[doc.index("stateDiagram-v2", doc.index("## Per-client path")):]
+    block = block[:block.index("```")]
+    for (st, ev), (nxt, action) in link_health.CLIENT_TRANSITIONS.items():
+        assert "%s --> %s: %s" % (st, nxt, ev) in block, (st, ev, nxt)
+
+
+@case
+def test_answered_stalls_never_reach_the_radio_reset():
+    # farm_ws does not count a stall the client model answered; with none
+    # counted, LinkHealth never asks for a radio reset however many happen
+    lh = LinkHealth()
+    for t in range(0, 300, 30):
+        _, ev = lh.update(float(t), obs(n_clients=2, hb_seen=True, last_rx_age_s=1.0,
+                                        stalls=0))
+        assert "radio_reset" not in ev
+    _, ev = lh.update(301.0, obs(n_clients=2, hb_seen=True, last_rx_age_s=1.0,
+                                 stalls=link_health.STALL_N))
+    assert "radio_reset" in ev               # unanswered stalls still do, as before
+
+
+
+@case
+def test_one_call_stuck_in_lwip_drains_instead_of_serving_again():
+    sp = SendPath()
+    assert sp.plan(0.0).serve and sp.plan(0.0).writes
+    sp.observe(10.06, "server", 10.06, True)          # 14:45: server 10.1 s, 0 clients
+    p = sp.plan(10.1)
+    assert p.state == link_health.SEND_DRAIN and not p.serve and not p.writes and not p.accept
+    ev = dict(sp.take_events())
+    assert ev["send_drain"]["hold_s"] == link_health.DRAIN_S and "server slow" in ev["send_drain"]["why"]
+    assert sp.plan(10.06 + link_health.DRAIN_S - 0.1).state == link_health.SEND_DRAIN
+    p = sp.plan(10.06 + link_health.DRAIN_S)
+    assert p.state == SEND_DEGRADED and p.serve and p.writes and p.accept and p.level == 1
+
+
+@case
+def test_a_merely_slow_send_still_backs_off_not_drains():
+    sp = SendPath()
+    sp.observe(1.0, "server", 1.2, True)              # slow, but no C sleep
+    assert sp.plan(1.0).state == SEND_BACKOFF and sp.plan(1.0).serve
+
+
+@case
+def test_drain_constants_come_from_the_lwip_source():
+    assert link_health.DRAIN_S >= link_health.CLOSE_ABORT_S == 10.0
+    assert link_health.DRAIN_S - link_health.CLOSE_ABORT_S <= 2 * link_health.TCP_POLL_STEP_S
 
 
 @case

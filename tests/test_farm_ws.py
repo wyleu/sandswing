@@ -280,6 +280,7 @@ def test_a_slow_poll_is_counted_as_a_stall_for_link_health():
     try:
         with contextlib.redirect_stdout(io.StringIO()):
             farm_ws.poll()
+            t[0] += link_health.DRAIN_S                  # SEND_DRAIN skips the server meanwhile
             farm_ws.poll()
         assert farm_ws.stalls_since(t[0], 60.0) == 2
         assert farm_ws.stalls_since(t[0] + 100.0, 60.0) == 0     # old ones age out
@@ -441,6 +442,317 @@ def test_refusal_close_and_replay_together_stay_inside_the_budget():
         farm_ws.time.monotonic = real
     assert took <= link_health.POLL_BUDGET_S + 0.05, took
     assert farm_ws._refused or all(ws.closed for ws in old if ws not in farm_ws._clients)
+
+
+# --- the 2026-10-29 14:26-14:30 failure: per-client model (ClientPath) -------
+
+DISPLAY = "192.168.0.125"
+
+
+def peer_ws(conn, peer):
+    ws = RealishWs(conn)
+    ws._request.client_address = (peer, 1)
+    return ws
+
+
+class SleepConn(FakeConn):
+    """A send that sleeps `cost` s inside the call before returning (the
+    lwip_tcp_send ERR_MEM loop: no Python deadline can cut it short)."""
+    def __init__(self, clock, cost):
+        FakeConn.__init__(self)
+        self.clock, self.cost = clock, cost
+
+    def send(self, view):
+        self.clock.t += self.cost
+        return FakeConn.send(self, view)
+
+
+def hear(ws):
+    ws.on_receive = ['{"schema":"sand.hello/v1","type":"heartbeat"}']
+
+
+def states():
+    return dict((id(ws), farm_ws._meta[id(ws)]["path"].state) for ws in farm_ws._clients)
+
+
+@case
+def test_send_deadline_missed_cuts_that_client_through_the_model():
+    farm_ws.reset_state()
+    with fake_clock(step=0.001) as clock:
+        stuck_conn = FakeConn(take=0)                    # TCP buffer full: not reading
+        stuck = farm_ws._accept(peer_ws(stuck_conn, DISPLAY))
+        good_conn = FakeConn()
+        good = farm_ws._accept(peer_ws(good_conn, "192.168.0.50"))
+        t0 = clock.t
+        assert farm_ws.send({"seq": 1})
+        took = clock.t - t0
+    assert took <= link_health.SEND_TIMEOUT_S + 0.05, took     # its deadline, no more
+    assert farm_ws._clients == [good] and stuck.closed
+    assert stuck_conn.data == bytearray()                # cut: no close frame queued in lwIP
+    assert good_conn.data.endswith(b'{"seq": 1}')        # the other client got it
+    notes = dict(farm_ws.take_link_notes())
+    d = notes["client_dropped"]
+    assert d["how"] == "cut NEW->overran" and d["peer"] == DISPLAY, d
+    assert "not reading" in d["reason"], d
+
+
+@case
+def test_one_send_stuck_in_lwip_cuts_that_client_and_the_lagging_one_only():
+    """A send that sleeps 10 s in C: the client it was for is cut (overran),
+    a LAGGING client (the likely cause) is cut (starved), a LIVE client is
+    kept, and the stall is not counted towards the radio reset."""
+    farm_ws.reset_state()
+    with fake_clock() as clock:
+        lag = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))
+        live_conn = FakeConn()
+        live = farm_ws._accept(peer_ws(live_conn, "192.168.0.50"))
+        hear(lag); hear(live)
+        farm_ws.poll()
+        clock.t += link_health.CLIENT_LAG_S + 1
+        hear(live)
+        farm_ws.poll()                                    # lag goes quiet: held
+        assert states()[id(lag)] == link_health.C_LAGGING
+        assert states()[id(live)] == link_health.C_LIVE
+        victim = farm_ws._accept(peer_ws(SleepConn(clock, link_health.LWIP_ERR_MEM_S), "192.168.0.60"))
+        farm_ws._new.remove(victim)                       # no replay: straight to a live send
+        farm_ws.send({"seq": 2})
+    assert victim.closed and lag.closed and farm_ws._clients == [live]
+    assert live_conn.data.endswith(b'{"seq": 2}')
+    hows = [i.get("how") for w, i in farm_ws.take_link_notes() if w == "client_dropped"]
+    assert "cut NEW->overran" in hows and "cut LAGGING->starved" in hows, hows
+    assert farm_ws.stats["starved"] == 1 and farm_ws.stats["cuts"] == 2
+
+
+@case
+def test_server_phase_stall_with_a_lagging_client_is_answered_not_counted():
+    """14:26:31 / 14:29:43 / 14:30:10: three 10.1 s server phases ended in a
+    radio reset.  With a LAGGING client to blame, each is answered by cutting
+    it, no stall reaches LinkHealth, and the radio is left alone."""
+    import io, contextlib
+    farm_ws.reset_state()
+    lh = link_health.LinkHealth()
+    real = farm_ws.time.monotonic
+    clock = Clock()
+    farm_ws.time.monotonic = clock
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            for n in range(3):
+                ingest = farm_ws._clients[0] if farm_ws._clients else farm_ws._accept(peer_ws(FakeConn(), DISPLAY))
+                old = farm_ws._accept(peer_ws(FakeConn(), "192.168.0.70"))
+                hear(ingest); hear(old)
+                farm_ws.poll()
+                clock.t += link_health.CLIENT_LAG_S + 1
+                hear(ingest)
+                farm_ws.poll()                            # old: LAGGING
+                farm_ws._server = StubServer(clock, link_health.LWIP_ERR_MEM_S + 0.1)
+                farm_ws.poll()                            # server 10.1 s
+                farm_ws._server = None
+                assert old.closed and not ingest.closed, n
+                _, ev = lh.update(clock.t, {"wifi_up": True, "n_clients": 1, "hb_seen": True,
+                                            "last_rx_age_s": 1.0, "tower_inactive": True,
+                                            "quiet_ms": 999999,
+                                            "stalls": farm_ws.stalls_since(clock.t, 300.0)})
+                assert "radio_reset" not in ev, (n, ev)
+                clock.t += 60.0
+    finally:
+        farm_ws.time.monotonic = real
+        farm_ws._server = None
+    assert farm_ws.stalls_since(clock.t, 1000.0) == 0
+    assert farm_ws.stats["stalls_answered"] == 3
+
+
+@case
+def test_a_stall_nobody_can_be_blamed_for_still_counts():
+    import io, contextlib
+    farm_ws.reset_state()
+    with fake_clock() as clock:
+        live = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))
+        hear(live)
+        farm_ws.poll()
+        farm_ws._server = StubServer(clock, link_health.LWIP_ERR_MEM_S)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                farm_ws.poll()
+        finally:
+            farm_ws._server = None
+        assert farm_ws._clients == [live]                # a talking client is not blamed
+        assert farm_ws.stalls_since(clock.t, 300.0) == 1  # the radio rule still sees it
+
+
+@case
+def test_lagging_client_gets_nothing_then_everything_in_order_when_heard():
+    farm_ws.reset_state()
+    with fake_clock() as clock:
+        conn = FakeConn()
+        ws = farm_ws._accept(peer_ws(conn, DISPLAY))
+        hear(ws)
+        farm_ws.poll()
+        clock.t += link_health.CLIENT_LAG_S + 1
+        farm_ws.poll()
+        assert states()[id(ws)] == link_health.C_LAGGING
+        before = len(conn.data)
+        farm_ws.send({"seq": 10})
+        farm_ws.send({"hb": 1}, keep=False)               # heartbeat: skipped, not queued
+        farm_ws.send({"seq": 11})
+        run_polls(clock, 1.0)
+        assert len(conn.data) == before                   # held: nothing queued in lwIP
+        hear(ws)
+        run_polls(clock, 1.0)
+    assert states()[id(ws)] == link_health.C_LIVE
+    tail = bytes(conn.data[before:])
+    assert tail.index(b'"seq": 10') < tail.index(b'"seq": 11') and b'"hb"' not in tail
+    whats = [w for w, _ in farm_ws.take_link_notes()]
+    assert "client_lagging" in whats and "client_resumed" in whats, whats
+
+
+@case
+def test_a_new_connection_replaces_the_lagging_one_from_the_same_peer():
+    """The display reconnects about once a minute and leaves its old socket:
+    the new connection supersedes the old one once that has stopped talking.
+    A LIVE client from the same address (Sandbells ingest and the page-3
+    widget share .125) is kept."""
+    farm_ws.reset_state()
+    with fake_clock() as clock:
+        ingest = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))
+        old_page = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))
+        hear(ingest); hear(old_page)
+        farm_ws.poll()
+        clock.t += link_health.CLIENT_LAG_S + 1
+        hear(ingest)
+        farm_ws.poll()                                    # old page: LAGGING
+        new_page = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))
+    assert old_page.closed and farm_ws._clients == [ingest, new_page]
+    d = [i for w, i in farm_ws.take_link_notes() if w == "client_dropped"][-1]
+    assert d["how"] == "cut LAGGING->superseded" and "superseded" in d["reason"], d
+    assert farm_ws.stats["superseded"] == 1
+
+
+@case
+def test_a_client_that_goes_quiet_after_its_replacement_arrived_is_cut_at_once():
+    farm_ws.reset_state()
+    with fake_clock() as clock:
+        old_page = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))
+        hear(old_page)
+        farm_ws.poll()
+        new_page = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))   # old still LIVE: kept
+        assert not old_page.closed
+        hear(new_page)
+        clock.t += link_health.CLIENT_LAG_S + 1
+        hear(new_page)
+        farm_ws.poll()                                    # old goes quiet -> superseded
+    assert old_page.closed and farm_ws._clients == [new_page]
+
+
+@case
+def test_broadcast_to_every_stuck_client_stays_inside_the_poll_budget():
+    farm_ws.reset_state()
+    with fake_clock(step=0.001) as clock:
+        for n in range(farm_ws.MAX_WS_CLIENTS):
+            farm_ws._accept(peer_ws(FakeConn(take=0), "192.168.0.%d" % (60 + n)))
+        t0 = clock.t
+        farm_ws.send({"seq": 1})
+        took = clock.t - t0
+    assert took <= link_health.POLL_BUDGET_S + link_health.SEND_TIMEOUT_S, took
+    for ws in list(farm_ws._clients):                     # whoever was not reached waits
+        assert farm_ws._meta[id(ws)]["todo"], "left over: queued for the next poll"
+
+
+@case
+def test_status_shows_clients_by_state():
+    farm_ws.reset_state()
+    with fake_clock() as clock:
+        a = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))
+        farm_ws._accept(peer_ws(FakeConn(), "192.168.0.50"))
+        hear(a)
+        farm_ws.poll()
+        clock.t += link_health.CLIENT_LAG_S + 1
+        farm_ws.poll()
+    st = farm_ws.link_status()
+    assert st["clients_by_state"] == {"LAGGING": 1, "NEW": 1}, st
+    assert st["lagging"] == 1
+
+
+
+# --- the 2026-10-29 14:45 failure: server phase 10.1 s with 0 clients ---------
+
+class StarvedPool:
+    """lwIP's shared buffers.  Starved until `free_at`: any reply the library
+    sends meanwhile sleeps LWIP_ERR_MEM_S inside send().  Closed connections
+    are aborted (and their segments freed) CLOSE_ABORT_S after the stall."""
+    def __init__(self, clock, starved_until):
+        self.clock, self.free_at = clock, starved_until
+        self.server_calls = []
+        self.stalls = []
+
+    def poll(self):                                   # Server.poll: a request comes in, a reply goes out
+        self.server_calls.append(self.clock.t)
+        if self.clock.t < self.free_at:
+            self.stalls.append(self.clock.t)
+            self.clock.t += link_health.LWIP_ERR_MEM_S
+            self.free_at = min(self.free_at, self.clock.t + link_health.CLOSE_ABORT_S)
+
+
+@case
+def test_zero_client_server_stall_drains_once_instead_of_repeating():
+    """Every poll the display (or a /status poller) has a request waiting.
+    The first reply hits ERR_MEM (10 s, unavoidable).  Then SEND_DRAIN: no
+    Server.poll() at all for DRAIN_S, so not one more reply goes into the
+    starved pool; then the server is served again and the pool is free.
+    One stall in five minutes, nothing for LinkHealth to reset."""
+    import io, contextlib
+    farm_ws.reset_state()
+    real = farm_ws.time.monotonic
+    clock = Clock()
+    farm_ws.time.monotonic = clock
+    pool = StarvedPool(clock, starved_until=clock.t + 30.0)   # would stay starved 30 s if fed
+    farm_ws._server = pool
+    lh = link_health.LinkHealth()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            t_end = clock.t + 300.0
+            while clock.t < t_end:
+                farm_ws.poll()
+                _, ev = lh.update(clock.t, {"wifi_up": True, "n_clients": 0, "hb_seen": True,
+                                            "last_rx_age_s": 1.0, "tower_inactive": True,
+                                            "quiet_ms": 999999,
+                                            "stalls": farm_ws.stalls_since(clock.t, 300.0)})
+                assert "radio_reset" not in ev, ev
+                clock.t += 0.05
+    finally:
+        farm_ws.time.monotonic = real
+        farm_ws._server = None
+    assert len(pool.stalls) == 1, pool.stalls                 # once, not 14:26 / 14:29 / 14:30
+    first = pool.stalls[0] + link_health.LWIP_ERR_MEM_S
+    assert not [t for t in pool.server_calls if first <= t < first + link_health.DRAIN_S - 0.05]
+    assert [t for t in pool.server_calls if t >= first + link_health.DRAIN_S]   # served again
+    assert farm_ws.link_status()["send_state"] in ("SEND_DEGRADED", "SEND_OK")
+
+
+@case
+def test_nothing_is_written_while_lwip_drains_and_it_all_goes_out_after():
+    farm_ws.reset_state()
+    with fake_clock() as clock:
+        conn = FakeConn()
+        ws = farm_ws._accept(peer_ws(conn, DISPLAY))
+        farm_ws._new.remove(ws)
+        hear(ws)
+        farm_ws.poll()
+        farm_ws._server = StubServer(clock, link_health.LWIP_ERR_MEM_S)
+        try:
+            farm_ws.poll()                                # starved: SEND_DRAIN
+        finally:
+            farm_ws._server = None
+        assert farm_ws._path.state == link_health.SEND_DRAIN
+        before = len(conn.data)
+        farm_ws.send({"seq": 1})
+        farm_ws.send({"hb": 1}, keep=False)
+        ws.on_receive = ['{"type":"heartbeat"}'] * 2000   # it keeps talking throughout
+        run_polls(clock, link_health.DRAIN_S - 1.0)
+        assert len(conn.data) == before                   # held for everyone
+        assert ws in farm_ws._clients                     # LIVE: not blamed
+        run_polls(clock, 2.0)
+    assert farm_ws._path.state != link_health.SEND_DRAIN
+    assert conn.data[before:].endswith(b'{"seq": 1}') and b'"hb"' not in conn.data[before:]
 
 
 def kiosk_session(seconds, drain_bps, cap=3000):
