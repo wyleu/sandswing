@@ -212,7 +212,10 @@ def emit(msg):
         
 async def ws_poll_task(guard=None, app=None):
     while True:
-        farm_ws.poll()
+        try:
+            farm_ws.poll()
+        except MemoryError as e:             # an event in the model, not the end of the task
+            farm_ws.memory_low("poll", e)
         if app is not None:
             app.flush_link_notes()
         if guard is not None:

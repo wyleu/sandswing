@@ -31,6 +31,7 @@ time_servers.py
 time_select.py
 watchdog_guard.py
 farm_ws.py
+status_doc.py
 ws_bounds.py
 lastline.py
 farm_log.py

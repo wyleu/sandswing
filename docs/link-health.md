@@ -339,6 +339,8 @@ stateDiagram-v2
     SENDING --> CANCELLED: starved
     WAITING --> CANCELLED: held
     SENDING --> CANCELLED: held
+    WAITING --> CANCELLED: nomem
+    SENDING --> CANCELLED: nomem
 ```
 
 ### /status while the tower rings (StatusGate)
@@ -399,6 +401,102 @@ Log after deploy:
   `last_reply_b`.
 * `client_lagging` / `client_dropped` now carry `src` from the client's hello
   (`sandbells-page` for the kiosk page; the ingest's own `src`).
+
+## /status as deltas, and memory (15:42-15:47)
+
+After status-reply the reply writer and the ringing hold worked, and then:
+
+```
+15:42:19 /status reply cancelled (one 1460 B chunk took 10.0 s): 5840 of 7278 B   peer .120
+15:42:19 both .125 clients lagging; 'sandbells' (ingest) cut LAGGING->superseded
+15:42:29 ws poll: memory allocation failed, allocating 7382 bytes
+15:45-47 status payload error ... allocating 6728 bytes / ws poll ... ~7320 bytes, every few s,
+         with 'mem free 106-110 kB'; send_degraded level 5; link_dead radio_reset (0 clients)
+```
+
+**Why memory and lwIP fail together.**  CircuitPython 10.0.3 builds with
+`MICROPY_GC_SPLIT_HEAP_AUTO 1`: when the Python heap has no contiguous block
+for an allocation even after a collection, `gc_try_add_heap()` takes a new
+area -- at least as large as the whole heap so far -- from the port heap
+(`port_malloc`, tlsf), the same heap lwIP takes its pbufs from
+(`MEM_CUSTOM_ALLOCATOR`, `MEMP_MEM_MALLOC`), with no reserve
+(`gc_get_max_new_split()` = the largest free tlsf block).  So one 7 kB string
+in a fragmented heap can leave lwIP without a single 1.5 kB pbuf: that is the
+10 s `ERR_MEM` sleep on one 1460 B chunk.  When the growth fails as well it
+is a `MemoryError`.  "mem free" (Python heap free) stays at 106-110 kB
+throughout: it is the largest *contiguous* block that is missing.
+
+**What changed.**
+
+* The document is never one string.  `status_doc.StatusDoc` serialises each
+  unit on its own (the head fields; each section by id; each part by key), at
+  most every `STATUS_REBUILD_S` (2 s) whoever asks, after a `gc.collect()`.
+  A reply is the list of those pieces (each well under 2 kB) plus separators;
+  the library's headers are collected the same way, and nothing is joined.
+* The writer copies the pieces into one `REPLY_CHUNK_B` buffer allocated at
+  import and sends that: one `send()` per turn, no allocation per chunk.
+* Each unit carries the version at which it last changed.
+  `/status?since=<status_version>&boot=<boot_id>` gets a delta: the head
+  fields if they changed, the changed sections, the section order, removed
+  sections; no parts (a few hundred bytes, one chunk).  A first request
+  (`since=0`, another boot, an unknown version) gets the whole document
+  without `parts` (Sandbells never shows them).  A plain `/status` (old
+  Sandbells, curl) still gets everything, parts included.
+* Chunk size stays `TCP_MSS`.  With `LWIP_NETIF_TX_SINGLE_PBUF 1`,
+  `tcp_pbuf_prealloc()` (lwIP `tcp_out.c`) allocates `max_length` (a full MSS
+  pbuf) for every new segment whatever the write length; a write that cannot
+  go into the unsent tail (`unsent_oversize`) costs a whole new pbuf.  512 B
+  chunks would need up to three pbufs where one does; they lower nothing.
+  What lowers the pressure is fewer bytes: deltas.
+
+### What a /status request gets (`STATUS_ASK`)
+
+Checked in this order; while the tower rings (`StatusGate` HELD) every row
+is `held`.
+
+| event | reply | when |
+|---|---|---|
+| `nomem` | `held` | within `STATUS_NOMEM_S` (21 s) of a MemoryError |
+| `crowd` | `held` | a new poller while `STATUS_MAX_PEERS` (2) others polled within 60 s |
+| `again` | `held` | this peer already had `STATUS_PEER_N` (2) replies within `STATUS_POLL_HINT_S` (5 s) |
+| `refull` | `held` | a plain `/status` again within `STATUS_FULL_MIN_S` (15 s) |
+| `plain` | `full_parts` | plain `/status`: whole document with parts |
+| `first` | `full` | `since` given but not usable: whole document, no parts |
+| `since` | `delta` | `since` and `boot` match: only what changed |
+
+The held reply says why (`"held": "again"`, `"crowd"`, `"refull"`, `"nomem"`,
+`"ringing"`); a patched Sandbells keeps the last full status on screen.
+The document's `poll_hint_sec` is now `STATUS_POLL_HINT_S` (5).
+
+### MemoryError is an event
+
+`farm_ws.memory_low()` (from `Server.poll()`, the route, or
+`ws_poll_task`): every reply cancelled (`nomem`), the cached document
+dropped, `gc.collect()`, the send path drains (`SEND_TRANSITIONS` `nomem`, no
+level change), `/status` held for `STATUS_NOMEM_S`, the stall counted as
+answered, and the poll task carries on.  Log:
+`memory low in server (memory allocation failed, ...): replies cancelled,
+heap collected, N B free` and `link mem_low {...}`.
+
+### Stalls with a known cause do not raise the level
+
+`SEND_TRANSITIONS` `answered` (a `/status` chunk of `STARVED_S`: the reply is
+cancelled) and `nomem` drain at the same level.  A slow chunk under
+`STARVED_S` (15:38:33 `reply slow 0.95 s`) no longer counts at all
+(`SLOW_S["reply"]` = `STARVED_S`); a reply send that fails (the poller hung
+up) is not a bad send (`FAILURE_IS_BAD`).
+
+### Clients: supersede by src; our own silence is not theirs
+
+* A new connection replaces an older one only from the same peer **and**
+  the same hello `src`, checked when its hello arrives.  The ingest
+  (`sandbells`) and the kiosk page (`sandbells-page`) on .125 never replace
+  each other.
+* A poll that stalled (`STARVED_S` or more) moves every client's last-heard
+  on by the stall: they could not be heard meanwhile.  While the send path
+  drains, quiet is not judged at all, and when the drain ends each client's
+  last-heard is at least `CLIENT_HB_S` before then: a client is LAGGING only
+  for its own `CLIENT_LAG_S` of silence.
 
 ## State diagram (Wi-Fi and clients)
 

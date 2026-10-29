@@ -42,6 +42,7 @@ from lastline import print        # print as before, and remember the line
 import wifi
 import adafruit_connection_manager
 import link_health                 # the send-path state model: this file obeys it
+import status_doc                  # /status as versioned pieces (never one big string)
 try:
     import ws_bounds               # deadlines on the library's waits, and what they cost
 except ImportError:                # pragma: no cover
@@ -90,12 +91,28 @@ _notes = []                    # (what, info) for concentrator.py
 _replies = []                  # queued HTTP replies (/status), oldest first: see _pump_replies
 _path = link_health.SendPath() # send-path state model: plan(now) says what is allowed
 _gate = link_health.StatusGate() # /status full or held, from the tower state: set_tower()
+
+
+def _new_boot_id():
+    try:
+        import os
+        return "".join("%02x" % b for b in os.urandom(4))
+    except Exception:
+        return "%08x" % (int(time.monotonic() * 1000) & 0xFFFFFFFF)
+
+
+_doc = status_doc.StatusDoc(_new_boot_id())   # rebuilt at most every STATUS_REBUILD_S
+_peers = {}                    # peer -> {"times": [served at], "full_at": t, "seen": t}
+_nomem_until = [0.0]           # a MemoryError holds /status (and drains) until then
+_deaf = {"drain": False}       # was the send path draining last poll (see _credit_quiet)
+_last_end = [None]             # when the last poll() finished: a late loop is our own silence
 _payload_fn = lambda: {}
 stats = {"connects": 0, "drops": 0, "refused": 0, "send_timeouts": 0,
          "silent_drops": 0, "refused_backoff": 0, "replays_done": 0,
          "cuts": 0, "lagging": 0, "superseded": 0, "starved": 0,
          "stalls_answered": 0, "replies": 0, "replies_done": 0,
-         "replies_cancelled": 0, "replies_held": 0,
+         "replies_cancelled": 0, "replies_held": 0, "deltas": 0, "fulls": 0,
+         "mem_low": 0, "status_version": 0,
          "last_reply_s": None, "last_reply_b": None,
          "last_drop_reason": None, "last_drop_at": None,
          "hb_seen": False, "last_rx_at": None}
@@ -330,75 +347,176 @@ def _queued_response_class():
 
             def _send(self):
                 self._out = []
-                body = self._body.encode("utf-8") if isinstance(self._body, str) else self._body
-                self._send_headers(len(body), self._content_type)
-                self._out.append(body)
+                body = self._body
+                if isinstance(body, str):
+                    body = [body.encode("utf-8")]
+                elif not isinstance(body, list):
+                    body = [body]
+                self._send_headers(status_doc.size(body), self._content_type)
+                pieces = self._out + body       # never joined: no big block
+                self._out = None
                 req = self._request
                 try:
                     peer = str(req.client_address[0])
                 except Exception:
                     peer = None
-                data = b"".join(self._out)
-                self._out = None
-                self._size = len(data)
-                _queue_reply(req.connection, data, peer)
+                self._size = status_doc.size(pieces)
+                _queue_reply(req.connection, pieces, peer)
         _queued_cls.append(QueuedResponse)
     return _queued_cls[0]
 
 
-def route_status(request, path_status="/status"):
-    """GET /status: the full document, or the held one while the tower
-    rings (StatusGate); either way queued for the reply writer."""
-    t_route = time.monotonic()
-    if _gate.state == link_health.STATUS_HELD:
-        # the tower is ringing: a few hundred bytes, no payload built
-        stats["replies_held"] += 1
-        _last_route[0], _last_route[1] = path_status, time.monotonic() - t_route
-        return _queued_response_class()(
-            request,
-            body=held_body(),
-            content_type="application/json",
-            headers={"Access-Control-Allow-Origin": "*",
-                     "Retry-After": str(link_health.STATUS_HELD_RETRY_S)},
-        )
+def _query(request, key):
     try:
-        body = json.dumps(_payload_fn())
-    except MemoryError as e:             # fragmented heap: tidy, retry once
-        print("status payload error", e)
+        v = request.query_params.get(key)
+    except Exception:
+        return None
+    return None if v is None else str(v)
+
+
+def _int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ask_event(peer, since, boot, now):
+    """What this request is, for link_health.STATUS_ASK (checked in order)."""
+    if now < _nomem_until[0]:
+        return "nomem"
+    for k in [k for k, v in _peers.items() if now - v["seen"] > link_health.STATUS_PEER_WINDOW_S]:
+        del _peers[k]
+    if peer not in _peers and len(_peers) >= link_health.STATUS_MAX_PEERS:
+        return "crowd"
+    p = _peers.get(peer)
+    if p is not None:
+        p["times"] = [t for t in p["times"] if now - t < link_health.STATUS_POLL_HINT_S]
+        if len(p["times"]) >= link_health.STATUS_PEER_N:
+            return "again"
+    if since is None:
+        if p is not None and p["full_at"] is not None \
+                and now - p["full_at"] < link_health.STATUS_FULL_MIN_S:
+            return "refull"
+        return "plain"
+    return "since" if _doc.knows(since, boot) else "first"
+
+
+def _served(peer, now, full):
+    p = _peers.setdefault(peer, {"times": [], "full_at": None, "seen": now})
+    p["seen"] = now
+    p["times"].append(now)
+    if full:
+        p["full_at"] = now
+
+
+def route_status(request, path_status="/status"):
+    """GET /status[?since=<status_version>&boot=<boot_id>]: STATUS_ASK says
+    whether this request gets a delta, the whole document, or the tiny held
+    reply; whichever it is goes to the reply writer as pieces, never joined."""
+    t_route = time.monotonic()
+    try:
+        peer = str(request.client_address[0])
+    except Exception:
+        peer = None
+    since = _int(_query(request, "since"))
+    boot = _query(request, "boot")
+    event = _ask_event(peer, since, boot, t_route)
+    kind = link_health.STATUS_ASK[(_gate.state, event)]
+    if kind != "held":
         try:
-            import gc
-            gc.collect()
-            body = json.dumps(_payload_fn())
-        except Exception as e2:
-            print("status payload retry failed", e2)
-            body = '{"error":"payload"}'
-    except Exception as e:
-        print("status payload error", e)
-        body = '{"error":"payload"}'
-    _last_route[0], _last_route[1] = path_status, time.monotonic() - t_route
-    # not written here: queued, and written a chunk per poll turn
-    # (link_health REPLY_TRANSITIONS; one 5964 B send() stalled 10 s)
+            if _doc.refresh(t_route, _build_payload, link_health.STATUS_REBUILD_S):
+                stats["status_version"] = _doc.version
+        except MemoryError as e:
+            memory_low("status", e)
+            kind, event = "held", "nomem"
+        except Exception as e:
+            print("status payload error", e)
+            if _doc.built_at is None:
+                kind, event = "held", "error"
+        if kind == "delta" and not _doc.knows(since, boot):
+            kind = "full"
+    headers = {"Access-Control-Allow-Origin": "*"}
+    if kind == "held":
+        stats["replies_held"] += 1
+        why = "ringing" if _gate.state == link_health.STATUS_HELD else event
+        headers["Retry-After"] = str(link_health.STATUS_HELD_RETRY_S)
+        body = held_body(why)
+    elif kind == "delta":
+        stats["deltas"] += 1
+        body = _doc.delta(since)
+    else:
+        stats["fulls"] += 1
+        body = _doc.full(parts=(kind == "full_parts"))
+    if kind != "held":
+        _served(peer, t_route, kind == "full_parts")
+    _last_route[0], _last_route[1] = "%s %s" % (path_status, kind), time.monotonic() - t_route
     return _queued_response_class()(
-        request,
-        body=body,
-        content_type="application/json",
-        headers={"Access-Control-Allow-Origin": "*"},
-    )
+        request, body=body, content_type="application/json", headers=headers)
 
 
-def held_body():
-    """The /status answer while the tower rings: a valid sand.status/v1
+def _build_payload():
+    """The document, built from the concentrator's payload with the heap
+    collected first, so its small allocations reuse freed space instead of
+    growing the heap into the port heap lwIP shares."""
+    try:
+        import gc
+        gc.collect()
+    except ImportError:
+        pass
+    doc = _payload_fn()
+    if isinstance(doc, dict):
+        doc["poll_hint_sec"] = link_health.STATUS_POLL_HINT_S
+    return doc
+
+
+HELD_SUMMARY = {"ringing": "Ringing (%s): full status paused so strokes have the link",
+                "again": "Asked again too soon (tower %s): status paused",
+                "crowd": "Too many pollers (tower %s): status paused",
+                "refull": "Whole status asked again too soon (tower %s): status paused",
+                "nomem": "Memory low (tower %s): status paused",
+                "error": "Status not built yet (tower %s)"}
+
+
+def held_body(why="ringing"):
+    """The tiny /status answer (ringing, or a limit): a valid sand.status/v1
     document (renders as one Tower section even in an unpatched Sandbells)
     with held set, so a patched page keeps the last full status on screen."""
     tower = _gate.tower
-    return json.dumps({
-        "schema": "sand.status/v1", "family": "sandswing", "held": "ringing",
+    return status_doc.dumps({
+        "schema": "sand.status/v1", "family": "sandswing", "held": why,
         "tower": tower, "retry_after_s": link_health.STATUS_HELD_RETRY_S,
+        "boot_id": _doc.boot_id, "status_version": _doc.version,
         "level": "ok",
-        "summary": "Ringing (%s): full status paused so strokes have the link" % tower,
+        "summary": HELD_SUMMARY.get(why, "Status paused (%s)" % why.replace("%", "")) % tower,
         "sections": [{"id": "tower", "title": "Tower", "items": [
             {"key": "tower", "label": "Tower", "value": tower,
              "level": "ok" if tower == "active" else "warn"}]}]})
+
+
+def memory_low(where, err=None):
+    """A MemoryError on the poll path, as an event in the model: every reply
+    is cancelled ("nomem"), the cached document dropped, the heap collected,
+    the send path drains (SEND_TRANSITIONS "nomem", no level change), and
+    /status is held for STATUS_NOMEM_S.  Counted as an answered stall."""
+    now = time.monotonic()
+    stats["mem_low"] += 1
+    for job in list(_replies):
+        _reply_event(job, "nomem", "memory low")
+    _doc.reset()
+    free = None
+    try:
+        import gc
+        gc.collect()
+        free = gc.mem_free()
+    except (ImportError, AttributeError):
+        pass
+    _nomem_until[0] = now + link_health.STATUS_NOMEM_S
+    _answered[0] += 1
+    _path.memory_low(now, "%s: %s" % (where, str(err)[:60]))
+    _note("mem_low", where=where, why=str(err)[:60], free=free)
+    print("%.3f memory low in %s (%s): replies cancelled, heap collected, %s B free"
+          % (now, where, err, free))
 
 
 def set_tower(tower, now=None):
@@ -418,7 +536,9 @@ def set_tower(tower, now=None):
 def _queue_reply(conn, data, peer=None, now=None):
     """Hand a finished reply to the single writer (or turn it away)."""
     now = time.monotonic() if now is None else now
-    job = {"conn": conn, "data": data, "done": 0, "at": now, "peer": peer,
+    pieces = data if isinstance(data, list) else [data]
+    job = {"conn": conn, "pieces": pieces, "size": status_doc.size(pieces),
+           "piece": 0, "off": 0, "done": 0, "at": now, "peer": peer,
            "path": link_health.ReplyPath()}
     stats["replies"] += 1
     if len(_replies) >= link_health.REPLY_QUEUE_MAX:
@@ -445,16 +565,37 @@ def _reply_event(job, event, why=None):
         took = round(time.monotonic() - job["at"], 2)
         if action == "close":
             stats["replies_done"] += 1
-            stats["last_reply_s"], stats["last_reply_b"] = took, len(job["data"])
+            stats["last_reply_s"], stats["last_reply_b"] = took, job["size"]
         else:
             stats["replies_cancelled"] += 1
             _note("reply_cancelled", why=event if why is None else str(why),
-                  sent_b=job["done"], size_b=len(job["data"]), took_s=took,
+                  sent_b=job["done"], size_b=job["size"], took_s=took,
                   peer=job["peer"])
             print("%.3f /status reply cancelled (%s): %d of %d B in %.1f s"
                   % (time.monotonic(), event if why is None else why,
-                     job["done"], len(job["data"]), took))
+                     job["done"], job["size"], took))
     return action
+
+
+_chunk_buf = bytearray(link_health.REPLY_CHUNK_B)   # allocated once: every chunk is copied here
+_chunk_mv = memoryview(_chunk_buf)
+
+
+def _fill_chunk(job):
+    """Copy up to REPLY_CHUNK_B of the job's pieces, from where it got to,
+    into the one preallocated buffer: one send() per turn whatever the
+    pieces look like, and no allocation per chunk."""
+    i, off, n = job["piece"], job["off"], 0
+    pieces = job["pieces"]
+    while i < len(pieces) and n < len(_chunk_buf):
+        p = pieces[i]
+        k = min(len(p) - off, len(_chunk_buf) - n)
+        _chunk_mv[n:n + k] = memoryview(p)[off:off + k]
+        n += k
+        off += k
+        if off >= len(p):
+            i, off = i + 1, 0
+    return _chunk_mv[:n]
 
 
 def _pump_replies(plan, deadline):
@@ -472,7 +613,7 @@ def _pump_replies(plan, deadline):
     for _ in range(link_health.REPLY_CHUNKS_PER_TURN):
         if deadline - time.monotonic() < link_health.MIN_SLICE_S:
             return
-        chunk = memoryview(job["data"])[job["done"]:job["done"] + link_health.REPLY_CHUNK_B]
+        chunk = _fill_chunk(job)
         t0 = time.monotonic()
         try:
             n = job["conn"].send(chunk)
@@ -486,7 +627,12 @@ def _pump_replies(plan, deadline):
             _reply_event(job, "failed", _why(e))
             return
         t1 = time.monotonic()
-        job["done"] += n or 0
+        n = n or 0
+        job["done"] += n
+        job["off"] += n
+        while job["piece"] < len(job["pieces"]) and job["off"] >= len(job["pieces"][job["piece"]]):
+            job["off"] -= len(job["pieces"][job["piece"]])
+            job["piece"] += 1
         _path.observe(t1, "reply", t1 - t0, True)
         if t1 - t0 >= link_health.STARVED_S:
             # lwIP's ERR_MEM sleep, and we know which write it was: this
@@ -495,7 +641,7 @@ def _pump_replies(plan, deadline):
             _reply_event(job, "starved", "one %d B chunk took %.1f s" % (len(chunk), t1 - t0))
             _starved("reply", t1 - t0)
             return
-        if job["done"] >= len(job["data"]):
+        if job["done"] >= job["size"]:
             _reply_event(job, "done")
             return
         if not n or n < len(chunk):
@@ -539,11 +685,9 @@ def _accept(ws):
         _new.append(ws)
         stats["connects"] += 1
         print("%.3f WS client connected %s" % (time.monotonic(), _count()))
-        # the display reconnects and leaves its old connection behind: tell
-        # the older clients from this peer (the table cuts only a LAGGING one)
-        if peer is not None:
-            for old in [c for c in _clients if c is not ws and _peer(c) == peer]:
-                _event(old, "superseded", "superseded by a new connection from %s" % peer)
+        # superseding waits for this client's hello (_receive): only an
+        # older connection from the same peer AND the same src is replaced
+        # (15:42:19: the ingest was cut as "superseded" by the kiosk page)
     return ws
 
 
@@ -671,11 +815,42 @@ def _event(ws, event, why=None):
     return action
 
 
+def _src(ws):
+    m = _meta.get(id(ws))
+    return None if m is None else m.get("src")
+
+
+def _same_src_older(ws):
+    """Older clients from ws's peer that said the same src in their hello."""
+    peer, src = _peer(ws), _src(ws)
+    if peer is None or src is None or src == "?" or ws not in _clients:
+        return []
+    return [c for c in _clients[:_clients.index(ws)]
+            if _peer(c) == peer and _src(c) == src]
+
+
 def _newer_from_same_peer(ws):
-    peer = _peer(ws)
-    if peer is None or ws not in _clients:
+    """A newer client from the same peer with the same src (two different
+    Sandbells clients on one Pi -- ingest and kiosk page -- never replace
+    each other)."""
+    peer, src = _peer(ws), _src(ws)
+    if peer is None or src is None or src == "?" or ws not in _clients:
         return False
-    return any(_peer(c) == peer for c in _clients[_clients.index(ws) + 1:])
+    return any(_peer(c) == peer and _src(c) == src
+               for c in _clients[_clients.index(ws) + 1:])
+
+
+def _credit_quiet(took, why):
+    """Time the Pico itself could not listen (a stalled poll, a late loop) is
+    not the clients' silence: move their last-heard on by that much, so the
+    ClientPath sees only their own quiet (15:42:19: both .125 clients went
+    LAGGING after our own 10 s stall)."""
+    now = time.monotonic()
+    for ws in _clients:
+        m = _meta.get(id(ws))
+        if m is not None and m["rx"] is not None:
+            m["rx"] = min(now, m["rx"] + took)
+    stats["quiet_credited_s"] = round(stats.get("quiet_credited_s", 0) + took, 1)
 
 
 def _starved(where, took):
@@ -791,6 +966,12 @@ def _receive(ws, now):
                     m["src"] = str(json.loads(msg).get("src"))[:24]
                 except Exception:
                     m["src"] = "?"
+                # the display reconnects and leaves its old connection behind:
+                # tell the older ones with the same peer and src (the table
+                # cuts only a LAGGING one)
+                for old in _same_src_older(ws):
+                    _event(old, "superseded", "superseded by a new connection from %s (%s)"
+                           % (m["path"].peer, m["src"]))
             if not m["hb"]:
                 m["hb"] = True
                 stats["hb_seen"] = True
@@ -854,6 +1035,8 @@ def poll():
     if _server and plan.serve:          # SEND_DRAIN: not even a 503 (it is a send too)
         try:
             _server.poll()
+        except MemoryError as e:
+            memory_low("server", e)
         except Exception as e:
             print("ws poll:", e)
         t_srv = time.monotonic()
@@ -883,6 +1066,16 @@ def poll():
                 and ws in _clients and m["path"].writes():
             _pump(ws, m, plan, now, deadline)
     t_new = time.monotonic()
+    if t_new - t0 >= link_health.STARVED_S:
+        _credit_quiet(t_new - t0, "stall")
+    draining = _path.plan(t_new).state == link_health.SEND_DRAIN   # also a drain begun this poll
+    if _deaf["drain"] and not draining:
+        # a drain just ended: quiet is counted again from now, not from
+        # before the drain (frames may not have got through lwIP meanwhile)
+        for m in _meta.values():
+            if m["rx"] is not None:
+                m["rx"] = max(m["rx"], t_new - link_health.CLIENT_HB_S)
+    _deaf["drain"] = draining
     now = t_new
     clients = list(_clients)
     _turn[0] += 1
@@ -903,11 +1096,14 @@ def poll():
             _event(ws, "closed")
             continue
         m = _meta.get(id(ws))
+        if draining:
+            continue                                # our own silence: judge them after
         if m is not None and m["hb"] and now - m["rx"] > CLIENT_SILENT_S:
             _event(ws, "silent", "silent %d s" % CLIENT_SILENT_S)
         elif m is not None and m["hb"] and now - m["rx"] > CLIENT_LAG_S:
             _event(ws, "quiet")
     t_end = time.monotonic()
+    _last_end[0] = t_end
     took = t_end - t0
     _path.observe(t_end, "poll", took, True)
     _flush_path_events()
@@ -1067,6 +1263,11 @@ def reset_state():
     del _notes[:]
     del _replies[:]
     _gate.reset()
+    _doc.reset()
+    _peers.clear()
+    _nomem_until[0] = 0.0
+    _deaf["drain"] = False
+    _last_end[0] = None
     _answered[0] = 0
     _path.reset()
     _meta.clear()

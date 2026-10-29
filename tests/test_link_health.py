@@ -308,7 +308,7 @@ def test_send_table_is_complete_and_consistent():
     assert set(link_health.SEND_SERVES) == set(link_health.SEND_WRITES) == states
     for (st, ev), (nxt, delta) in link_health.SEND_TRANSITIONS.items():
         assert st in states and nxt in states and ev in (
-            "bad", "starved", "drained", "hold_over", "calm", "level0")
+            "bad", "starved", "drained", "hold_over", "calm", "level0", "answered", "nomem")
     rows = link_health.SEND_LEVELS
     holds = [r[0] for r in rows]
     replays = [r[1] for r in rows]
@@ -505,6 +505,50 @@ def test_doc_diagram_lists_every_status_gate_transition():
     block = block[:block.index("```")]
     for (st, ev), (nxt, action) in link_health.STATUS_TRANSITIONS.items():
         assert "%s --> %s: %s" % (st, nxt, ev) in block, (st, ev, nxt)
+
+
+@case
+def test_known_cause_stalls_drain_without_raising_the_level():
+    """15:45:47: reply-cancel stalls had walked the level to 5 before the
+    radio reset.  A reply chunk's ERR_MEM stall or a MemoryError drains at the
+    same level; an unexplained stall still raises it."""
+    sp = SendPath()
+    assert not sp.observe(1.0, "reply", 0.95, True)         # 15:38:33: no backoff any more
+    assert sp.plan(1.0).state == SEND_OK
+    assert not SendPath().observe(1.0, "reply", 0.0, False)   # a poller hanging up early
+    assert sp.observe(2.0, "reply", link_health.LWIP_ERR_MEM_S, True)
+    assert sp.plan(2.0).state == link_health.SEND_DRAIN and sp.level == 0
+    sp.plan(2.0 + link_health.DRAIN_S + 0.1)
+    sp.memory_low(20.0, "server: memory allocation failed")
+    assert sp.plan(20.0).state == link_health.SEND_DRAIN and sp.level == 0
+    assert [w for w, _ in sp.take_events()].count("send_drain") == 2
+    other = SendPath()
+    other.observe(1.0, "server", link_health.LWIP_ERR_MEM_S, True)
+    assert other.level == 1                                  # cause unknown: as before
+
+
+@case
+def test_status_ask_table_ringing_holds_everything_and_limits_hold():
+    ask = link_health.STATUS_ASK
+    S, H = link_health.STATUS_SERVE, link_health.STATUS_HELD
+    assert ask[(S, "since")] == "delta" and ask[(S, "first")] == "full"
+    assert ask[(S, "plain")] == "full_parts"
+    for ev in ("again", "crowd", "refull", "nomem"):
+        assert ask[(S, ev)] == "held", ev
+    assert all(v == "held" for (st, _), v in ask.items() if st == H)
+    assert link_health.STATUS_REBUILD_S < 3.0               # Sandbells' fastest poll
+    assert link_health.STATUS_NOMEM_S > link_health.DRAIN_S
+
+
+@case
+def test_doc_lists_every_status_ask_row():
+    import os
+    doc = open(os.path.join(os.path.dirname(__file__), "..", "docs", "link-health.md")).read()
+    block = doc[doc.index("### What a /status request gets"):]
+    block = block[:block.index("\n## ")]
+    for (st, ev), kind in link_health.STATUS_ASK.items():
+        if st == link_health.STATUS_SERVE:
+            assert "| `%s` | `%s` |" % (ev, kind) in block, (ev, kind)
 
 
 @case

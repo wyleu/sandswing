@@ -48,6 +48,7 @@ sys.modules["adafruit_httpserver"] = _http
 
 import farm_ws
 import link_health
+import status_doc
 
 
 def fresh(n):
@@ -467,8 +468,8 @@ class SleepConn(FakeConn):
         return FakeConn.send(self, view)
 
 
-def hear(ws):
-    ws.on_receive = ['{"schema":"sand.hello/v1","type":"heartbeat"}']
+def hear(ws, src="sandbells-page"):
+    ws.on_receive = ['{"schema":"sand.hello/v1","type":"heartbeat","src":"%s"}' % src]
 
 
 def states():
@@ -615,12 +616,16 @@ def test_a_new_connection_replaces_the_lagging_one_from_the_same_peer():
     with fake_clock() as clock:
         ingest = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))
         old_page = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))
-        hear(ingest); hear(old_page)
+        hear(ingest, "sandbells"); hear(old_page)
         farm_ws.poll()
         clock.t += link_health.CLIENT_LAG_S + 1
-        hear(ingest)
+        hear(ingest, "sandbells")
         farm_ws.poll()                                    # old page: LAGGING
         new_page = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))
+        assert not old_page.closed                        # src not known yet
+        hear(new_page)
+        hear(ingest, "sandbells")
+        farm_ws.poll()                                    # its hello: same peer, same src
     assert old_page.closed and farm_ws._clients == [ingest, new_page]
     d = [i for w, i in farm_ws.take_link_notes() if w == "client_dropped"][-1]
     assert d["how"] == "cut LAGGING->superseded" and "superseded" in d["reason"], d
@@ -637,10 +642,65 @@ def test_a_client_that_goes_quiet_after_its_replacement_arrived_is_cut_at_once()
         new_page = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))   # old still LIVE: kept
         assert not old_page.closed
         hear(new_page)
+        farm_ws.poll()
         clock.t += link_health.CLIENT_LAG_S + 1
         hear(new_page)
         farm_ws.poll()                                    # old goes quiet -> superseded
     assert old_page.closed and farm_ws._clients == [new_page]
+
+
+@case
+def test_the_ingest_is_never_superseded_by_the_kiosk_page_from_the_same_pi():
+    """15:42:19: the ingest ('sandbells') and the kiosk page ('sandbells-page')
+    both on .125, both LAGGING after a stall: the ingest was cut as
+    'superseded by a newer connection'.  Different src: neither replaces
+    the other."""
+    farm_ws.reset_state()
+    with fake_clock() as clock:
+        ingest = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))
+        page = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))
+        hear(ingest, "sandbells"); hear(page)
+        farm_ws.poll()
+        clock.t += link_health.CLIENT_LAG_S + 1
+        farm_ws.poll()                                    # both quiet: LAGGING, both kept
+        assert not ingest.closed and not page.closed
+        page2 = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))
+        hear(page2)
+        farm_ws.poll()                                    # a new page: replaces the old page only
+    assert page.closed and not ingest.closed and ingest in farm_ws._clients
+    cut = [i for w, i in farm_ws.take_link_notes() if w == "client_dropped"]
+    assert [c["src"] for c in cut] == ["sandbells-page"], cut
+
+
+@case
+def test_our_own_stall_is_not_counted_as_the_clients_quiet():
+    """15:42:19: a 10 s stall in our own poll, then both clients 'no frame for
+    10 s'.  The stall is credited to them: neither goes LAGGING."""
+    import io, contextlib
+    farm_ws.reset_state()
+    with fake_clock() as clock:
+        ingest = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))
+        page = farm_ws._accept(peer_ws(FakeConn(), DISPLAY))
+        hear(ingest, "sandbells"); hear(page)
+        farm_ws.poll()
+        clock.t += 1.0
+        class Srv:
+            def poll(self):
+                clock.t += link_health.LWIP_ERR_MEM_S         # our 10 s
+        farm_ws._server = Srv()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                farm_ws.poll()
+        finally:
+            farm_ws._server = None
+        assert states() == {id(ingest): link_health.C_LIVE, id(page): link_health.C_LIVE}, states()
+        clock.t += link_health.DRAIN_S + 0.1                 # the drain ends; still nothing heard
+        farm_ws.poll()
+        notes = farm_ws.take_link_notes()
+        assert not [w for w, _ in notes if w == "client_lagging"], (notes, states())
+        clock.t += link_health.CLIENT_LAG_S + 1                # and now really quiet
+        farm_ws.poll()
+    assert states() == {id(ingest): link_health.C_LAGGING, id(page): link_health.C_LAGGING}, states()
 
 
 @case
@@ -986,19 +1046,35 @@ class _HdrResponse:                        # the part of the library Response us
         raise AssertionError("must not write")
 
 
-def _status_get(clock, payload_calls):
-    """One GET /status through route_status and the reply writer -> raw bytes."""
+def _payload(calls, n_sections=6, pad=900, extra=None):
+    """A document the shape of the concentrator's (about 7 kB with parts)."""
+    def fn():
+        calls.append(1)
+        doc = {"schema": "sand.status/v1", "id": "sandswing", "ts": len(calls),
+               "summary": "last line", "panel": [[0, 0, 0]] * 6,
+               "sections": [{"id": "s%d" % i, "title": "S%d" % i,
+                             "items": [{"key": "k", "label": "K", "value": "x" * pad}]}
+                            for i in range(n_sections)],
+               "parts": {"link": {"pad": "p" * 1500}, "ring": {"n": 1}}}
+        if extra:
+            extra(doc)
+        return doc
+    return fn
+
+
+def _status_get(clock, calls, query=None, peer="192.168.0.125", payload=None):
+    """One GET /status through route_status and the reply writer -> (bytes, turns)."""
     saved = (farm_ws.Response, list(farm_ws._queued_cls), farm_ws._payload_fn)
     farm_ws.Response = _HdrResponse
     del farm_ws._queued_cls[:]
-    farm_ws._payload_fn = lambda: payload_calls.append(1) or {"schema": "sand.status/v1",
-                                                                "pad": "x" * 5800}
+    farm_ws._payload_fn = payload or _payload(calls)
     try:
         conn = ReplyConn(clock)
-        req = types.SimpleNamespace(connection=conn, client_address=("192.168.0.125", 5))
+        req = types.SimpleNamespace(connection=conn, client_address=(peer, 5),
+                                    query_params=dict(query or {}))
         farm_ws.route_status(req)._send()
         turns = 0
-        while not conn.closed and turns < 20:
+        while not conn.closed and turns < 40:
             farm_ws.poll()
             clock.t += 0.05
             turns += 1
@@ -1008,6 +1084,11 @@ def _status_get(clock, payload_calls):
     return bytes(conn.data), turns
 
 
+def _body(raw):
+    head, body = raw.split(b"\r\n\r\n", 1)
+    return head, json.loads(body)
+
+
 @case
 def test_while_the_tower_rings_status_is_a_tiny_held_document_with_retry_after():
     farm_ws.reset_state()
@@ -1015,24 +1096,185 @@ def test_while_the_tower_rings_status_is_a_tiny_held_document_with_retry_after()
     with fake_clock() as clock:
         full, turns_full = _status_get(clock, calls)
         assert farm_ws.set_tower("active") == "hold"
+        clock.t += 20
         held, turns_held = _status_get(clock, calls)
         assert farm_ws.set_tower("ringing_down") is None          # still ringing: still held
+        clock.t += 20
         held2, _ = _status_get(clock, calls)
         assert farm_ws.set_tower("inactive") == "resume"
+        clock.t += 20
         back, _ = _status_get(clock, calls)
     assert len(calls) == 2                                    # no payload built while held
     assert turns_full >= 5 and turns_held == 1
-    head, body = held.split(b"\r\n\r\n", 1)
+    head, doc = _body(held)
     assert b"Retry-After: %d" % link_health.STATUS_HELD_RETRY_S in head
     assert len(held) <= link_health.STATUS_HELD_BODY_MAX <= link_health.REPLY_CHUNK_B, len(held)
-    doc = json.loads(body)
     assert doc["schema"] == "sand.status/v1" and doc["held"] == "ringing" and doc["tower"] == "active"
     assert doc["sections"][0]["items"][0]["value"] == "active"
-    assert json.loads(held2.split(b"\r\n\r\n", 1)[1])["tower"] == "ringing_down"
-    assert b'"pad"' in back and b"Retry-After" not in back       # full page again
+    assert _body(held2)[1]["tower"] == "ringing_down"
+    assert "parts" in _body(back)[1] and b"Retry-After" not in back   # full page again
     notes = [w for w, _ in farm_ws.take_link_notes()]
     assert "status_held" in notes and "status_resumed" in notes
     assert farm_ws.stats["replies_held"] == 2
+
+
+@case
+def test_status_since_gives_only_what_changed_and_a_full_document_first():
+    farm_ws.reset_state()
+    calls = []
+    def tower_changes(doc):
+        if len(calls) >= 2:
+            doc["sections"][3]["items"][0]["value"] = "changed"
+    pay = _payload(calls, extra=tower_changes)
+    with fake_clock() as clock:
+        raw, _ = _status_get(clock, calls, {"since": "0", "boot": ""}, payload=pay)
+        _, first = _body(raw)
+        assert first.get("full") is True, first and "parts" not in first     # lean: Sandbells never shows parts
+        v, boot = first["status_version"], first["boot_id"]
+        assert len(first["sections"]) == 6
+        clock.t += link_health.STATUS_REBUILD_S + 0.5
+        raw, turns = _status_get(clock, calls, {"since": str(v), "boot": boot}, payload=pay)
+        _, d = _body(raw)
+        assert d.get("delta") is True and d["since"] == v and d["status_version"] == v + 1, d
+        assert [s["id"] for s in d["sections"]] == ["s3"], d          # only the changed one
+        assert d["order"] == ["s0", "s1", "s2", "s3", "s4", "s5"] and "head" in d, d
+        assert len(raw) < 1500 and turns == 1, (len(raw), turns)
+        clock.t += 1.0                                     # within STATUS_REBUILD_S: no rebuild
+        raw, _ = _status_get(clock, calls, {"since": str(v + 1), "boot": boot}, payload=pay,
+                             peer="192.168.0.120")          # (.125 has had its two)
+        _, d = _body(raw)
+        assert d["sections"] == [] and "head" not in d and len(calls) == 2, (d, len(calls))
+        clock.t += 5
+        raw, _ = _status_get(clock, calls, {"since": str(v), "boot": "deadbeef"}, payload=pay)
+        assert _body(raw)[1].get("full") is True, _body(raw)   # another boot: whole document
+    assert farm_ws.stats["deltas"] == 2 and farm_ws.stats["fulls"] == 2, farm_ws.stats
+
+
+@case
+def test_status_document_is_never_one_big_allocation():
+    """15:42-15:47: 'allocating 6728 bytes' (json.dumps of the whole doc) and
+    'allocating 7382 bytes' (headers + body joined).  The reply is pieces,
+    each one unit of the document, and is written through one preallocated
+    REPLY_CHUNK_B buffer."""
+    farm_ws.reset_state()
+    calls = []
+    with fake_clock() as clock:
+        saved = (farm_ws.Response, list(farm_ws._queued_cls), farm_ws._payload_fn)
+        farm_ws.Response = _HdrResponse
+        del farm_ws._queued_cls[:]
+        farm_ws._payload_fn = _payload(calls)
+        try:
+            conn = ReplyConn(clock)
+            req = types.SimpleNamespace(connection=conn, client_address=("192.168.0.125", 5),
+                                        query_params={})
+            farm_ws.route_status(req)._send()
+            job = farm_ws._replies[0]
+            assert job["size"] > 7000, job["size"]
+            assert max(len(p) for p in job["pieces"]) <= 2000, [len(p) for p in job["pieces"]]
+            buf = farm_ws._chunk_buf
+            while not conn.closed:
+                farm_ws.poll()
+                clock.t += 0.05
+            assert farm_ws._chunk_buf is buf
+        finally:
+            farm_ws.Response, farm_ws._payload_fn = saved[0], saved[2]
+            farm_ws._queued_cls[:] = saved[1]
+    doc = json.loads(bytes(conn.data).split(b"\r\n\r\n", 1)[1])
+    assert len(doc["sections"]) == 6 and doc["parts"]["ring"] == {"n": 1}
+    assert max(n for _, n in conn.sends) <= link_health.REPLY_CHUNK_B
+
+
+@case
+def test_status_is_rate_limited_per_peer_and_a_third_poller_is_held():
+    farm_ws.reset_state()
+    calls = []
+    with fake_clock() as clock:
+        q = {"since": "0", "boot": ""}
+        a1, _ = _status_get(clock, calls, q)
+        a2, _ = _status_get(clock, calls, q)                 # two per STATUS_POLL_HINT_S: fine
+        a3, _ = _status_get(clock, calls, q)                 # a third within it: held "again"
+        b1, _ = _status_get(clock, calls, q, peer="192.168.0.120")
+        c1, _ = _status_get(clock, calls, q, peer="192.168.0.99")   # a third poller: "crowd"
+        clock.t += link_health.STATUS_POLL_HINT_S
+        a4, _ = _status_get(clock, calls, q)
+        p1, _ = _status_get(clock, calls, None, peer="192.168.0.120")   # plain: whole + parts
+        clock.t += link_health.STATUS_POLL_HINT_S
+        p2, _ = _status_get(clock, calls, None, peer="192.168.0.120")   # plain again < 15 s
+    got = [_body(x)[1].get("held") for x in (a1, a2, a3, b1, c1, a4, p1, p2)]
+    assert got == [None, None, "again", None, "crowd", None, None, "refull"], got
+    assert "parts" in _body(p1)[1]
+
+
+@case
+def test_a_memory_error_is_an_event_not_the_end_of_the_link():
+    """15:42:29 / 15:45-47: 'ws poll: memory allocation failed' every few
+    seconds, then lost.  Now: replies cancelled, document dropped, heap
+    collected, the send path drains without raising the level, /status is
+    held for STATUS_NOMEM_S, and the stall is answered."""
+    import io, contextlib
+    farm_ws.reset_state()
+    calls = []
+    with fake_clock() as clock:
+        _status_get(clock, calls)
+        conn = ReplyConn(clock)
+        farm_ws._queue_reply(conn, [b"x" * 3000])
+        class Srv:
+            def poll(self):
+                raise MemoryError("memory allocation failed, allocating 7382 bytes")
+        farm_ws._server = Srv()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                farm_ws.poll()
+        finally:
+            farm_ws._server = None
+        assert conn.closed and not farm_ws._replies and farm_ws._doc.built_at is None
+        assert farm_ws._path.state == link_health.SEND_DRAIN and farm_ws._path.level == 0
+        clock.t += link_health.DRAIN_S + 0.5              # nothing is served during the drain
+        raw, _ = _status_get(clock, calls, {"since": "0", "boot": ""})
+        assert _body(raw)[1]["held"] == "nomem"
+        clock.t += link_health.STATUS_NOMEM_S
+        raw, _ = _status_get(clock, calls, {"since": "0", "boot": ""})
+        assert _body(raw)[1]["full"] is True
+    notes = dict(farm_ws.take_link_notes())
+    assert "mem_low" in notes and notes["mem_low"]["where"] == "server", notes
+    assert farm_ws.stats["mem_low"] == 1 and farm_ws.stalls_since(clock.t, 300.0) == 0
+
+
+@case
+def test_a_memory_error_building_the_document_is_held_not_raised():
+    import io, contextlib
+    farm_ws.reset_state()
+    calls = []
+    def boom():
+        raise MemoryError("memory allocation failed, allocating 6728 bytes")
+    saved = (farm_ws.Response, list(farm_ws._queued_cls), farm_ws._payload_fn)
+    farm_ws.Response = _HdrResponse
+    del farm_ws._queued_cls[:]
+    farm_ws._payload_fn = boom
+    try:
+        with fake_clock() as clock, contextlib.redirect_stdout(io.StringIO()):
+            req = types.SimpleNamespace(connection=ReplyConn(clock),
+                                        client_address=("192.168.0.125", 5), query_params={})
+            farm_ws.route_status(req)._send()      # nothing raised into the library
+    finally:
+        farm_ws.Response, farm_ws._payload_fn = saved[0], saved[2]
+        farm_ws._queued_cls[:] = saved[1]
+    body = status_doc.join(farm_ws._replies[0]["pieces"]).split(b"\r\n\r\n", 1)[1]
+    assert json.loads(body)["held"] == "nomem" and farm_ws.stats["mem_low"] == 1
+    assert farm_ws._path.state == link_health.SEND_DRAIN
+
+
+@case
+def test_a_slow_status_chunk_does_not_raise_the_ws_backoff():
+    """15:38:33 send_backoff 'reply slow 0.95 s'."""
+    farm_ws.reset_state()
+    with fake_clock() as clock:
+        conn = ReplyConn(clock, cost=lambda b: 0.95)
+        farm_ws._queue_reply(conn, [b"x" * 3000])
+        for _ in range(5):
+            farm_ws.poll()
+            clock.t += 0.05
+    assert farm_ws._path.state == link_health.SEND_OK and farm_ws._path.level == 0
 
 
 @case

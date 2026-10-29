@@ -109,12 +109,17 @@ MIN_SLICE_S = 0.05           # not worth starting a send with less budget than t
 
 # A call that took this long counts as a bad send, whether or not it raised.
 SLOW_S = {"replay": 0.2, "live": 0.3, "server": 1.0, "close": 0.15, "poll": 1.5,
-          "reply": 0.3}
+          "reply": 2.0}
+# "reply" (a /status chunk) is not a /ws send: a slow chunk is the reply
+# writer's business (its own REPLY_DEADLINE_S), not a reason to refuse /ws
+# clients.  15:38:33 "send_backoff 'reply slow 0.95 s'" raised the WS level for
+# nothing.  Only a chunk of STARVED_S (lwIP's ERR_MEM sleep) counts, and that
+# one is "answered" (below): it drains without raising the level.
 # A call that RAISED counts as a bad send only for these kinds.  A close frame
 # that fails at once (2026-10-29 15:04:30: EBADF, 0.00 s, on a socket the
 # library had already shut) says nothing about the link: only a slow close
 # counts.  (Every other kind: a failure is bad, as before.)
-FAILURE_IS_BAD = {"close": False}
+FAILURE_IS_BAD = {"close": False, "reply": False}   # a poller hanging up early: not lwIP
 
 # CircuitPython 10.0.3 ports/raspberrypi/common-hal/socketpool/Socket.c
 # lwip_tcp_send(): `for (i = 0; i < 200; ++i) { tcp_write(); ... if ERR_MEM:
@@ -176,6 +181,18 @@ SEND_TRANSITIONS = {
     (SEND_DEGRADED, "calm"):      (SEND_DEGRADED, -1),
     (SEND_DEGRADED, "level0"):    (SEND_OK, 0),
 }
+# A stall whose cause is known and already dealt with -- a /status chunk that
+# hit ERR_MEM (the reply is cancelled: "answered"), or a MemoryError in the
+# poll ("nomem": replies cancelled, gc.collect()) -- still drains, so lwIP can
+# free what is queued, but does not raise the level: the level is how gently
+# /ws clients are treated, and they did nothing.  15:45:47: reply-cancel
+# stalls had walked the level up to 5 (no replay at all) before the radio reset.
+for _st in (SEND_OK, SEND_DEGRADED, SEND_BACKOFF, SEND_DRAIN):
+    SEND_TRANSITIONS[(_st, "answered")] = (SEND_DRAIN, 0)
+    SEND_TRANSITIONS[(_st, "nomem")] = (SEND_DRAIN, 0)
+del _st
+# kinds whose STARVED_S stall is "answered" rather than "starved"
+KNOWN_CAUSE = ("reply",)
 # What each state lets farm_ws do: accept a /ws client; run the library's
 # Server.poll() at all (accept, read a request, send its reply: a 503 or a
 # /status body is a send too); write frames to clients (else they queue).
@@ -285,9 +302,18 @@ class SendPath:
             self.last_bad = now
             why = "%s %s %.2f s" % (kind, "slow" if ok else "failed", took_s)
             # one call this long is lwIP's ERR_MEM sleep, not a slow peer
-            self._fire(now, "starved" if took_s >= STARVED_S and kind != "poll"
-                       else "bad", why)
+            if took_s >= STARVED_S and kind in KNOWN_CAUSE:
+                self._fire(now, "answered", why)
+            else:
+                self._fire(now, "starved" if took_s >= STARVED_S and kind != "poll"
+                           else "bad", why)
         return bad
+
+    def memory_low(self, now, why):
+        """A MemoryError on the poll path: drain (no serving, no writes) for
+        DRAIN_S while the Python heap is collected and lwIP frees."""
+        self._timed(now)
+        self._fire(now, "nomem", why)
 
     def note_refused(self):
         self.refused += 1
@@ -442,6 +468,7 @@ for _st in (R_WAITING, R_SENDING):
     REPLY_TRANSITIONS[(_st, "failed")] = (R_CANCELLED, "abort")
     REPLY_TRANSITIONS[(_st, "starved")] = (R_CANCELLED, "abort")
     REPLY_TRANSITIONS[(_st, "held")] = (R_CANCELLED, "abort")     # the tower started ringing
+    REPLY_TRANSITIONS[(_st, "nomem")] = (R_CANCELLED, "abort")    # MemoryError: give it all back
 del _st
 
 
@@ -481,6 +508,41 @@ STATUS_TRANSITIONS = {
 
 STATUS_HELD_RETRY_S = 15         # Retry-After: Sandbells' default poll_hint_sec
 STATUS_HELD_BODY_MAX = 512       # well inside one REPLY_CHUNK_B
+
+# --- what one /status request gets (status_doc.StatusDoc, farm_ws.route_status)
+#
+# The document is rebuilt at most every STATUS_REBUILD_S, whoever asks, and
+# kept as pieces with a version per piece.  A poller that says
+#   /status?since=<status_version>&boot=<boot_id>
+# gets only what changed (a few hundred bytes); a first request (since=0, an
+# unknown boot or version) gets the whole document without "parts"; a plain
+# /status (old Sandbells, curl) gets the whole document with parts, at most
+# once per STATUS_FULL_MIN_S per peer.  Over the limits: the tiny held reply.
+STATUS_REBUILD_S = 2.0           # Sandbells' fastest poll is 3 s (poll_hint_sec clamp)
+STATUS_POLL_HINT_S = 5           # the document's poll_hint_sec
+STATUS_PEER_N = 2                # replies per peer per STATUS_POLL_HINT_S: one Sandbells
+                                 # proxy serves the kiosk page and one more browser
+STATUS_MAX_PEERS = 2             # pollers within STATUS_PEER_WINDOW_S (15:42: .125 and .120)
+STATUS_PEER_WINDOW_S = 60.0
+STATUS_FULL_MIN_S = 15.0         # a plain (whole + parts) /status per peer: Sandbells' default poll
+STATUS_NOMEM_S = 2 * DRAIN_S     # after a MemoryError: the drain, then as long again held
+
+# (gate state, what the request is) -> what it gets.  Events, in the order
+# farm_ws checks them: nomem, crowd (a poller beyond STATUS_MAX_PEERS), again
+# (this peer over STATUS_PEER_N), refull (plain /status again within
+# STATUS_FULL_MIN_S), first (needs the whole document), since (delta).
+STATUS_ASK = {
+    (STATUS_SERVE, "first"):  "full",
+    (STATUS_SERVE, "plain"):  "full_parts",
+    (STATUS_SERVE, "since"):  "delta",
+    (STATUS_SERVE, "again"):  "held",
+    (STATUS_SERVE, "crowd"):  "held",
+    (STATUS_SERVE, "refull"): "held",
+    (STATUS_SERVE, "nomem"):  "held",
+}
+for _ev in ("first", "plain", "since", "again", "crowd", "refull", "nomem"):
+    STATUS_ASK[(STATUS_HELD, _ev)] = "held"                  # ringing: strokes first
+del _ev
 
 
 class StatusGate:
