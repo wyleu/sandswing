@@ -1294,6 +1294,55 @@ def test_ringing_cancels_the_full_reply_being_written():
     assert held and held[0]["cancelled"] == 1, held
 
 
+@case
+def test_a_status_socket_already_gone_is_dropped_quietly():
+    """16:20:03-04: three '/status reply cancelled ([Errno 9] EBADF)' warnings."""
+    import io, contextlib
+    farm_ws.reset_state()
+    class GoneConn(ReplyConn):
+        def send(self, view):
+            if self.sends:
+                raise OSError(9, "EBADF")
+            return ReplyConn.send(self, view)
+    with fake_clock() as clock:
+        conn = GoneConn(clock)
+        farm_ws._queue_reply(conn, [b"x" * 1773])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            for _ in range(3):
+                farm_ws.poll()
+                clock.t += 0.05
+    assert conn.closed and not farm_ws._replies
+    assert farm_ws.stats["replies_gone"] == 1 and farm_ws.stats["replies_cancelled"] == 0
+    assert "cancelled" not in out.getvalue()
+    assert not [w for w, _ in farm_ws.take_link_notes() if w == "reply_cancelled"]
+    assert farm_ws._path.state == link_health.SEND_OK
+
+
+@case
+def test_parts_are_built_only_for_a_plain_status():
+    farm_ws.reset_state()
+    asked = []
+    def payload(parts=True):
+        asked.append(parts)
+        doc = {"schema": "sand.status/v1", "id": "x", "sections": [{"id": "a"}],
+               "parts": {"watchdog": {"last_reset": None}}}
+        if parts:
+            doc["parts"]["survey"] = {"pad": "s" * 3000}
+        return doc
+    with fake_clock() as clock:
+        raw, _ = _status_get(clock, [], {"since": "0", "boot": ""}, payload=payload)
+        assert "parts" not in _body(raw)[1] and asked == [False]
+        lean_cache = farm_ws.stats["status_cache_b"]
+        clock.t += 0.5                                       # within STATUS_REBUILD_S
+        raw, _ = _status_get(clock, [], None, peer="192.168.0.120", payload=payload)
+        assert _body(raw)[1]["parts"]["survey"]["pad"] == "s" * 3000 and asked == [False, True]
+        clock.t += 5
+        _status_get(clock, [], {"since": "0", "boot": ""}, payload=payload)
+    assert asked == [False, True, False]
+    assert farm_ws.stats["status_cache_b"] == lean_cache < 500, farm_ws.stats["status_cache_b"]
+
+
 def kiosk_session(seconds, drain_bps, cap=3000):
     """A display that reconnects half a second after every drop, against an lwIP
     queue model.  Returns (stall times, 503 count, replays done, connects)."""

@@ -381,14 +381,19 @@ class Concentrator:
                      for _ in range(self.n)]
         self.frame = panel.panel_frame({}, self.link)
         
-    def status_payload(self):
-        parts = {"mux": report.part(self.mux), "gate": report.part(self.gate),
-                 "refresh": report.part(self.refresher),
-                 "ring": report.part(self.ring),
-                 "sync": report.part(self.sntp, "boot_record"),
-                 "watchdog": report.part(self.guard),
-                 "link": self.link_status(),
-                 "survey": self.survey_status()}
+    def status_payload(self, parts=True):
+        """parts=False (farm_ws: deltas and Sandbells' first full document,
+        which never show them): only the watchdog part, for last_reset."""
+        if parts:
+            parts = {"mux": report.part(self.mux), "gate": report.part(self.gate),
+                     "refresh": report.part(self.refresher),
+                     "ring": report.part(self.ring),
+                     "sync": report.part(self.sntp, "boot_record"),
+                     "watchdog": report.part(self.guard),
+                     "link": self.link_status(),
+                     "survey": self.survey_status()}
+        else:
+            parts = {"watchdog": report.part(self.guard)}
         return report.build({
             "id": self.cfg.get("device", {}).get("name"),
             "name": self.cfg.get("device", {}).get("name"),

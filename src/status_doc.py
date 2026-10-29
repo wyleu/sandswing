@@ -15,7 +15,8 @@ the version at which it last changed.  A reply is a list of those pieces
 plus a few separators; farm_ws writes them in chunks without joining them.
 
     doc = StatusDoc(boot_id)
-    doc.refresh(now, payload_fn, min_s)  -> True if rebuilt
+    doc.refresh(now, payload_fn, min_s, parts=False)  -> True if rebuilt
+    doc.cache_b()                        -> bytes held between requests
     doc.full(parts=True)                 -> [pieces]   whole document
     doc.delta(since)                     -> [pieces]   only what changed after `since`
     doc.knows(since, boot)               -> can a delta from `since` be given?
@@ -55,12 +56,18 @@ class StatusDoc:
         self.parts = []          # part keys, in document order
         self.gone = {}           # key -> version at which it disappeared
         self.built_at = None
-        self.size_b = 0          # the last full document's size (with parts)
+        self.size_b = 0          # the last full document's size (with parts if kept)
 
-    def refresh(self, now, payload_fn, min_s):
-        """Rebuild from payload_fn() unless built less than min_s ago."""
-        if self.built_at is not None and now - self.built_at < min_s:
+    def refresh(self, now, payload_fn, min_s, parts=False):
+        """Rebuild from payload_fn() unless built less than min_s ago (or
+        parts are wanted and not held).  Parts are kept only when asked for
+        (a plain /status): 16:18 'mem free 87 kB', the parts were most of
+        the cache and of every rebuild's garbage, and no delta carries them.
+        They do not move the version either."""
+        if self.built_at is not None and now - self.built_at < min_s \
+                and (self.parts or not parts):
             return False
+        parts_wanted = parts
         doc = payload_fn()
         self.built_at = now
         seen = {}
@@ -73,6 +80,8 @@ class StatusDoc:
                     order.append(sid)
                     seen["s:" + sid] = _b(dumps(sec))
             elif k == "parts":
+                if not parts_wanted:
+                    continue
                 for pk in doc[k]:
                     parts.append(pk)
                     seen["p:" + pk] = _b(dumps(doc[k][pk]))
@@ -80,20 +89,30 @@ class StatusDoc:
                 head[k] = doc[k]
         seen[HEAD] = _b(dumps(head))
         doc = head = None
+        for k in [k for k in self.units if k.startswith("p:")]:
+            del self.units[k]                    # parts: never kept from one build to the next
         changed = [k for k in seen
                    if k not in self.units or self.units[k][1] != seen[k]]
         removed = [k for k in self.units if k not in seen]
-        if changed or removed or order != self.order:
+        versioned = [k for k in changed if not k.startswith("p:")]
+        if versioned or removed or order != self.order:
             self.version += 1
-            for k in changed:
-                self.units[k] = [self.version, seen[k]]
-                self.gone.pop(k, None)
-            for k in removed:
-                del self.units[k]
-                self.gone[k] = self.version
+        for k in changed:
+            self.units[k] = [self.version, seen[k]]
+            self.gone.pop(k, None)
+        for k in removed:
+            del self.units[k]
+            self.gone[k] = self.version
+        if len(self.gone) > 16:                  # sections that left long ago
+            for k in sorted(self.gone, key=lambda k: self.gone[k])[:-16]:
+                del self.gone[k]
         self.order, self.parts = order, parts
         self.size_b = sum(len(p) for p in self.full(parts=True))
         return True
+
+    def cache_b(self):
+        """Bytes of serialised units held between requests."""
+        return sum(len(u[1]) for u in self.units.values())
 
     def knows(self, since, boot):
         """A delta needs the same boot and a version this document has had."""

@@ -341,6 +341,8 @@ stateDiagram-v2
     SENDING --> CANCELLED: held
     WAITING --> CANCELLED: nomem
     SENDING --> CANCELLED: nomem
+    WAITING --> CANCELLED: gone
+    SENDING --> CANCELLED: gone
 ```
 
 ### /status while the tower rings (StatusGate)
@@ -448,6 +450,30 @@ throughout: it is the largest *contiguous* block that is missing.
   go into the unsent tail (`unsent_oversize`) costs a whole new pbuf.  512 B
   chunks would need up to three pbufs where one does; they lower nothing.
   What lowers the pressure is fewer bytes: deltas.
+
+### Follow-up (16:17-16:20): parts not cached; a gone poller is quiet
+
+* `mem free` settled at 87 kB (103-111 before).  The document cache held the
+  `parts` (survey, link, mux, ...), which no delta and no Sandbells page uses,
+  and every rebuild (every 2 s while polled) serialised them again.  Now
+  `concentrator.status_payload(parts=False)` builds only the watchdog part
+  (for `last_reset`), and `StatusDoc` keeps parts only for a plain `/status`
+  and drops them at the next rebuild; parts never move `status_version`.
+  `net.status_cache_b` says how many bytes the cache holds.
+* A chunk that finds its socket already gone (`EBADF`, `ECONNRESET`,
+  `EPIPE`, `ENOTCONN`, `ECONNABORTED`) is `gone`: dropped quietly, counted in
+  `net.replies_gone`, no log line, no effect on the send path.  (In
+  CircuitPython `EBADF` means the socket object was closed with a null pcb;
+  the three at 16:20:03-04 came right after the drain, in the burst of
+  reconnects.)
+* Not changed, on purpose: a lock between WS frames and reply chunks, and a
+  smaller heartbeat.  With `LWIP_NETIF_TX_SINGLE_PBUF` each new segment
+  takes a full-MSS pbuf whatever its length, so a 1 kB heartbeat costs the
+  same as a 0.5 kB one; and the frames and chunks are already written one
+  after the other by one Python thread -- what overlaps is lwIP holding
+  unacknowledged segments, which Python cannot see.  The 16:19:53 live-frame
+  stall was handled as designed (that client cut, drain at level 1, no radio
+  reset); what makes it rarer is fewer bytes and less heap churn, above.
 
 ### What a /status request gets (`STATUS_ASK`)
 

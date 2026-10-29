@@ -17,9 +17,9 @@ def doc(ts=1, tower="inactive", sections=("network", "time", "heads", "tower")):
             "parts": {"link": {"drops": 0}, "ring": {"n": 1}}}
 
 
-def built(d, now=0.0):
+def built(d, now=0.0, parts=True):
     sd = status_doc.StatusDoc("b007")
-    sd.refresh(now, lambda: d, 2.0)
+    sd.refresh(now, lambda: d, 2.0, parts=parts)
     return sd
 
 
@@ -89,6 +89,26 @@ def test_merging_deltas_rebuilds_the_full_document():
     merged["status_version"] = d["status_version"]
     want = json.loads(status_doc.join(sd.full(parts=False)))
     assert merged == want
+
+
+@case
+def test_parts_are_kept_only_when_asked_and_never_move_the_version():
+    """16:18 'mem free 87 kB' (was 103-111): the parts were most of the cache
+    and of each rebuild's garbage, and no delta carries them."""
+    d = doc()
+    d["parts"]["survey"] = {"pad": "s" * 3000}
+    sd = status_doc.StatusDoc("b007")
+    sd.refresh(0.0, lambda: d, 2.0)                            # a delta poller
+    lean = sd.cache_b()
+    assert not [k for k in sd.units if k.startswith("p:")] and lean < 1000, lean
+    assert sd.refresh(1.0, lambda: d, 2.0, parts=True)         # a plain /status: built now
+    full = json.loads(status_doc.join(sd.full()))
+    assert full["parts"]["survey"] == d["parts"]["survey"] and sd.version == 1
+    assert sd.cache_b() > lean + 3000
+    d2 = doc()
+    d2["parts"]["survey"] = {"pad": "t" * 3000}                # only parts changed
+    sd.refresh(5.0, lambda: d2, 2.0)
+    assert sd.version == 1 and sd.cache_b() == lean            # dropped again, version kept
 
 
 finish()

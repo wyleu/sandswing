@@ -469,6 +469,7 @@ for _st in (R_WAITING, R_SENDING):
     REPLY_TRANSITIONS[(_st, "starved")] = (R_CANCELLED, "abort")
     REPLY_TRANSITIONS[(_st, "held")] = (R_CANCELLED, "abort")     # the tower started ringing
     REPLY_TRANSITIONS[(_st, "nomem")] = (R_CANCELLED, "abort")    # MemoryError: give it all back
+    REPLY_TRANSITIONS[(_st, "gone")] = (R_CANCELLED, "drop")      # the poller hung up: quietly
 del _st
 
 

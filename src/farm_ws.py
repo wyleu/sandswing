@@ -65,6 +65,24 @@ except ImportError:                     # pragma: no cover
     EAGAIN = 11
     ETIMEDOUT = 110
 
+# a /status socket that is already gone when its next chunk is written: the
+# poller hung up (ECONNRESET / EPIPE / ENOTCONN / ECONNABORTED) or the socket
+# was shut under us (EBADF: CircuitPython's "closed socket, null pcb").
+# Nothing about lwIP or the link: dropped quietly (ReplyPath "gone").
+def _gone_errnos():
+    out = []
+    try:
+        import errno as _e                  # the port's own numbers (newlib on the Pico)
+    except ImportError:                     # pragma: no cover
+        _e = None
+    for name, fallback in (("EBADF", 9), ("EPIPE", 32), ("ECONNABORTED", 113),
+                           ("ECONNRESET", 104), ("ENOTCONN", 128)):
+        out.append(getattr(_e, name, fallback))
+    return tuple(out)
+
+
+REPLY_GONE_ERRNOS = _gone_errnos()
+
 CLIENT_SILENT_S = link_health.CLIENT_SILENT_S  # a heartbeat client silent this long is dead
 CLIENT_LAG_S = link_health.CLIENT_LAG_S        # ...this long: stop writing to it (LAGGING)
 STALL_S = 5.0                  # a poll pass this slow counts as a stall (link health)
@@ -112,7 +130,7 @@ stats = {"connects": 0, "drops": 0, "refused": 0, "send_timeouts": 0,
          "cuts": 0, "lagging": 0, "superseded": 0, "starved": 0,
          "stalls_answered": 0, "replies": 0, "replies_done": 0,
          "replies_cancelled": 0, "replies_held": 0, "deltas": 0, "fulls": 0,
-         "mem_low": 0, "status_version": 0,
+         "mem_low": 0, "status_version": 0, "status_cache_b": 0, "replies_gone": 0,
          "last_reply_s": None, "last_reply_b": None,
          "last_drop_reason": None, "last_drop_at": None,
          "hb_seen": False, "last_rx_at": None}
@@ -425,8 +443,11 @@ def route_status(request, path_status="/status"):
     kind = link_health.STATUS_ASK[(_gate.state, event)]
     if kind != "held":
         try:
-            if _doc.refresh(t_route, _build_payload, link_health.STATUS_REBUILD_S):
+            want_parts = kind == "full_parts"
+            if _doc.refresh(t_route, lambda: _build_payload(want_parts),
+                            link_health.STATUS_REBUILD_S, parts=want_parts):
                 stats["status_version"] = _doc.version
+                stats["status_cache_b"] = _doc.cache_b()
         except MemoryError as e:
             memory_low("status", e)
             kind, event = "held", "nomem"
@@ -455,7 +476,7 @@ def route_status(request, path_status="/status"):
         request, body=body, content_type="application/json", headers=headers)
 
 
-def _build_payload():
+def _build_payload(parts=False):
     """The document, built from the concentrator's payload with the heap
     collected first, so its small allocations reuse freed space instead of
     growing the heap into the port heap lwIP shares."""
@@ -464,7 +485,10 @@ def _build_payload():
         gc.collect()
     except ImportError:
         pass
-    doc = _payload_fn()
+    try:
+        doc = _payload_fn(parts=parts)       # concentrator: skip building parts nobody asked for
+    except TypeError:
+        doc = _payload_fn()
     if isinstance(doc, dict):
         doc["poll_hint_sec"] = link_health.STATUS_POLL_HINT_S
     return doc
@@ -555,6 +579,15 @@ def _queue_reply(conn, data, peer=None, now=None):
 def _reply_event(job, event, why=None):
     """Tell a reply's ReplyPath what happened; do what REPLY_TRANSITIONS says."""
     action = job["path"].fire(event)
+    if action == "drop":                       # the poller is gone: nothing to say
+        if job in _replies:
+            _replies.remove(job)
+        try:
+            job["conn"].close()
+        except Exception:
+            pass
+        stats["replies_gone"] += 1
+        return action
     if action in ("close", "abort"):
         if job in _replies:
             _replies.remove(job)
@@ -622,6 +655,9 @@ def _pump_replies(plan, deadline):
             if e.errno == EAGAIN:                   # no room in lwIP now: next turn
                 _path.observe(t1, "reply", t1 - t0, True)
                 _reply_event(job, "blocked")
+                return
+            if e.errno in REPLY_GONE_ERRNOS:
+                _reply_event(job, "gone")           # not a send problem: not observed
                 return
             _path.observe(t1, "reply", t1 - t0, False)
             _reply_event(job, "failed", _why(e))
