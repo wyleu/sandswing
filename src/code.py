@@ -7,6 +7,7 @@ import time
 
 DEFAULT_PROGRAM = None  # ← set to e.g. "fallback.py" if desired
 CONFIG_FILE = "settings.json"
+BOOT_LABEL = "SANDSWING"   # boot line names the project (was "CIRCUITPY", the drive name)
 try:
     import json
     with open(CONFIG_FILE, "rb") as f:
@@ -31,9 +32,9 @@ except Exception as e:
     
 try:
     import build_info
-    print("CIRCUITPY", build_info.GIT, build_info.BUILT)
+    print(BOOT_LABEL, build_info.GIT, build_info.BUILT)
 except Exception:
-    print("CIRCUITPY unstamped")
+    print(BOOT_LABEL, "unstamped")
 
 print("WiFi SSID:", wifi_ssid)
 print("MIDI channel:", midi_channel)

@@ -118,8 +118,20 @@ git status
 git rev-parse --short HEAD
 tools/deploy.sh              # code + build_info
 tools/deploy.sh --settings   # also copy settings.json
-tools/deploy.sh --settings --lib   # wiped board / new UF2
+tools/deploy.sh --settings --lib --first-install   # wiped board / new UF2
 ```
+
+Before copying anything `tools/board_guard.py` checks the board really is the
+sandswing Pico: `PROJECT="sandswing"` in its `build_info.py` (older stamps:
+sandswing files on it), a `settings.json` whose `startup.program` is
+`concentrator.py`, and, if `~/.config/sandpico/sandswing.uid` exists, the
+`UID:` from `boot_out.txt`. Pin it once:
+`mkdir -p ~/.config/sandpico && echo 7091CDAB9DBD5305 >> ~/.config/sandpico/sandswing.uid`.
+On another project's board, or a blank one without `--first-install`, it
+prints `guard: REFUSED: ...` and copies nothing; `--force` overrides. The
+board's `settings.json` is first backed up to `~/pico-settings/` (mode 600).
+`tools/deploy.sh /media/$USER/CIRCUITPY` (or `--dest DIR`) uses that mount
+instead of the `CIRCUITPY` label and leaves it mounted.
 
 `tools/files.txt` is the list. Logging on the Pico is off unless you add `farm_log.py`. Capture serial on the Pi.
 
@@ -130,7 +142,7 @@ git rev-parse --short HEAD
 mpremote connect /dev/ttyACM0 fs cat :build_info.py
 ```
 
-Same short hash. Serial after Ctrl-D should print `CIRCUITPY <hash>` from `code.py`.
+Same short hash. Serial after Ctrl-D should print `SANDSWING <hash> <date>` from `code.py` (before this it said `CIRCUITPY`).
 
 Dirty `src/` still copies; the stamp is the last commit. Clean tree + deploy + matching hash = current.
 
