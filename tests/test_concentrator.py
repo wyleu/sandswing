@@ -3,7 +3,18 @@ import os
 import sys
 from hw import spawn, child_setup, child_finish, check, finish, run_survey, paint_once
 
-ONCE = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 26, 28]
+ONCE = [8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 26, 28]
+# Sense inputs: keypad.Keys holds them, handed to DigitalInOut only while the
+# self-test / a survey runs (sense_keys.py), so they are claimed in turn.
+SENSE = [0, 1, 2, 3, 4, 5, 6, 7]
+TICKS_MASK = (1 << 29) - 1
+
+
+def keypad_clock(t):
+    """Fake keypad stamps edges with supervisor.ticks_ms: follow the test's
+    tick list t (raw, wrapped like CircuitPython)."""
+    import supervisor
+    supervisor.ticks_ms = lambda: t[0] & TICKS_MASK
 
 
 class FakeSntp:
@@ -63,6 +74,7 @@ def strokes(app, fh):
     app.head[0] = app.head[1] = "new"            # heads, not plug-change sockets
     t = [1000000]
     app.ticks = TickClock(lambda: t[0])
+    keypad_clock(t)
     app.ring.clock_ms = app.ticks.now
     sent = []
     concentrator.send = sent.append
@@ -85,6 +97,73 @@ def strokes(app, fh):
     app._tower_step()
     return {"tower0": tower0, "wakes": app.sntp.wakes,
             "events": [[e["body"]["ch"], e["session"], e["mode"]] for e in sent]}
+
+
+class RawSntp(FakeSntp):
+    """Records the raw_tick each stamp() was given."""
+    def __init__(self):
+        FakeSntp.__init__(self)
+        self.raws = []
+
+    def stamp(self, raw_tick=None):
+        self.raws.append(raw_tick)
+        return FakeSntp.stamp(self, raw_tick)
+
+
+def stamps(app, fh):
+    """keypad edges: a stroke carries its edge's own stamp (not the drain
+    time), across the 2**29 ticks_ms wrap; key -> channel; overflow shows in
+    the log, /status and the heartbeat."""
+    import concentrator
+    import keypad
+    from sntp_pico import TickClock, TICKS_PERIOD
+    keys = keypad.made[-1]
+    assert keys is app.sense.keys
+    keys.scanning = False                       # edges by inject() only
+    app.head[0] = app.head[2] = "new"
+    t = [TICKS_PERIOD - 1000]                   # 1 s before ticks_ms wraps
+    app.ticks = TickClock(lambda: t[0] & TICKS_MASK)
+    app.events.ticks = app.ticks
+    keypad_clock(t)
+    sent = []
+    concentrator.send = lambda obj, keep=True: sent.append(obj)
+    app.sntp = None                             # tick_ms from app.ticks.extend(raw)
+    app.poll_sense()                            # all clear: last_false set
+    res = {}
+    # edge at T-900, drained 400 ms later (a busy loop)
+    keys.inject(0, True, (TICKS_PERIOD - 900) & TICKS_MASK)
+    keys.inject(0, False, (TICKS_PERIOD - 860) & TICKS_MASK)
+    t[0] = TICKS_PERIOD - 500
+    app.poll_sense()
+    # next stroke after the wrap: raw stamp 100, drained at raw 700
+    keys.inject(2, True, (TICKS_PERIOD - 50) & TICKS_MASK)   # key 2 = ch3, before the wrap
+    keys.inject(0, True, 100)                                # ch1 again, after it
+    t[0] = TICKS_PERIOD + 700
+    app.poll_sense()
+    res["strokes"] = [[e["body"]["ch"], e["tick_ms"]] for e in sent if e["type"] == "stroke"]
+    res["stroke_ms"] = [app.stroke_ms[0], app.stroke_ms[2]]
+    # with a clock: SntpClock.stamp gets the keypad stamp as raw_tick
+    app.sntp = RawSntp()
+    keys.inject(0, False, 300)
+    keys.inject(0, True, 1300)
+    t[0] = TICKS_PERIOD + 2000
+    app.poll_sense()
+    res["raws"] = app.sntp.raws
+    # overflow: a full queue while the loop is held
+    lines = []
+    app.sense.log = lines.append
+    for i in range(keys.max_events + 3):
+        keys.inject(3, i % 2 == 0, 2000 + i)
+    app.sntp = None
+    app.poll_sense()
+    res["overflow_lines"] = lines
+    res["overflowed_after"] = keys.events.overflowed
+    res["more_sense"] = app.status_more()["sense"]
+    res["hb_edges_lost"] = app.heartbeat_doc()["body"]["edges_lost"]
+    doc = app.status_payload()
+    res["panel_edges"] = [[i["value"], i["level"]] for x in doc["sections"]
+                          if x["id"] == "concentrator" for i in x["items"] if i["key"] == "edges"]
+    return {"stamps": res}
 
 
 def watch_empty(app, fh, plug_head):
@@ -270,6 +349,7 @@ def trigger(app, fh, pressed):
     res = {"heads": list(app.head), "laser8": fh.pwm[8].duty_cycle}
     t = [5000000]
     app.ticks = TickClock(lambda: t[0])
+    keypad_clock(t)
     sent = []
     concentrator.send = lambda obj, keep=True: sent.append(obj)
     app.sntp = SessionSntp()
@@ -392,6 +472,8 @@ def child(scenario, src, extra):
         run_survey(app, "boot")              # boot survey (was _probe_heads in __init__)
         if scenario == "strokes":
             out.update(strokes(app, fh))
+        if scenario == "stamps":
+            out.update(stamps(app, fh))
         if scenario == "watch":
             out.update(watch_empty(app, fh, plug_head))
         if scenario == "link":
@@ -430,6 +512,8 @@ def child(scenario, src, extra):
         out["slice21"] = list(app.mux.pwm_slices[21][:3])
         out["warn27"] = any("27" in w for w in app.mux.warnings)
         app.poll_sense()
+        out["sense_claims"] = dict((str(g), [k for gp, k in fh.history if gp == g])
+                                   for g in range(app.n))
         # tower goes active, rings down, goes inactive -> survey (x2)
         for _ in range(2):
             for st in ("active", "ringing_down", "inactive"):
@@ -477,6 +561,12 @@ def main():
         once = dict((g, n) for g, n in r["claims"].items() if int(g) in ONCE)
         check(t + " every pin claimed exactly once",
               once == dict((str(g), 1) for g in ONCE), r["claims"])
+        seq = r.get("sense_claims") or {}
+        check(t + " sense pins: DigitalInOut (self-test, surveys) and keypad in turn, keypad last",
+              sorted(seq) == [str(g) for g in SENSE]
+              and all(k[0] == "DigitalInOut" and k[-1] == "keypad.Keys"
+                      and all(a != b for a, b in zip(k, k[1:])) for k in seq.values()),
+              seq)
         check(t + " GP27 never claimed", not r["gp27"])
         check(t + " heads all 'empty' (ch5-8 no_board)", r.get("heads") == ["empty"] * 8
               and r.get("heads_after") == ["empty"] * 8, r.get("heads"))
@@ -514,6 +604,24 @@ def main():
     check("strokes: other channel independent of ch1's gap", ev[-1:] == [[2, 1, "ringing"]], ev)
     check("strokes: one session for the whole ring (one wake)",
           r.get("wakes") == 1 and all(e[1] == 1 for e in ev), (r.get("wakes"), ev))
+    r = spawn(me, "stamps")
+    S = r.get("stamps") or {}
+    P = 1 << 29
+    check("keypad: a stroke carries its edge's stamp, not the (400 ms later) drain time",
+          (S.get("strokes") or [None])[0] == [1, P - 900], r.get("exc") or S.get("strokes"))
+    check("keypad: key 2 -> ch3; stamps before and after the 2**29 wrap extend in order",
+          (S.get("strokes") or [])[1:] == [[3, P - 50], [1, P + 100]]
+          and S.get("stroke_ms") == [P + 100, P - 50], (S.get("strokes"), S.get("stroke_ms")))
+    check("keypad: SntpClock.stamp() is given the raw keypad stamp",
+          S.get("raws") == [1300], S.get("raws"))
+    check("keypad: overflow logged once, cleared, counted in /status, heartbeat and panel",
+          len(S.get("overflow_lines") or []) == 1 and "EDGES LOST" in S["overflow_lines"][0]
+          and S.get("overflowed_after") is False
+          and (S.get("more_sense") or {}).get("overflows") == 1
+          and (S.get("more_sense") or {}).get("scan_ms") == 1
+          and S.get("hb_edges_lost") == 1
+          and S.get("panel_edges") == [["keypad 1 ms, 1 overflow", "warn"]],
+          (S.get("overflow_lines"), S.get("more_sense"), S.get("hb_edges_lost"), S.get("panel_edges")))
     r = spawn(me, "watch")
     w = r.get("watch") or {}
     quiet = {"selects": 0, "pulses": 0, "doubt": False, "ch": None}

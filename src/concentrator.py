@@ -26,8 +26,10 @@ Flow
    with the surveyed kinds; it holds the heads' lasers and sends MIDI.
    The watchdog (watchdog_guard, OFF by default) is armed only after
    startup, just before the steady loop, and fed only from _sense_step().
-5. Steady loop (sense_task): poll sense, tower, gate, await survey step,
-   feed watchdog. panel_task and the ws poll task run alongside.
+5. Steady loop (sense_task): drain the sense edges, tower, gate, await
+   survey step, feed watchdog. panel_task and the ws poll task run alongside.
+   Edges are stamped by keypad in the background (sense_keys.py), not by
+   this loop: a late loop delays an edge's handling, never its time.
 
 The old test-program exec (settings test.program) is gone; see RETIRE.md.
 On tower-inactive the absolute head state can be re-assessed by triggering
@@ -40,15 +42,18 @@ settings.json
 Pins
 ----
 The pin list comes from pins_from_settings.load_pinmap. A/B/C, GP26,
-GP21 and GP28 are claimed once by tower_build/mux_select; sense inputs
-and lasers once here, for the whole run.
+GP21 and GP28 are claimed once by tower_build/mux_select; lasers once here,
+for the whole run.  The sense inputs belong to one SenseKeys (sense_keys.py):
+keypad.Keys scans them, except while a survey runs, when they are handed
+over as plain inputs (the survey switches pulls and samples them).
+
+settings.json "inputs": scan_interval_ms (1), event_queue_len (64).
 """
 
 import time
 
 import asyncio
 import board
-import digitalio
 import neopixel
 import wifi
 import os
@@ -90,6 +95,7 @@ from mux_errors import ChannelBusy
 from laser_measure import counts_to_ma
 from adc_avg import avg as _avg
 from link_health import LinkHealth, PICO_RESET_S, STALL_WINDOW_S
+from sense_keys import SenseKeys, settings as sense_settings
 
 RING_WINDOW_S = 0.4
 SETTLE_S = 0.3
@@ -126,6 +132,11 @@ TRIGGER_MIN_GAP_MS = 150         # and never two test strokes closer than this
 TRIGGER_STUCK_MS = 10000         # held this long (tower quiet): resurvey once
 TRIGGER_BODY = {"test": True, "src": "trigger"}
 
+# poll_sense: drain rounds per pass.  Handling an edge can send (and pump
+# more edges in); a second round takes those now.  The bound keeps a stuck
+# input from holding the loop.
+DRAIN_ROUNDS = 2
+
 # Survey "why" (docs/survey-why.md).  Code constants.
 WHY_HB_CHARS = 80            # heartbeat: first why line, cut to this length
 WHY_HB_KINDS = ("fault", "trigger", "unknown")   # ...and only for these kinds
@@ -146,16 +157,6 @@ def short_why(w, n=WHY_HB_CHARS):
     k = w.rfind(" (")
     tail = w[k:] if k > 0 and w.endswith(")") and len(w) - k < n // 2 else ""
     return w[:n - len(tail) - 3].rstrip() + "..." + tail
-
-
-def _claim_sense(sense_gps):
-    pins = []
-    for gp in sense_gps:
-        pin = digitalio.DigitalInOut(getattr(board, "GP%d" % gp))
-        pin.direction = digitalio.Direction.INPUT
-        pin.pull = digitalio.Pull.UP
-        pins.append(pin)
-    return pins
 
 
 WIFI_ROUNDS = 6          # passes over wifi.networks at boot before giving up
@@ -212,10 +213,14 @@ def emit(msg):
         
 async def ws_poll_task(guard=None, app=None):
     while True:
+        if app is not None:
+            app.pump_edges()                 # farm_ws.poll() can block for a while
         try:
             farm_ws.poll()
         except MemoryError as e:             # an event in the model, not the end of the task
             farm_ws.memory_low("poll", e)
+        if app is not None:
+            app.pump_edges()
         if app is not None:
             app.flush_link_notes()
         if guard is not None:
@@ -279,7 +284,7 @@ class Concentrator:
 
         self.survey_state = SurveyState(
             n_channels=self.n,
-            survey_fn=lambda: survey_all(self.survey, self.bells, self.gate, self._boards()),
+            survey_fn=self._survey,
             paint_fn=lambda kinds, beat: self._paint_kinds(kinds, beat),
         )
         self.survey_state.trigger("boot")
@@ -306,6 +311,8 @@ class Concentrator:
         if not st["dac"].get("ok"):
             print("   dac", st["dac"])
         
+        self.sense.to_keys()         # self-test done: keypad stamps the edges from here
+        self.sense.drain()           # levels now are the starting state, not edges
         self._init_edge_state()
         
         self.head = ["unknown"] * self.n
@@ -315,8 +322,29 @@ class Concentrator:
 
     def _setup_sense(self):
         self.sense_gps = self.pinmap["sense_gp"]
-        self.inputs = _claim_sense(self.sense_gps)
+        scan_ms, queue_len = sense_settings(self.cfg)
+        # plain inputs (pull-up) until the boot self-test is done, then keypad
+        self.sense = SenseKeys(self.sense_gps, scan_ms, queue_len, log=emit)
+        self.inputs = self.sense.pins        # stable stand-ins (bells, Ring)
         self.n = len(self.sense_gps)
+
+    async def _survey(self):
+        """survey_fn: the survey switches pulls and samples the sense pins
+        itself, so it holds them as plain inputs while it runs.  Edges seen
+        before the hand-over stay queued; a level that changed meanwhile is
+        reported as an (unstamped) edge when keypad takes them back."""
+        self.sense.to_pins()
+        try:
+            return await survey_all(self.survey, self.bells, self.gate, self._boards())
+        finally:
+            self.sense.to_keys()
+
+    def pump_edges(self):
+        """Empty keypad's queue into SenseKeys (before and after a blocking
+        call) so it cannot overflow while the loop is held."""
+        sense = getattr(self, "sense", None)
+        if sense is not None:
+            sense.pump()
 
     def _setup_strip(self):
         # TODO(hardware): pixel_order. The old colour comments ((4,0,0)
@@ -370,7 +398,7 @@ class Concentrator:
         self.edge_at = [None] * self.n
         self.stroke_ms = [None] * self.n     # tick ms of the last accepted stroke
         self.stroke_n = [0] * self.n         # accepted strokes this boot (status page)
-        self._prev_held = [not pin.value for pin in self.inputs]
+        self._prev_held = list(self.sense.held)   # level as of the edges handled
         self.trig_armed = [False] * self.n   # trigger plug: next press counts
         self.trig_open_ms = [None] * self.n  # tick ms the switch was seen open
         self.trig_low_ms = [None] * self.n   # tick ms the press began
@@ -440,6 +468,7 @@ class Concentrator:
                           "n": self.stroke_n[i],
                           "ago_s": None if last is None else int((now_ms - last) / 1000)})
         more = {"rssi": farm_ws.wifi_rssi(), "link": link, "time": t,
+                "sense": self.sense.status(),
                 "chans": chans, "uptime_s": int(time.monotonic() - self.boot_at),
                 "last_reset": self.guard.last_reset, "watchdog": self.guard.armed,
                 "boot_id": self.events.boot_id, "seq": self.events.seq,
@@ -462,11 +491,25 @@ class Concentrator:
     def poll_sense(self):
         """Active-low sense, pull-up. A falling edge opens a ring window.
         A return held with no edge is STOOD, not an edge.
+        Every keypad edge goes through _channel and the Ring in the order it
+        happened, carrying its own stamp; then one pass per channel at its
+        current level (ring window, STOOD, trigger timers, tower report).
         """
         now = time.monotonic()
-        for i, pin in enumerate(self.inputs):
-            self._channel(i, pin, now)
-        self.ring.poll()
+        for _ in range(DRAIN_ROUNDS):
+            edges = self.sense.drain()
+            if not edges:
+                break
+            for i, held, raw in edges:
+                self._channel(i, held, now, raw)
+                self.ring.edge(i, held, self._edge_ms(raw))
+        for i in range(self.n):
+            self._channel(i, self._prev_held[i], now)
+
+    def _edge_ms(self, raw):
+        """Extended tick ms of an edge: its keypad stamp (supervisor.ticks_ms,
+        wraps at 2**29) through TickClock.extend, or now if it has none."""
+        return self.ticks.now() if raw is None else self.ticks.extend(raw)
 
     def _paint_kinds(self, kinds, beat_on):
         self.kinds = kinds
@@ -503,9 +546,10 @@ class Concentrator:
         self._frame_args = (kinds, self.link, activity, right)
         panel.paint(self.strip, self.frame)
         
-    def _channel(self, i, pin, now):
+    def _channel(self, i, held, now, raw=None):
+        """held: the level after this edge (or the current level, no edge).
+        raw: the edge's keypad stamp; None = no stamp (use now)."""
         prev = self._prev_held[i]
-        held = not pin.value
         became = held and not prev
         released = (not held) and prev
         self._prev_held[i] = held
@@ -519,10 +563,10 @@ class Concentrator:
     
         stroke = False
         if self.head[i] == "trigger":
-            stroke = self._trigger_edge(i, held, now)
+            stroke = self._trigger_edge(i, held, now, self._edge_ms(raw))
         elif became and self.last_false[i] is not None:
             self.edge_at[i] = now
-            t_ms, last = self.ticks.now(), self.stroke_ms[i]
+            t_ms, last = self._edge_ms(raw), self.stroke_ms[i]
             if last is not None and t_ms - last < MIN_STROKE_GAP_MS:
                 print("%.3f ch %d DOUBLE %dms (ignored)" % (now, i + 1, t_ms - last))
             else:
@@ -557,7 +601,9 @@ class Concentrator:
             body = {"ch": i + 1}
             if self.head[i] == "trigger":
                 body.update(TRIGGER_BODY)        # labelled, never hidden
-            send(self.events.make(self.sntp, "stroke", body))
+            self.sense.pump()                    # the send can block: keep edges flowing
+            send(self.events.make(self.sntp, "stroke", body, raw_tick=raw))
+            self.sense.pump()
         return kind, held
 
     # ---- survey why ---------------------------------------------------------
@@ -614,9 +660,9 @@ class Concentrator:
         return (prev is not None and i < self.n
                 and self.head[i] == "trigger" and prev[i])
 
-    def _trigger_edge(self, i, held, now):
-        """Trigger plug: True when this sample is a counted press."""
-        t = self.ticks.now()
+    def _trigger_edge(self, i, held, now, t):
+        """Trigger plug: True when this sample is a counted press.
+        t: extended tick ms of the edge (its keypad stamp) or of now."""
         opened = self.trig_open_ms[i]
         if opened is not None and t < opened:
             opened = self.trig_open_ms[i] = t        # clock replaced: start again
@@ -715,7 +761,7 @@ class Concentrator:
         import mux_select
         self.ring.stop()
         release(self.lasers)
-        release(self.inputs)
+        self.sense.deinit()
         if self.thr_pwm is not None:
             release([self.thr_pwm])
         mux_select.reset_registry()
@@ -794,10 +840,12 @@ class Concentrator:
         """Periodic link supervision."""
         state = {"lost_at": None, "tried_at": 0}
         while True:
+            self.pump_edges()                    # a rejoin / ping blocks
             try:
                 self.link_step(time.monotonic(), state)
             except Exception as e:               # never let it kill main()
                 emit("link_task: %r" % e)
+            self.pump_edges()
             await asyncio.sleep(LINK_CHECK_S)
         
         # ---- link health ------------------------------------------------------
@@ -806,7 +854,9 @@ class Concentrator:
         body = {"what": what}
         body.update(info)
         emit("%.3f link %s %s" % (time.monotonic(), what, info))
+        self.pump_edges()
         send(self.events.make(self.sntp, "link", body))
+        self.pump_edges()
 
     def flush_link_notes(self):
         take = getattr(farm_ws, "take_link_notes", None)
@@ -853,6 +903,7 @@ class Concentrator:
             "uptime_s": int(time.monotonic() - self.boot_at),
             "last_reset": self.guard.last_reset,
             "watchdog": self.guard.armed,
+            "edges_lost": self.sense.overflows,   # keypad queue overflows this boot
         })
         try:
             import gc
@@ -878,10 +929,12 @@ class Concentrator:
                 emit("loop late %.1f s (survey %s, clients %d)" % (
                     late, self.survey_state.phase, farm_ws.ws_clients()))
             if farm_ws.ws_clients():
+                self.pump_edges()
                 try:
                     send(self.heartbeat_doc(), keep=False)
                 except Exception as e:           # never let it kill main()
                     emit("heartbeat: %r" % e)
+                self.pump_edges()
 
     def _rejoin(self):
         """Blocking join (paused watchdog).  True if we have an address."""

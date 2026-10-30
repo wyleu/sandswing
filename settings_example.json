@@ -29,6 +29,10 @@
   "program": "sandswing.py",
   "enter": "watchdog"
   },
+  "inputs": {
+    "scan_interval_ms": 1,
+    "event_queue_len": 64
+  },
   "probe": {
     "present_delta": 2000,
     "lb_delta": 1000

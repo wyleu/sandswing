@@ -30,6 +30,7 @@
 #   device       – name, family, location, role
 #   startup      – program filename or program registry key
 #   pins         – GPIO map (bell IR path)
+#   inputs       – sense edge scan: scan_interval_ms, event_queue_len (sandswing)
 #   ir           – carrier / duty (bell IR path)
 #   detection    – num_bells, latch timings (bell path)
 #   hardware     – head counts, laser_via, notes (sense path)
@@ -88,6 +89,11 @@ DEFAULTS = {
         "program": None,
     },
     "pins": {},
+    # sense edges (sense_keys.py, keypad.Keys): scan period and queue length
+    "inputs": {
+        "scan_interval_ms": 1,
+        "event_queue_len": 64,
+    },
     "ir": {},
     "detection": {},
     "hardware": {},

@@ -26,6 +26,12 @@ class Pwm:
     duty_cycle = 0
 
 
+def feed(r, ins):
+    """What concentrator does now: every level change is one edge()."""
+    for ch in range(r.n):
+        r.edge(ch, not ins[ch].value)
+
+
 def rig(n=4):
     ins = [Pin(True) for _ in range(n)]
     las = [Pwm() for _ in range(n)]
@@ -49,10 +55,10 @@ def test_new_head_trip_sends_note_and_counts_stroke():
     r, ins, las, sent = rig()
     r.start({0: "head_new"})              # rest high (not held)
     ins[0].value = False                  # beam broken -> held -> trip
-    r.poll()
+    feed(r, ins)
     assert sent == [(0, 65, True)] and r.tripped() == {0} and r.strokes[0] == 1
     ins[0].value = True
-    r.poll()
+    feed(r, ins)
     assert sent[-1] == (0, 65, False) and not r.tripped()
 
 
@@ -61,10 +67,10 @@ def test_old_head_rest_low_trip_on_rise():
     r, ins, las, sent = rig()
     ins[1].value = False                  # old head: held at rest
     r.start({1: "head_old"})
-    r.poll()
+    feed(r, ins)
     assert sent == []                     # resting is not a note
     ins[1].value = True
-    r.poll()
+    feed(r, ins)
     assert sent == [(1, 64, True)]
 
 
@@ -73,10 +79,10 @@ def test_stop_turns_notes_and_lasers_off_and_restart():
     r, ins, las, sent = rig()
     r.start({0: "head_new", 2: "head_new"})
     ins[2].value = False
-    r.poll()
+    feed(r, ins)
     r.stop()
     assert sent[-1] == (2, 62, False) and all(l.duty_cycle == 0 for l in las)
-    r.poll()                              # stopped: nothing happens
+    feed(r, ins)                              # stopped: nothing happens
     r.start({0: "head_new"}, duty={0: 40000})
     assert las[0].duty_cycle == 40000 and las[2].duty_cycle == 0
     assert r.status()["heads"] == {1: "head_new"}
@@ -96,15 +102,33 @@ def test_double_trip_inside_min_gap_is_one_stroke():
     r = ring.Ring(ins, las, send_fn=lambda ch, note, on: sent.append((ch, note, on)),
                   clock_ms=lambda: t[0])
     r.start({0: "head_new", 1: "head_new"})
-    ins[0].value = False; r.poll()                   # stroke
-    t[0] += 20; ins[0].value = True; r.poll()
-    t[0] += 34; ins[0].value = False; r.poll()       # 54 ms later: double
-    t[0] += 20; ins[0].value = True; r.poll()
+    ins[0].value = False; feed(r, ins)                   # stroke
+    t[0] += 20; ins[0].value = True; feed(r, ins)
+    t[0] += 34; ins[0].value = False; feed(r, ins)       # 54 ms later: double
+    t[0] += 20; ins[0].value = True; feed(r, ins)
     assert r.strokes[0] == 1 and sent == [(0, 65, True), (0, 65, False)], sent
-    ins[1].value = False; r.poll()                   # other bell: independent
+    ins[1].value = False; feed(r, ins)                   # other bell: independent
     assert r.strokes[1] == 1, r.strokes
-    t[0] += ring.MIN_STROKE_GAP_MS; ins[0].value = False; r.poll()   # after the gap
+    t[0] += ring.MIN_STROKE_GAP_MS; ins[0].value = False; feed(r, ins)   # after the gap
     assert r.strokes[0] == 2 and sent[-1] == (0, 65, True), sent
+
+
+@case
+def test_edge_uses_its_own_stamp_not_the_clock():
+    t = [500000]
+    ins = [Pin(True)]
+    r = ring.Ring(ins, [Pwm()], send_fn=lambda ch, note, on: None,
+                  clock_ms=lambda: t[0])
+    r.start({0: "head_new"})
+    r.edge(0, True, 400000)                          # stamped 100 s before "now"
+    assert r.on_at[0] == 400000, r.on_at
+    r.edge(0, False, 400020)
+    r.edge(0, True, 400000 + ring.MIN_STROKE_GAP_MS - 1)   # inside the gap by its stamp
+    assert r.strokes[0] == 1, r.strokes
+    r.edge(0, False, 400300)
+    r.edge(0, True, 400000 + ring.MIN_STROKE_GAP_MS)       # gap measured stamp to stamp
+    assert r.strokes[0] == 2, r.strokes
+    assert not hasattr(r, "poll")                    # no pin polling left in Ring
 
 
 n_fail = results.count(False)

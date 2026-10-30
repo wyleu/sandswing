@@ -60,6 +60,48 @@ Rules (from commissioning spec T1–T25, summarised):
 5. If a session starts unsynced, `utc_ms` stays null for that session; `tick_ms`
    is always present so times can be rebuilt later.
 
+### Edge stamps on sandswing: `keypad`, then PIO
+
+Rule 1 ("stamp at the moment of detection") used to mean "when the main loop
+next read the pin".  A busy loop (WebSocket send, radio work) stamped edges
+late: a 3200 ms test pulse train on ch 4 read 3156–3247 ms gaps, in long/short
+pairs summing to ~6400 ms, from a sender good to ≤5 ms.
+
+Now the sense inputs belong to `sense_keys.py`, which runs CircuitPython
+`keypad.Keys` on them (active low, internal pull-up, as before).  keypad scans
+in the background every `inputs.scan_interval_ms` and queues each change with
+its own `supervisor.ticks_ms` timestamp.  The loop drains the queue every pass
+(and before and after blocking sends); a stroke's `tick_ms` / `utc_ms` come
+from that event timestamp via `TickClock.extend()` / `SntpClock.stamp(raw_tick)`,
+so the 2**29 wrap is handled by the same code as every other stamp.  Edge stamps
+are therefore good to **`scan_interval_ms` (1 ms)**, not to the loop period.
+While a survey runs, the pins are handed back to plain `DigitalInOut` (the
+survey switches pulls); a level that changed meanwhile is handled with no
+stamp (now).
+
+```json
+"inputs": {
+  "scan_interval_ms": 1,
+  "event_queue_len": 64
+}
+```
+
+A full queue drops edges: the console says `sense: EDGES LOST ...`, and the
+count is `/status` `more.sense.overflows` (Concentrator panel "Edge stamps")
+and heartbeat `edges_lost`.
+
+Strokes stay in time order among themselves; an event stamped earlier than a
+heartbeat already sent can now follow it on the wire (order by `tick_ms`,
+not arrival).
+
+**Planned upgrade: PIO edge capture.**  The 4-1-2 direction strips have 20 mm
+units which, by an estimate, pass a head in about 3 ms at full-circle speed.
+That is too tight for a 1 ms scan (a unit is two or three samples, and its
+edges are only good to ±1 ms).  An RP2350 PIO state machine timestamping each
+edge in hardware (µs resolution, independent of the CPU) is the planned way to read the strips;
+it can also take over more of the sense processing later.  `keypad` is the
+stage for the stroke counter (funeral / slow toll) until then.
+
 ### Settings (same names on every device)
 
 ```json

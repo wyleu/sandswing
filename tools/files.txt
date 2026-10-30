@@ -5,6 +5,7 @@ pins_from_settings.py
 link_health.py
 concentrator.py
 ring.py
+sense_keys.py
 tower_watch.py
 tower_build.py
 mux_select.py

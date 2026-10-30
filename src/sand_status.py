@@ -461,6 +461,13 @@ def from_concentrator(facts):
         if m.get("mem_free") is not None:
             conc.append(item("mem", "Free memory", "%d kB" % (m["mem_free"] // 1024)))
         conc.append(item("boot", "Boot / event", "%s / %s" % (m.get("boot_id"), m.get("seq"))))
+        sense = m.get("sense")
+        if sense:
+            lost = sense.get("overflows") or 0
+            conc.append(item("edges", "Edge stamps", "keypad %s ms, %d overflow%s" % (
+                sense.get("scan_ms"), lost, "" if lost == 1 else "s"),
+                "warn" if lost else "ok",
+                hint="queue %s events; edges are lost on an overflow" % sense.get("queue")))
         sections.append(section("concentrator", "Concentrator", conc))
     return document(
         device_id=f.get("id") or "concentrator",

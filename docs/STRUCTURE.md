@@ -5,12 +5,12 @@ concentrator.py is the root. It builds every object and injects it into the modu
 ## Flow
 1. **Startup tests:**
    - `tower_build.build_from_pins`: PWM slice check before any claim, then one Tower owns A/B/C, plus GP26, GP21 @ `threshold_mux.pwm_hz` and GP28.
-   - Lasers and sense inputs are claimed once.
+   - Lasers are claimed once.  The sense inputs belong to `sense_keys.SenseKeys`: plain pull-up inputs for the self-test and each survey, `keypad.Keys` (edge stamps, `inputs.scan_interval_ms`) the rest of the time.
    - `socket_survey.survey_all` updates `channel_gate`.
    - The loopback self-test runs.
    - `sntp_pico` starts if there is Wi-Fi and `time.ntp_ips` is set.
 2. **Settle, then ring:** `ring.Ring.start(kinds)` holds the heads' lasers on and sends MIDI on trips.
-3. **Every loop:** `poll_sense`, then `ring.poll`, `panel_frame` (strip + payload), `tower.poll`, `sntp.set_ringing`, `gate.enforce`.
+3. **Every loop:** `poll_sense` (drain the keypad edges; each goes to the stroke state and `ring.edge` with its own stamp), `panel_frame` (strip + payload), `tower.poll`, `sntp.set_ringing`, `gate.enforce`.
 4. **On going inactive:** rescan (survey again, then settle and ring again). The watchdog is paused around the rescan.
 5. **Watchdog** (`watchdog_guard`, see below): armed by `start_app()` only after steps 1-2 and the first SNTP burst, just before the steady loop.
 
@@ -58,7 +58,8 @@ concentrator.py is the root. It builds every object and injects it into the modu
 | panel.py | panel_frame (6 LEDs) -> strip / rig / ws; StatusSlot | 75 | 1175 |
 | report.py | assembles status payload from parts (+ `last_reset`) | 25 | 354 |
 | watchdog_guard.py | WatchdogGuard: hardware watchdog, OFF by default; arm/feed/pause/disarm, heartbeats, reset reason | 226 | 3017 |
-| ring.py | Ring (lasers on, rest level, MIDI, strokes) | 128 | 1771 |
+| ring.py | Ring (lasers on, rest level, MIDI, strokes; fed edges) | 128 | 1771 |
+| sense_keys.py | SenseKeys: sense pins as keypad edges (own ticks_ms stamp), pins hand-over for surveys, overflow count | new | – |
 | sntp_pico.py | SNTP clock (copied as is) | 506 | 5914 |
 | pins_from_settings.py | load_pinmap only | 60 | 734 |
 | tower_watch.py, config_loader.py, farm_ws.py, farm_log.py, sand_status.py | repo, unchanged | 237/382/104/138/368 | 2332/3868/1816/986/4144 |
@@ -74,6 +75,7 @@ graph LR
   concentrator --> channel_gate
   concentrator --> threshold_refresh
   concentrator --> ring
+  concentrator --> sense_keys
   concentrator --> panel
   concentrator --> report
   concentrator --> board_pins
@@ -123,4 +125,5 @@ graph LR
 - `test_imports.py`: every module imports on the fake board modules, and no pin is claimed at import.
 - `test_concentrator.py`: Concentrator end to end on the fakes, covering probe, rescan, the ring and a new-head stroke.
 - `test_ring.py` tests Ring.
+- `test_sense_keys.py` tests SenseKeys on `tests/fakes/keypad.py` (settings defaults, polarity, key -> channel, own stamps, wrap, overflow, hand-over); `test_concentrator.py` "stamps" checks a stroke carries its edge's keypad stamp.
 - The repo's `test_machine.py` and `test_strip.py` are included.

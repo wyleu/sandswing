@@ -3,7 +3,8 @@ ring.py
 =======
 The basic 'I'm ringing' behaviour, run by concentrator.py after its
 startup tests and settle.  It owns no pins: concentrator hands it the
-sense inputs, the laser PWMs and the heads found by the survey.
+sense inputs (read once, for each head's rest level), the laser PWMs and
+the heads found by the survey, and feeds it every sense edge (edge()).
 
 For each head: hold its laser on (at its laser_duty), learn its resting
 level, and send USB MIDI on the change off rest.  Idle is not a note.
@@ -103,27 +104,27 @@ class Ring:
         print("%.3f ch %d %s %d%s" % (time.monotonic(), ch + 1, "ON" if on else "OFF", note,
                                        "" if (self.midi or self._send_fn) else " (no midi)"))
 
-    def poll(self):
-        if not self.running:
+    def edge(self, ch, held, t_ms=None):
+        """One sense edge on channel ch (held = beam state after it), at
+        t_ms (int ms on clock_ms's scale: the edge's own keypad stamp,
+        extended).  t_ms None = now."""
+        if not self.running or ch not in self.heads or held == self.prev_held[ch]:
             return
-        for ch in self.heads:
-            held = not self.inputs[ch].value
-            if held != self.prev_held[ch]:
-                trip = held != self.rest_held[ch]
-                if trip and not self.sounding[ch]:
-                    now = self.clock_ms()
-                    last = self.on_at[ch]
-                    if last is not None and now - last < self.min_gap_ms:
-                        self.prev_held[ch] = held      # double: no note, no stroke
-                        continue
-                    self.on_at[ch] = now
-                    self.sounding[ch] = True
-                    self.strokes[ch] += 1
-                    self._send(ch, True)
-                elif (not trip) and self.sounding[ch]:
-                    self.sounding[ch] = False
-                    self._send(ch, False)
-                self.prev_held[ch] = held
+        trip = held != self.rest_held[ch]
+        if trip and not self.sounding[ch]:
+            now = self.clock_ms() if t_ms is None else t_ms
+            last = self.on_at[ch]
+            if last is not None and now - last < self.min_gap_ms:
+                self.prev_held[ch] = held      # double: no note, no stroke
+                return
+            self.on_at[ch] = now
+            self.sounding[ch] = True
+            self.strokes[ch] += 1
+            self._send(ch, True)
+        elif (not trip) and self.sounding[ch]:
+            self.sounding[ch] = False
+            self._send(ch, False)
+        self.prev_held[ch] = held
 
     def tripped(self):
         return set(ch for ch in self.heads if self.sounding[ch])
