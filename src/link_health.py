@@ -119,7 +119,12 @@ SLOW_S = {"replay": 0.2, "live": 0.3, "server": 1.0, "close": 0.15, "poll": 1.5,
 # that fails at once (2026-10-29 15:04:30: EBADF, 0.00 s, on a socket the
 # library had already shut) says nothing about the link: only a slow close
 # counts.  (Every other kind: a failure is bad, as before.)
-FAILURE_IS_BAD = {"close": False, "reply": False}   # a poller hanging up early: not lwIP
+FAILURE_IS_BAD = {"close": False, "reply": False, "gone": False}   # a poller hanging up early: not lwIP
+# "gone": a /ws frame that failed because the socket was already dead
+# (EBADF / ECONNRESET / ENOTCONN / EPIPE / ECONNABORTED) -- 2026-10-31
+# 10:41:42 "replay failed 0.00 s" on a connection the peer had reset during
+# the handshake raised the level 1 -> 2, and three of those took it to 5 (no
+# replay at all).  A dead socket says nothing about lwIP: only a slow one counts.
 
 # CircuitPython 10.0.3 ports/raspberrypi/common-hal/socketpool/Socket.c
 # lwip_tcp_send(): `for (i = 0; i < 200; ++i) { tcp_write(); ... if ERR_MEM:
@@ -438,6 +443,33 @@ class ClientPath:
 # ---------------------------------------------------------------------------
 TCP_MSS = 1460                   # lwipopts.h
 REPLY_CHUNK_B = TCP_MSS          # at most one new pbuf per send(): 5964 B in 5 turns
+# /ws frames go the same way (farm_ws._flush): a non-blocking socket, at most
+# WS_CHUNK_B per send() call, a short write or EAGAIN parks the rest in the
+# client's own buffer for the next turn instead of spinning on it, and bytes
+# parked longer than the send bound (link.send_block_ms) mean the peer is not
+# reading: the client is cut.
+WS_CHUNK_B = TCP_MSS
+
+# settings.json "link.send_block_ms": the most one network operation (a frame,
+# a handshake or reply chunk, a request read, a close) may hold the loop in
+# Python-visible code.  Default and ceiling: SEND_TIMEOUT_S (a lower value
+# tightens every bound; a higher one is ignored, the bounds above are already
+# the most this loop can afford).  The floor is MIN_SLICE_S.  NOT covered,
+# whatever the setting: lwip_tcp_send's ERR_MEM sleep (LWIP_ERR_MEM_S), which is
+# C code that a Python deadline cannot interrupt.
+MS_PER_S = 1000
+SEND_BLOCK_MS = int(SEND_TIMEOUT_S * MS_PER_S)
+
+
+def send_block_s(cfg):
+    """link.send_block_ms from cfg (a config_loader.Config or a dict), in
+    seconds, clamped to [MIN_SLICE_S, SEND_TIMEOUT_S]."""
+    sec = cfg.get("link", {}) if cfg is not None else {}
+    try:
+        ms = float((sec or {}).get("send_block_ms", SEND_BLOCK_MS))
+    except (TypeError, ValueError):
+        ms = SEND_BLOCK_MS
+    return min(SEND_TIMEOUT_S, max(MIN_SLICE_S, ms / MS_PER_S))
 REPLY_CHUNKS_PER_TURN = 1
 # Sandbells' proxy gives a device STATUS_TRY_TIMEOUT_S = 3 s per address
 # (8 s when it has only one): a reply later than that is read by nobody.

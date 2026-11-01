@@ -33,11 +33,28 @@ SCAN_INTERVAL_MS = 1      # scan every 1 ms tick: edge stamps are good to 1 ms
 # worst loop hold logged so far (a Wi-Fi rejoin pauses the loop, and edges are
 # also pumped before and after it).  The queue costs a few bytes per event.
 EVENT_QUEUE_LEN = 64
+# A pump() later than this after the one before means the loop was held (a
+# network call stuck in C, 2026-10-31: 10 s in lwip_tcp_send).  keypad keeps
+# scanning in the background meanwhile, so the stamps should still be right,
+# but nothing here can prove it: say so in the log and count it in /status
+# (sense.late_drains, next to the overflows).  500 ms is above every bounded
+# hold in the loop (one network op is held to link.send_block_ms, 400 ms by
+# default) so it only fires on a stall nobody could bound.
+LATE_DRAIN_MS = 500
 
 VALUE_WHEN_PRESSED = False   # active-low: the PT pulls the line low when held
 PULL = True                  # internal pull-up, as DigitalInOut Pull.UP before
 MS_PER_S = 1000
 KEYS, PINS = "keys", "pins"
+try:
+    from sntp_pico import TICKS_MASK      # supervisor.ticks_ms wraps at 2**29
+except ImportError:                       # pragma: no cover
+    TICKS_MASK = (1 << 29) - 1
+
+
+def _ticks_ms():
+    import supervisor
+    return supervisor.ticks_ms()
 
 
 def settings(cfg):
@@ -56,6 +73,15 @@ def settings(cfg):
     except (TypeError, ValueError):
         qlen = EVENT_QUEUE_LEN
     return scan, qlen
+
+
+def late_drain_ms(cfg):
+    """inputs.late_drain_ms from cfg, else LATE_DRAIN_MS (at least 1)."""
+    sec = cfg.get("inputs", {}) if cfg is not None else {}
+    try:
+        return max(1, int((sec or {}).get("late_drain_ms", LATE_DRAIN_MS)))
+    except (TypeError, ValueError):
+        return LATE_DRAIN_MS
 
 
 class SensePin:
@@ -82,7 +108,8 @@ class SensePin:
 
 class SenseKeys:
     def __init__(self, gps, scan_interval_ms=SCAN_INTERVAL_MS,
-                 queue_len=EVENT_QUEUE_LEN, log=print):
+                 queue_len=EVENT_QUEUE_LEN, log=print, late_ms=LATE_DRAIN_MS,
+                 ticks=None):
         self.gps = [int(g) for g in gps]
         self.n = len(self.gps)
         self.scan_interval_ms = int(scan_interval_ms)
@@ -91,6 +118,11 @@ class SenseKeys:
         self.held = [False] * self.n     # latest level known (True = held)
         self.overflows = 0               # keypad queue overflowed (edges lost)
         self.handovers = 0               # keys -> pins -> keys round trips
+        self.late_ms = int(late_ms)
+        self.late_drains = 0             # pumps later than late_ms after the last one
+        self.late_max_ms = 0             # the longest gap between pumps this boot
+        self._ticks = _ticks_ms if ticks is None else ticks
+        self._pumped_at = None           # ticks_ms of the last pump (keys mode only)
         self.mode = None
         self.keys = None
         self._dio = None
@@ -113,6 +145,7 @@ class SenseKeys:
             self.pump()
             self.keys.deinit()
             self.keys = None
+        self._pumped_at = None           # the survey owns the loop: not a late drain
         pins = []
         for gp in self.gps:
             p = digitalio.DigitalInOut(self._board_pin(gp))
@@ -140,6 +173,7 @@ class SenseKeys:
                                 interval=self.scan_interval_ms / MS_PER_S,
                                 max_events=self.queue_len)
         self._ev = keypad.Event()
+        self._pumped_at = self._ticks() & TICKS_MASK
         if self.mode == PINS:
             self.handovers += 1
         self.mode = KEYS
@@ -173,6 +207,9 @@ class SenseKeys:
         k = self.keys
         if k is None:
             return 0
+        now = self._ticks() & TICKS_MASK
+        gap = None if self._pumped_at is None else (now - self._pumped_at) & TICKS_MASK
+        self._pumped_at = now
         q, ev, moved = k.events, self._ev, 0
         while q.get_into(ev):
             ch = ev.key_number
@@ -190,7 +227,18 @@ class SenseKeys:
         if q.overflowed:
             self._lost("keypad queue overflowed (max_events %d)" % self.queue_len)
             q.clear()                    # the only way to reset overflowed
+        if gap is not None and gap > self.late_ms:
+            self._late(gap, moved)
         return moved
+
+    def _late(self, gap_ms, moved):
+        """The loop did not look for gap_ms.  The stamps are keypad's own (never
+        replaced by a guess); this only says they could not be checked."""
+        self.late_drains += 1
+        self.late_max_ms = max(self.late_max_ms, gap_ms)
+        self.log("sense: LATE DRAIN, loop held %d ms (> %d ms): %d edge(s) stamped in"
+                 " that window may be late; late drain %d this boot"
+                 % (gap_ms, self.late_ms, moved, self.late_drains))
 
     def _lost(self, why):
         self.overflows += 1
@@ -209,7 +257,8 @@ class SenseKeys:
     def status(self):
         return {"mode": self.mode, "scan_ms": self.scan_interval_ms,
                 "queue": self.queue_len, "overflows": self.overflows,
-                "handovers": self.handovers}
+                "handovers": self.handovers, "late_drains": self.late_drains,
+                "late_max_ms": self.late_max_ms, "late_ms": self.late_ms}
 
     def deinit(self):
         if self.keys is not None:

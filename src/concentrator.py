@@ -95,7 +95,7 @@ from mux_errors import ChannelBusy
 from laser_measure import counts_to_ma
 from adc_avg import avg as _avg
 from link_health import LinkHealth, PICO_RESET_S, STALL_WINDOW_S
-from sense_keys import SenseKeys, settings as sense_settings
+from sense_keys import SenseKeys, settings as sense_settings, late_drain_ms
 
 RING_WINDOW_S = 0.4
 SETTLE_S = 0.3
@@ -324,7 +324,8 @@ class Concentrator:
         self.sense_gps = self.pinmap["sense_gp"]
         scan_ms, queue_len = sense_settings(self.cfg)
         # plain inputs (pull-up) until the boot self-test is done, then keypad
-        self.sense = SenseKeys(self.sense_gps, scan_ms, queue_len, log=emit)
+        self.sense = SenseKeys(self.sense_gps, scan_ms, queue_len, log=emit,
+                               late_ms=late_drain_ms(self.cfg))
         self.inputs = self.sense.pins        # stable stand-ins (bells, Ring)
         self.n = len(self.sense_gps)
 
@@ -904,6 +905,7 @@ class Concentrator:
             "last_reset": self.guard.last_reset,
             "watchdog": self.guard.armed,
             "edges_lost": self.sense.overflows,   # keypad queue overflows this boot
+            "late_drains": self.sense.late_drains,  # loop held > inputs.late_drain_ms
         })
         try:
             import gc

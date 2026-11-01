@@ -31,7 +31,11 @@
   },
   "inputs": {
     "scan_interval_ms": 1,
-    "event_queue_len": 64
+    "event_queue_len": 64,
+    "late_drain_ms": 500
+  },
+  "link": {
+    "send_block_ms": 400
   },
   "probe": {
     "present_delta": 2000,

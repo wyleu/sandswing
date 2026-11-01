@@ -12,6 +12,7 @@ sys.path[:0] = [os.path.join(HERE, "fakes"), os.path.join(HERE, "fakes", "stubs"
 import _fake_hw
 import keypad
 import config_loader
+import link_health
 import sense_keys
 from sense_keys import SenseKeys
 
@@ -48,7 +49,7 @@ def test_settings_defaults_in_code_loader_and_example():
     assert sense_keys.settings({}) == (1, 64)
     assert sense_keys.settings({"inputs": None}) == (1, 64)
     d = config_loader.DEFAULTS["inputs"]
-    assert d == {"scan_interval_ms": 1, "event_queue_len": 64}, d
+    assert d == {"scan_interval_ms": 1, "event_queue_len": 64, "late_drain_ms": 500}, d
     ex = json.load(open(os.path.join(ROOT, "settings_example.json")))["inputs"]
     assert ex == d, ex
     # a settings.json with no "inputs" section still gets the defaults
@@ -194,6 +195,70 @@ def test_keypad_pins_are_not_the_threshold_adc_or_pwm_pins():
         sense = set(int(g) for g in pins["sense"])
         clash = sense & _other_gps(pins)
         assert not clash, (f, sorted(clash))
+
+
+class Ticks:
+    """supervisor.ticks_ms the test moves by hand (wraps like the real one)."""
+    def __init__(self, t=1000):
+        self.t = t
+
+    def __call__(self):
+        return self.t & MASK
+
+
+def late_rig(t0=1000):
+    logs = []
+    ticks = Ticks(t0)
+    s = SenseKeys((0, 1), log=logs.append, ticks=ticks)
+    s.to_keys()
+    s.keys.scanning = False
+    return s, logs, ticks
+
+
+@case
+def test_late_drain_setting_defaults_and_is_above_the_network_bound():
+    assert sense_keys.late_drain_ms({}) == sense_keys.LATE_DRAIN_MS == 500
+    assert sense_keys.late_drain_ms({"inputs": {"late_drain_ms": 250}}) == 250
+    assert sense_keys.late_drain_ms({"inputs": {"late_drain_ms": "x"}}) == 500
+    ex = json.load(open(os.path.join(ROOT, "settings_example.json")))["inputs"]
+    assert ex["late_drain_ms"] == 500, ex
+    # a bounded network op (link.send_block_ms) must never look like a stall
+    assert sense_keys.LATE_DRAIN_MS > link_health.SEND_BLOCK_MS
+
+
+@case
+def test_a_drain_after_a_held_loop_is_logged_and_counted_stamps_untouched():
+    s, logs, ticks = late_rig()
+    ticks.t += 20
+    s.pump()                                     # a normal loop pass: nothing said
+    assert s.late_drains == 0 and not logs
+    s.keys.inject(1, True, ticks.t + 5)          # an edge keypad stamped during the hold
+    ticks.t += 10040                             # the loop held 10 s (lwip_tcp_send)
+    edges = s.drain()
+    assert edges == [(1, True, 1025)], edges     # keypad's own stamp, never replaced
+    assert s.late_drains == 1 and s.late_max_ms == 10040, s.status()
+    assert len(logs) == 1 and "LATE DRAIN" in logs[0] and "10040 ms" in logs[0] \
+        and "1 edge(s)" in logs[0] and "may be late" in logs[0], logs
+    st = s.status()
+    assert (st["late_drains"], st["late_max_ms"], st["late_ms"], st["overflows"]) == (1, 10040, 500, 0), st
+
+
+@case
+def test_late_drain_measures_across_the_ticks_wrap_and_not_the_survey():
+    s, logs, ticks = late_rig(MASK - 100)
+    ticks.t = MASK + 300                          # 400 ms across the 2**29 wrap: fine
+    s.pump()
+    assert s.late_drains == 0, s.status()
+    ticks.t += 700
+    s.pump()
+    assert s.late_drains == 1 and s.late_max_ms == 700, s.status()
+    s.to_pins()                                   # the survey owns the loop for seconds
+    ticks.t += 30000
+    s.to_keys()
+    s.keys.scanning = False
+    ticks.t += 30
+    s.pump()
+    assert s.late_drains == 1, s.status()         # a hand-over is not a late drain
 
 
 n_fail = results.count(False)

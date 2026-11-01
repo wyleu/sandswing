@@ -35,12 +35,24 @@ _now = time.monotonic       # tests replace this
 # farm_ws's log says which part held it: reading the request (socket timeout
 # per recv, REQ_BOUND_S overall) or sending the reply (where lwIP's ERR_MEM
 # sleep lives).  farm_ws clears it before each Server.poll().
-last = {"read_s": 0.0, "reply_s": 0.0, "reply_b": 0}
+# "resets": replies (the /ws handshake) cut short by ECONNRESET.  The library
+# treats that as sent, so the route has already registered the Websocket;
+# farm_ws forgets it quietly instead of writing to a dead socket (EBADF).
+last = {"read_s": 0.0, "reply_s": 0.0, "reply_b": 0, "resets": 0}
 
 
 def clear_last():
     last["read_s"] = last["reply_s"] = 0.0
-    last["reply_b"] = 0
+    last["reply_b"] = last["resets"] = 0
+
+
+def set_bound(block_s):
+    """link.send_block_ms (farm_ws.configure_bounds): no wait here may be
+    longer than block_s.  Only ever tightens."""
+    global SEND_BOUND_S, RECV_BOUND_S, REQ_BOUND_S
+    SEND_BOUND_S = min(link_health.REPLY_BOUND_S, block_s)
+    RECV_BOUND_S = min(link_health.FRAME_BOUND_S, block_s)
+    REQ_BOUND_S = min(link_health.REQ_BOUND_S, block_s)
 
 
 def bounded_send_bytes(self, conn, buffer):
@@ -59,6 +71,7 @@ def bounded_send_bytes(self, conn, buffer):
                         raise OSError(ETIMEDOUT, "send timeout %.1f s" % SEND_BOUND_S)
                     continue
                 if exc.errno == ECONNRESET:
+                    last["resets"] += 1      # the peer is gone: see `last`
                     return
                 raise
             if n:

@@ -13,9 +13,14 @@
 #     one, it must keep sending: silent for CLIENT_SILENT_S -> dropped.  A
 #     client that never sends (old ingest, a debug listener) is never timed
 #     out, as before.
-#   * Sends are bounded (SEND_TIMEOUT_S): the library's send loops forever
-#     on EAGAIN when the TCP buffer is full (dead peer), which froze the
-#     whole concentrator.  A send that cannot finish drops that client.
+#   * Sends are bounded (SEND_TIMEOUT_S, settings.json link.send_block_ms):
+#     the library's send loops forever on EAGAIN when the TCP buffer is full
+#     (dead peer), which froze the whole concentrator.  Every write is
+#     non-blocking and at most one MSS; a short write or EAGAIN parks the rest
+#     for the next turn (_flush), and a client whose parked bytes are not
+#     taken within the bound is cut.  The one wait no Python bound reaches is
+#     CircuitPython's ERR_MEM sleep inside socket.send() (10 s, C code; see
+#     docs/link-health.md "Bounded writes").
 #   * The last REPLAY_N events are kept and replayed to every new client, so
 #     strokes made while the link was down still arrive (Sandbells ignores
 #     re-sends: UNIQUE(src, boot_id, seq)).
@@ -91,6 +96,8 @@ _answered = [0]                 # clients cut for a stall (overran / starved): s
 _turn = [0]                     # poll() count: which client is read first
 SLOW_POLL_S = 2.0              # a poll pass slower than this is logged
 SEND_TIMEOUT_S = link_health.SEND_TIMEOUT_S   # most one send may block on a full TCP buffer
+#   (lowered by settings.json link.send_block_ms: configure_bounds())
+WS_CHUNK_B = link_health.WS_CHUNK_B            # most one socket.send() is given (one lwIP pbuf)
 RX_FRAMES_PER_POLL = 4         # frames read per client per poll()
 REPLAY_N = link_health.SEND_LEVELS[0][1]      # recent events kept for replay (level 0 size)
 TODO_MAX = 2 * REPLAY_N        # events waiting behind a replay in progress, per client
@@ -124,6 +131,7 @@ _peers = {}                    # peer -> {"times": [served at], "full_at": t, "s
 _nomem_until = [0.0]           # a MemoryError holds /status (and drains) until then
 _deaf = {"drain": False}       # was the send path draining last poll (see _credit_quiet)
 _last_end = [None]             # when the last poll() finished: a late loop is our own silence
+_accepting = []               # Websockets made by the route during this Server.poll()
 _payload_fn = lambda: {}
 stats = {"connects": 0, "drops": 0, "refused": 0, "send_timeouts": 0,
          "silent_drops": 0, "refused_backoff": 0, "replays_done": 0,
@@ -132,6 +140,7 @@ stats = {"connects": 0, "drops": 0, "refused": 0, "send_timeouts": 0,
          "replies_cancelled": 0, "replies_held": 0, "deltas": 0, "fulls": 0,
          "mem_low": 0, "status_version": 0, "status_cache_b": 0, "replies_gone": 0,
          "last_reply_s": None, "last_reply_b": None,
+         "gone": 0, "handshakes_lost": 0, "parked": 0,
          "last_drop_reason": None, "last_drop_at": None,
          "hb_seen": False, "last_rx_at": None}
 
@@ -196,12 +205,28 @@ def connect_wifi(cfg, timeout=None):
     return False
 
 
+def configure_bounds(cfg):
+    """settings.json link.send_block_ms -> every Python-side network wait:
+    a /ws frame (SEND_TIMEOUT_S), a close frame, the library's request read,
+    handshake / 503 send and frame read (ws_bounds), the accepted socket's own
+    timeout.  Returns the bound in seconds (link_health.send_block_s)."""
+    global SEND_TIMEOUT_S, CLOSE_TIMEOUT_S
+    block_s = link_health.send_block_s(cfg)
+    SEND_TIMEOUT_S = block_s
+    CLOSE_TIMEOUT_S = min(link_health.CLOSE_TIMEOUT_S, block_s)
+    if ws_bounds is not None:
+        ws_bounds.set_bound(block_s)
+    return block_s
+
+
 def start_server(cfg, payload_fn):
     """payload_fn() -> dict for GET /status. Also accepts /ws clients
     (up to MAX_WS_CLIENTS)."""
     global _server, _payload_fn, _host, _cfg
     _payload_fn = payload_fn
     _cfg = cfg
+    block_s = configure_bounds(cfg)
+    print("net bound: %d ms per operation (link.send_block_ms)" % int(block_s * link_health.MS_PER_S))
     if not HAS_HTTP:
         print("adafruit_httpserver missing – no /ws")
         return None
@@ -224,7 +249,7 @@ def start_server(cfg, payload_fn):
         # default is 1 s): a connection that never sends its request costs
         # REQ_BOUND_S, then the library closes it.  Also caps the wait for
         # send-buffer space on that socket (not lwIP's ERR_MEM sleep).
-        server.socket_timeout = link_health.REQ_BOUND_S
+        server.socket_timeout = min(link_health.REQ_BOUND_S, block_s)
         port = cfg.get_int("network.http_port", 80)
         path_status = cfg.get_str("network.status_path", "/status")
         path_ws = cfg.get_str("network.ws_path", "/ws")
@@ -703,7 +728,9 @@ def route_ws(request):
         _path.note_refused()
         stats["refused_backoff"] += 1
         return _busy_response(request, plan.retry_after_s)
-    return _accept(Websocket(request))
+    ws = _accept(Websocket(request))
+    _accepting.append(ws)          # its handshake is sent after we return: see poll()
+    return ws
 
 
 def _accept(ws):
@@ -717,7 +744,8 @@ def _accept(ws):
         _clients.append(ws)
         _meta[id(ws)] = {"at": time.monotonic(), "rx": None, "hb": False,
                          "todo": [], "left": 0, "next_at": 0.0,
-                         "path": link_health.ClientPath(peer), "unheard_b": 0}
+                         "path": link_health.ClientPath(peer), "unheard_b": 0,
+                         "out": bytearray(), "out_at": None, "gone": False}
         _new.append(ws)
         stats["connects"] += 1
         print("%.3f WS client connected %s" % (time.monotonic(), _count()))
@@ -743,22 +771,38 @@ def _close(ws, code, frame=True):
         except Exception:
             pass
         return
+    m = _meta.get(id(ws))
+    if m is not None and (m["out"] or m["gone"]):
+        frame = False        # mid-frame, or a dead socket: a close frame cannot help
     if frame and not getattr(ws, "closed", False):
         t0 = time.monotonic()
         ok = False
         try:
             payload = b"" if code is None else int(code).to_bytes(2, "big")
-            _send_frame(ws, 8, payload, CLOSE_TIMEOUT_S)     # 8 = CLOSE
-            ok = True
+            ok = _send_frame(ws, 8, payload, CLOSE_TIMEOUT_S)     # 8 = CLOSE
         except Exception:
             pass
         t1 = time.monotonic()
         _path.observe(t1, "close", t1 - t0, ok)
+    _shut(ws, conn)
+
+
+def _shut(ws, conn):
+    """conn.close() exactly once.  CircuitPython's close() never waits (lwIP
+    aborts an unclean close by itself after CLOSE_ABORT_S) and returns quietly
+    on a socket already shut (null pcb); anything it raises is swallowed so a
+    dead socket cannot leave a client half-dropped."""
+    if getattr(ws, "_sw_shut", False):
+        return
+    ws.closed = True
+    try:
+        ws._sw_shut = True
+    except Exception:
+        pass
     try:
         conn.close()
     except Exception:
         pass
-    ws.closed = True
 
 
 _ERRNO_WORDS = {32: "broken pipe", 104: "connection reset", 107: "not connected",
@@ -782,10 +826,10 @@ def _drop(ws, why, code=WS_GOING_AWAY, frame=True, how=None):
     known = ws in _clients
     if known:
         _clients.remove(ws)
-    m = _meta.pop(id(ws), None)
     if ws in _new:
         _new.remove(ws)
-    _close(ws, code, frame)
+    _close(ws, code, frame)            # reads _meta (a parked frame: no close frame)
+    m = _meta.pop(id(ws), None)
     if isinstance(why, Exception) and not isinstance(why, OSError):
         # a bug, not a network fault: put the traceback in the serial log
         try:
@@ -807,6 +851,34 @@ def _drop(ws, why, code=WS_GOING_AWAY, frame=True, how=None):
             info["unheard_b"] = None if m is None else m["unheard_b"]
         _note("client_dropped", **info)
     print("%.3f WS client dropped: %s %s" % (time.monotonic(), why, _count()))
+
+
+def _handshake_lost(ws, why):
+    """The route registered ws, then the library's handshake failed (it
+    closed the socket and raised) or met ECONNRESET (which it treats as sent).
+    2026-10-31 10:41:42: a connection that sandbells2 had queued while the
+    Pico drained (10.5 s, nothing served) and then given up on was accepted
+    afterwards; the first replay frame hit the dead socket ("[Errno 9]
+    EBADF", 0.05 s after "connected") and counted as a failed send, raising
+    the backoff level every time.  Here it is forgotten quietly: no frame
+    written, no backoff, one note."""
+    if ws in _clients:
+        _clients.remove(ws)
+    if ws in _new:
+        _new.remove(ws)
+    if ws in _refused:
+        _refused.remove(ws)
+    m = _meta.pop(id(ws), None)
+    conn = getattr(getattr(ws, "_request", None), "connection", None)
+    if conn is not None:
+        _shut(ws, conn)
+    else:
+        ws.closed = True
+    stats["handshakes_lost"] += 1
+    peer = None if m is None else m["path"].peer
+    _note("client_handshake_lost", peer=peer, reason=_why(why) if isinstance(why, Exception) else why)
+    print("%.3f WS client lost in its handshake (%s): %s %s"
+          % (time.monotonic(), peer, why, _count()))
 
 
 def drop_all(why):
@@ -910,10 +982,7 @@ def _deliver(ws, msg, timeout_s, kind):
     try:
         bad = _send_text(ws, msg, timeout_s, kind)
     except OSError as e:
-        took = time.monotonic() - t0
-        _event(ws, "overran" if e.errno in (ETIMEDOUT, EAGAIN) else "failed",
-               "not reading: %s" % _why(e) if e.errno in (ETIMEDOUT, EAGAIN) else e)
-        _starved("%s send" % kind, took)
+        _send_failed(ws, e, kind, time.monotonic() - t0)
         return False
     except Exception as e:
         _event(ws, "failed", e)
@@ -933,26 +1002,113 @@ def _deliver(ws, msg, timeout_s, kind):
     return True
 
 
+def _deliver_parked(ws, m, timeout_s):
+    """The parked rest of a slow reader's frames, ahead of anything new.
+    True when nothing is parked any more."""
+    t0 = time.monotonic()
+    err, done = None, False
+    try:
+        done = _flush(ws, m, timeout_s)
+    except OSError as e:
+        err = e
+    t1 = time.monotonic()
+    took = t1 - t0
+    gone = err is not None and err.errno in REPLY_GONE_ERRNOS
+    _path.observe(t1, "gone" if gone else "live", took, err is None)
+    if err is not None:
+        if err.errno == ETIMEDOUT:
+            stats["send_timeouts"] += 1
+        _send_failed(ws, err, "live", took)
+        return False
+    if took > timeout_s:
+        stats["send_timeouts"] += 1
+        _event(ws, "overran", "parked bytes took %.2f s (deadline %.2f s)" % (took, timeout_s))
+        _starved("live send", took)
+        return False
+    return done
+
+
+def _send_failed(ws, e, kind, took):
+    """A send raised OSError: tell the client's model what kind of failure.
+    A dead socket (the peer reset it, or it was shut under us: EBADF on a
+    connection the peer had given up on during its handshake) is "closed",
+    not "failed": the client is gone, the link is not slow."""
+    if e.errno in REPLY_GONE_ERRNOS:
+        stats["gone"] += 1
+        m = _meta.get(id(ws))
+        if m is not None:
+            m["gone"] = True
+        _event(ws, "closed", "gone: %s" % _why(e))
+    else:
+        _event(ws, "overran" if e.errno in (ETIMEDOUT, EAGAIN) else "failed",
+               "not reading: %s" % _why(e) if e.errno in (ETIMEDOUT, EAGAIN) else e)
+    _starved("%s send" % kind, took)
+
+
 def _send_frame(ws, opcode, payload, timeout_s):
-    """One frame through ws's socket, giving up after timeout_s."""
+    """One frame into ws's out buffer, then _flush().  True when all of it
+    is with lwIP, False when part is parked for the next turn (a slow
+    reader); raises when the peer has not taken bytes for timeout_s."""
     frame = ws._prepare_frame(opcode, payload)
+    m = _meta.get(id(ws))
+    if m is None:                     # refused / closing: this frame only, nothing kept
+        m = {"out": bytearray(), "out_at": None}
+    if not m["out"]:
+        m["out_at"] = time.monotonic()
+    m["out"].extend(frame)
+    return _flush(ws, m, timeout_s)
+
+
+def _flush(ws, m, timeout_s):
+    """Hand ws's parked bytes to its socket without waiting.  The socket is
+    set non-blocking before every write (accepted sockets inherit the
+    listener's 0.3 s timeout; the library's Websocket sets non-blocking, a
+    fake or a future library might not).  Each send() is given at most
+    WS_CHUNK_B (one lwIP pbuf: lwIP allocates a whole MSS per new segment,
+    LWIP_NETIF_TX_SINGLE_PBUF), so one call cannot ask lwIP for a burst of
+    buffers.  EAGAIN or a short write ends the attempt at once: the rest stays
+    parked, in order, and goes first on the next turn.  Bytes parked longer
+    than timeout_s (link.send_block_ms): the peer is not reading, ETIMEDOUT,
+    and the caller's model cuts it.  This loop never spins on EAGAIN."""
     conn = ws._request.connection
-    view = memoryview(frame)
-    done, total = 0, len(frame)
-    deadline = time.monotonic() + timeout_s
+    out = m["out"]
+    _nonblocking(conn)
+    t0 = time.monotonic()
+    view = memoryview(out)
+    done, total = 0, len(out)
     while done < total:
         try:
-            n = conn.send(view[done:])
+            n = conn.send(view[done:done + WS_CHUNK_B])
         except OSError as e:
             if e.errno != EAGAIN:
                 raise
             n = 0
-        if n:
-            done += n
-        if done < total and time.monotonic() > deadline:
-            # also when bytes are trickling through: a barely-alive link that
-            # accepts a few bytes at a time held the Pico for 55 s
-            raise OSError(ETIMEDOUT, "send timeout %.1f s" % timeout_s)
+        if not n:
+            break
+        done += n
+        if time.monotonic() - t0 >= timeout_s:
+            break                     # the rest next turn: never more than the bound here
+    view = None                       # release the buffer before it is replaced
+    if done >= total:
+        m["out"] = bytearray()
+        m["out_at"] = None
+        return True
+    if done:                          # keep only what is not taken (no del on a
+        out = m["out"] = out[done:]   # bytearray slice: MicroPython lacks it)
+    stats["parked"] += 1
+    stuck_s = time.monotonic() - m["out_at"]
+    if stuck_s > timeout_s:
+        raise OSError(ETIMEDOUT, "send timeout %.1f s: %d B not taken in %.2f s"
+                      % (timeout_s, len(out), stuck_s))
+    return False
+
+
+def _nonblocking(conn):
+    """Before every write: never let socket.send() wait for buffer space."""
+    try:
+        conn.setblocking(False)
+    except Exception:
+        pass                          # a fake without it, or a socket already shut
 
 
 def _send_text(ws, msg, timeout_s=None, kind="live"):
@@ -966,22 +1122,24 @@ def _send_text(ws, msg, timeout_s=None, kind="live"):
     timeout_s = SEND_TIMEOUT_S if timeout_s is None else timeout_s
     t0 = time.monotonic()
     ok = False
+    gone = False
     try:
         prep = getattr(ws, "_prepare_frame", None)
         conn = getattr(getattr(ws, "_request", None), "connection", None)
         if prep is None or conn is None:
             ws.send_message(msg, fail_silently=True)
         else:
-            try:
-                _send_frame(ws, 1, msg.encode("utf-8"), timeout_s)   # 1 = TEXT
-            except OSError as e:
-                if e.errno == ETIMEDOUT:
-                    stats["send_timeouts"] += 1
-                raise
+            _send_frame(ws, 1, msg.encode("utf-8"), timeout_s)   # 1 = TEXT
         ok = True
+    except OSError as e:
+        if e.errno == ETIMEDOUT:
+            stats["send_timeouts"] += 1
+        gone = e.errno in REPLY_GONE_ERRNOS
+        raise
     finally:
         t1 = time.monotonic()
-        bad = _path.observe(t1, kind, t1 - t0, ok)
+        # a dead socket ("gone") is not a slow link: the backoff is not raised
+        bad = _path.observe(t1, "gone" if gone else kind, t1 - t0, ok)
     return bad
 
 
@@ -1037,6 +1195,12 @@ def _pump(ws, m, plan, now, deadline):
     replay frame) is an event for the client's model, which cuts it; the
     send-path model has been told too and decides the backoff."""
     sent = 0
+    if m["out"]:                                    # a slow reader's parked bytes go first
+        left = deadline - time.monotonic() - plan.close_s
+        if left < link_health.MIN_SLICE_S:
+            return
+        if not _deliver_parked(ws, m, min(plan.send_s, SEND_TIMEOUT_S, left)):
+            return                                  # still parked (or cut): next turn
     while m["todo"]:
         left = deadline - time.monotonic() - plan.close_s    # keep room to drop it
         if left < link_health.MIN_SLICE_S:
@@ -1044,15 +1208,17 @@ def _pump(ws, m, plan, now, deadline):
         replaying = m["left"] > 0
         if replaying and sent >= plan.chunk_frames:
             break
-        if not _deliver(ws, m["todo"][0], min(plan.send_s, left),
+        if not _deliver(ws, m["todo"][0], min(plan.send_s, SEND_TIMEOUT_S, left),
                         "replay" if replaying else "live"):
             return                                  # the model cut it (or it failed)
-        m["todo"].pop(0)
+        m["todo"].pop(0)                            # handed over (maybe partly parked)
         sent += 1
         if replaying:
             m["left"] -= 1
             if m["left"] == 0:
                 stats["replays_done"] += 1
+        if m["out"]:
+            return                                  # a slow reader: the rest next turn
     m["next_at"] = now + plan.chunk_gap_s
 
 
@@ -1069,12 +1235,22 @@ def poll():
     if ws_bounds is not None:
         ws_bounds.clear_last()
     if _server and plan.serve:          # SEND_DRAIN: not even a 503 (it is a send too)
+        del _accepting[:]
+        lost = None
         try:
             _server.poll()
         except MemoryError as e:
             memory_low("server", e)
+            lost = e
         except Exception as e:
             print("ws poll:", e)
+            lost = e
+        if lost is None and ws_bounds is not None and ws_bounds.last.get("resets"):
+            lost = "connection reset during the handshake"
+        if lost is not None:
+            for ws in list(_accepting):
+                _handshake_lost(ws, lost)
+        del _accepting[:]
         t_srv = time.monotonic()
         _path.observe(t_srv, "server", t_srv - t0, True)
         if ws_bounds is not None and ws_bounds.last["reply_s"] >= link_health.STARVED_S:
@@ -1098,7 +1274,8 @@ def poll():
     now = time.monotonic()
     for ws in list(_clients):
         m = _meta.get(id(ws))
-        if plan.writes and m is not None and m["todo"] and now >= m["next_at"] \
+        if plan.writes and m is not None and (m["todo"] or m["out"]) \
+                and (now >= m["next_at"] or m["out"]) \
                 and ws in _clients and m["path"].writes():
             _pump(ws, m, plan, now, deadline)
     t_new = time.monotonic()
@@ -1192,10 +1369,11 @@ def send(obj, keep=True):
         m = _meta.get(id(ws))
         left = deadline - time.monotonic()
         writes = m is None or m["path"].writes()
-        if m is not None and (m["todo"] or not writes or not writes_now
+        if m is not None and (m["todo"] or m["out"] or not writes or not writes_now
                               or left < link_health.MIN_SLICE_S):
-            # a replay is still going out, the client is LAGGING (hold), or
-            # the budget is spent: keep the order, queue behind.  Heartbeats
+            # a replay is still going out, a slow reader still has parked
+            # bytes, the client is LAGGING (hold), or the budget is spent:
+            # keep the order, queue behind.  Heartbeats
             # (keep=False) are state, not events: skip them.
             if keep:
                 if len(m["todo"]) >= TODO_MAX:
@@ -1298,6 +1476,7 @@ def reset_state():
     del _stalls[:]
     del _notes[:]
     del _replies[:]
+    del _accepting[:]
     _gate.reset()
     _doc.reset()
     _peers.clear()

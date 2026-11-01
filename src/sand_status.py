@@ -464,10 +464,17 @@ def from_concentrator(facts):
         sense = m.get("sense")
         if sense:
             lost = sense.get("overflows") or 0
-            conc.append(item("edges", "Edge stamps", "keypad %s ms, %d overflow%s" % (
-                sense.get("scan_ms"), lost, "" if lost == 1 else "s"),
-                "warn" if lost else "ok",
-                hint="queue %s events; edges are lost on an overflow" % sense.get("queue")))
+            late = sense.get("late_drains") or 0
+            text = "keypad %s ms, %d overflow%s" % (
+                sense.get("scan_ms"), lost, "" if lost == 1 else "s")
+            if late:                 # the loop was held: stamps in that window unchecked
+                text += ", %d late drain%s (max %s ms)" % (
+                    late, "" if late == 1 else "s", sense.get("late_max_ms"))
+            conc.append(item("edges", "Edge stamps", text,
+                "warn" if lost or late else "ok",
+                hint="queue %s events; edges are lost on an overflow; a late drain"
+                     " (loop held > %s ms) may have late stamps" % (
+                         sense.get("queue"), sense.get("late_ms"))))
         sections.append(section("concentrator", "Concentrator", conc))
     return document(
         device_id=f.get("id") or "concentrator",

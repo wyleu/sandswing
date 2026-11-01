@@ -130,16 +130,19 @@ def stamps(app, fh):
     app.sntp = None                             # tick_ms from app.ticks.extend(raw)
     app.poll_sense()                            # all clear: last_false set
     res = {}
+    late0 = app.sense.late_drains               # the jump onto this test's clock
     # edge at T-900, drained 400 ms later (a busy loop)
     keys.inject(0, True, (TICKS_PERIOD - 900) & TICKS_MASK)
     keys.inject(0, False, (TICKS_PERIOD - 860) & TICKS_MASK)
     t[0] = TICKS_PERIOD - 500
     app.poll_sense()
+    res["late_400"] = app.sense.late_drains - late0      # 400 ms: under inputs.late_drain_ms
     # next stroke after the wrap: raw stamp 100, drained at raw 700
     keys.inject(2, True, (TICKS_PERIOD - 50) & TICKS_MASK)   # key 2 = ch3, before the wrap
     keys.inject(0, True, 100)                                # ch1 again, after it
     t[0] = TICKS_PERIOD + 700
     app.poll_sense()
+    res["late_1200"] = app.sense.late_drains - late0     # 1200 ms across the wrap: late
     res["strokes"] = [[e["body"]["ch"], e["tick_ms"]] for e in sent if e["type"] == "stroke"]
     res["stroke_ms"] = [app.stroke_ms[0], app.stroke_ms[2]]
     # with a clock: SntpClock.stamp gets the keypad stamp as raw_tick
@@ -160,6 +163,8 @@ def stamps(app, fh):
     res["overflowed_after"] = keys.events.overflowed
     res["more_sense"] = app.status_more()["sense"]
     res["hb_edges_lost"] = app.heartbeat_doc()["body"]["edges_lost"]
+    res["hb_late_drains"] = app.heartbeat_doc()["body"]["late_drains"]
+    res["late_total"] = app.sense.late_drains
     doc = app.status_payload()
     res["panel_edges"] = [[i["value"], i["level"]] for x in doc["sections"]
                           if x["id"] == "concentrator" for i in x["items"] if i["key"] == "edges"]
@@ -620,8 +625,18 @@ def main():
           and (S.get("more_sense") or {}).get("overflows") == 1
           and (S.get("more_sense") or {}).get("scan_ms") == 1
           and S.get("hb_edges_lost") == 1
-          and S.get("panel_edges") == [["keypad 1 ms, 1 overflow", "warn"]],
+          and len(S.get("panel_edges") or []) == 1
+          and S["panel_edges"][0][0].startswith("keypad 1 ms, 1 overflow")
+          and S["panel_edges"][0][1] == "warn",
           (S.get("overflow_lines"), S.get("more_sense"), S.get("hb_edges_lost"), S.get("panel_edges")))
+    check("keypad: a drain 400 ms late is fine, 1200 ms late is a late drain; counted in"
+          " /status, heartbeat and panel next to the overflows",
+          S.get("late_400") == 0 and S.get("late_1200") == 1
+          and (S.get("more_sense") or {}).get("late_drains") == S.get("late_total")
+          and S.get("hb_late_drains") == S.get("late_total")
+          and "late drain" in ((S.get("panel_edges") or [[""]])[0][0]),
+          (S.get("late_400"), S.get("late_1200"), S.get("more_sense"), S.get("hb_late_drains"),
+           S.get("panel_edges")))
     r = spawn(me, "watch")
     w = r.get("watch") or {}
     quiet = {"selects": 0, "pulses": 0, "doubt": False, "ch": None}

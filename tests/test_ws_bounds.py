@@ -78,7 +78,9 @@ def test_send_that_makes_progress_completes():
 
 @case
 def test_send_to_a_reset_peer_returns_quietly():
+    ws_bounds.clear_last()
     ws_bounds.bounded_send_bytes(Resp(), Conn(send=[OSError(errno.ECONNRESET, "r")]), b"x")
+    assert ws_bounds.last["resets"] == 1      # farm_ws forgets that handshake's client
 
 
 @case
@@ -319,7 +321,7 @@ def test_reply_send_and_request_read_say_what_they_cost():
         Srv(), Conn(recv=[OSError(errno.ETIMEDOUT, "t")])))
     assert got == b"" and 0 < ws_bounds.last["read_s"] < 1.0, ws_bounds.last
     ws_bounds.clear_last()
-    assert ws_bounds.last == {"read_s": 0.0, "reply_s": 0.0, "reply_b": 0}
+    assert ws_bounds.last == {"read_s": 0.0, "reply_s": 0.0, "reply_b": 0, "resets": 0}
 
 
 

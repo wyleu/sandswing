@@ -30,7 +30,8 @@
 #   device       – name, family, location, role
 #   startup      – program filename or program registry key
 #   pins         – GPIO map (bell IR path)
-#   inputs       – sense edge scan: scan_interval_ms, event_queue_len (sandswing)
+#   inputs       – sense edge scan: scan_interval_ms, event_queue_len, late_drain_ms (sandswing)
+#   link         – /ws and /status sockets: send_block_ms (most one network op may hold the loop)
 #   ir           – carrier / duty (bell IR path)
 #   detection    – num_bells, latch timings (bell path)
 #   hardware     – head counts, laser_via, notes (sense path)
@@ -93,6 +94,10 @@ DEFAULTS = {
     "inputs": {
         "scan_interval_ms": 1,
         "event_queue_len": 64,
+        "late_drain_ms": 500,
+    },
+    "link": {
+        "send_block_ms": 400,
     },
     "ir": {},
     "detection": {},

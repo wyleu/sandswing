@@ -34,7 +34,11 @@ with `why`, `peer` = stratum/leap of the last reply even when rejected, so a
 sandmon GPS NO Lock shows as stratum 16 / leap 3), `last_seq`, `uptime_s`,
 `last_reset`, `watchdog`, `mem_free`.
 
-## Rules (code constants, no settings)
+## Rules (code constants; one setting, `link.send_block_ms`)
+
+The one setting is `link.send_block_ms` (default 400 = `SEND_TIMEOUT_S`): the
+most one network operation may hold the loop in Python-visible code.  It can
+only tighten the bounds below; see "Bounded writes" at the end.
 
 * Pico: a client that has sent a text frame must keep sending; quiet
   `CLIENT_LAG_S` (10 s, two missed 5 s hellos) -> LAGGING: nothing more is
@@ -687,3 +691,88 @@ link send_ok {'refused': 3, 'clients': 1}
 Not verified: all of this is tested on CPython with fakes (an lwIP queue model
 reproduces the 10 s stall and the storm, see `tests/test_farm_ws.py`); none of
 it has run on a Pico.
+
+
+## Bounded writes, and the one wait Python cannot bound (2026-10-31)
+
+### What the log showed (10:41-10:53, sandbells2 = 192.168.0.22)
+
+* `live frame took 10.04 s (deadline 0.40 s)`, then every reconnect of
+  sandbells2 lost 10.00 s on its first live frame (`cut NEW->overran`,
+  `hb False`), until LinkHealth reset the Pico after 300 s.
+* `WS client connected` followed 0.05 s later by `[Errno 9] EBADF`,
+  `close NEW->failed`, and `send_backoff 'replay failed 0.00 s'`.
+
+### The 10 s is C code: CircuitPython 10.0.3 `lwip_tcp_send()`
+
+`ports/raspberrypi/common-hal/socketpool/Socket.c`: once lwIP's send buffer
+has room, it calls `tcp_write()`; on `ERR_MEM` it retries 200 times with
+`mp_hal_delay_ms(50)` between tries -- **also on a non-blocking socket**
+(the source says so).  No socket timeout, `setblocking(False)` or Python
+deadline can shorten it, and nothing in Python runs meanwhile.  Worse: after
+the 200th try `err` holds the result of `tcp_output()` (ERR_OK), so the call
+returns the full length as if sent although `tcp_write()` never succeeded:
+that frame is silently lost.  That is why the log says "took 10.00 s" and not
+an error.
+
+`ERR_MEM` means lwIP could not allocate.  The Pico W build sets
+`LWIP_NETIF_TX_SINGLE_PBUF 1`, so every new TCP segment is a whole-MSS
+(1460 B) pbuf from CircuitPython's port heap, whatever the frame size.  A
+new connection whose very first frame fails for the full 10 s means the heap
+had no such block for 10 s: memory was short globally, not just on that
+socket.  What held it is not visible from Python (gc.mem_free() is the
+Python heap only).
+
+**The only fix for the sleep itself is in CircuitPython** (give up on
+ERR_MEM for a non-blocking socket, return EAGAIN; and return an error after
+the last try).  Python can only make ERR_MEM less likely and make sure one
+stall is not followed by another:
+
+* every write is at most one MSS (`WS_CHUNK_B`), on a socket set
+  non-blocking right before it, so one call asks lwIP for at most one pbuf;
+* a short write or EAGAIN parks the rest in that client's own buffer and the
+  loop moves on (no spinning); later frames queue behind it in order;
+* a client whose parked bytes are not taken within `link.send_block_ms` is
+  cut (no close frame: it would only queue more in lwIP);
+* after a stall that can only be ERR_MEM (`STARVED_S`), SEND_DRAIN (10.5 s,
+  as before) writes and serves nothing so lwIP can free.
+
+The keypad keeps scanning through the sleep (background task): in the log,
+`press 27`, `CLEAR`, `press 28` came out of one drain as separate edges and
+`press 28` passed the 150 ms / 50 ms gates, which compare keypad stamps.
+The console line shows the drain time, which is why all three read 1163.598.
+`inputs.late_drain_ms` (500) now says so in the log and counts it in
+`/status` (`sense.late_drains`, heartbeat `late_drains`).
+
+### The EBADF: a handshake the peer had already given up on
+
+During SEND_DRAIN nothing is served, so sandbells2's reconnect sat in lwIP's
+accept queue.  It gave up (closed or reset) before the drain ended; the
+Pico then accepted it.  The library's handshake send met ECONNRESET, which
+`Response._send_bytes` (and ws_bounds, copying it) treats as sent, so the
+route had already registered the client; the first replay frame hit the
+dead socket (EBADF).  That failure counted as a bad send: level 1 -> 2,
+3 -> 4, 5 -> 5 (no replay at all).
+
+Fixes: ws_bounds counts the reset (`last["resets"]`); farm_ws forgets the
+clients registered during that `Server.poll()` (also when the handshake
+raised): no frame written, no backoff, note `client_handshake_lost`.  Any
+later send failure with a dead-socket errno (EBADF, ECONNRESET, ENOTCONN,
+EPIPE, ECONNABORTED) is the client's `closed` event (`stats.gone`), observed
+as kind `gone`, which is not bad (`FAILURE_IS_BAD`) unless it was slow.
+Close is `_shut()`: exactly once, never raises, no close frame into the
+middle of a parked frame or onto a dead socket.
+
+### Every network wait and its bound
+
+| Operation | Bound |
+|---|---|
+| accept | listener non-blocking (library) |
+| request read | socket timeout and ws_bounds `REQ_BOUND_S`, both <= send_block |
+| handshake / 503 send | ws_bounds `SEND_BOUND_S` <= send_block, accepted socket's own timeout <= send_block (Websocket sockets are non-blocking) |
+| /ws frame read | non-blocking; a started frame `RECV_BOUND_S` <= send_block |
+| live / replay / heartbeat frame | non-blocking, <= one MSS per call, parked on EAGAIN; cut when parked > send_block |
+| /status reply | non-blocking, one MSS chunk per turn, `REPLY_DEADLINE_S` (unchanged) |
+| close frame | only when nothing is parked; `CLOSE_TIMEOUT_S` <= send_block |
+| close | `socket.close()` never waits in CircuitPython (lwIP aborts later) |
+| **any `send()` that meets ERR_MEM** | **10 s in C: cannot be bounded from Python** |

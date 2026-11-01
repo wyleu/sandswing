@@ -126,4 +126,5 @@ graph LR
 - `test_concentrator.py`: Concentrator end to end on the fakes, covering probe, rescan, the ring and a new-head stroke.
 - `test_ring.py` tests Ring.
 - `test_sense_keys.py` tests SenseKeys on `tests/fakes/keypad.py` (settings defaults, polarity, key -> channel, own stamps, wrap, overflow, hand-over); `test_concentrator.py` "stamps" checks a stroke carries its edge's keypad stamp.
+- `test_bounded_send.py` uses `tests/fake_socket.py` (a socket that blocks, says EAGAIN, takes a few bytes at a time, or raises EBADF) to show no /ws write, handshake or close holds the loop past `link.send_block_ms`, that a non-reading client is cut at that bound, and that a handshake the peer gave up on is forgotten without raising the backoff.  The ERR_MEM sleep inside CircuitPython's `lwip_tcp_send` is the one wait it cannot bound (docs/link-health.md, "Bounded writes").
 - The repo's `test_machine.py` and `test_strip.py` are included.

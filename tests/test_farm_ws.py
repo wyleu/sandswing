@@ -116,8 +116,10 @@ def test_failing_send_drops_only_that_client():
     b.send_error = OSError(32, "EPIPE")
     assert farm_ws.send({"n": 1})
     assert farm_ws._clients == [a, c]
-    assert b.closed and b.close_code == farm_ws.WS_GOING_AWAY
+    assert b.closed                          # gone (EPIPE): dropped as "closed"
     assert len(a.sent) == len(c.sent) == 1
+    assert farm_ws.stats["gone"] == 1
+    assert farm_ws._path.state == "SEND_OK"  # a dead socket does not raise the backoff
 
 
 @case
@@ -183,12 +185,16 @@ def test_send_to_a_full_tcp_buffer_gives_up_and_drops_that_client():
     stuck = farm_ws._accept(RealishWs(FakeConn(take=0)))
     good_conn = FakeConn(take=7)                 # partial sends are fine
     good = farm_ws._accept(RealishWs(good_conn))
-    old = farm_ws.SEND_TIMEOUT_S
-    farm_ws.SEND_TIMEOUT_S = 0.05
+    del farm_ws._new[:]                              # no replay: just the live frame
+    clock, real = Clock(), farm_ws.time.monotonic
+    farm_ws.time.monotonic = clock
     try:
         assert farm_ws.send({"type": "stroke", "n": 1})
+        assert stuck in farm_ws._clients            # parked, not spun on: the loop goes on
+        clock.t += farm_ws.SEND_TIMEOUT_S + 0.01
+        farm_ws.poll()                              # still nothing taken after the bound: cut
     finally:
-        farm_ws.SEND_TIMEOUT_S = old
+        farm_ws.time.monotonic = real
     assert farm_ws._clients == [good] and stuck.closed
     assert farm_ws.stats["send_timeouts"] == 1
     assert good_conn.data[2:] == b'{"type": "stroke", "n": 1}', good_conn.data
@@ -487,7 +493,9 @@ def test_send_deadline_missed_cuts_that_client_through_the_model():
         t0 = clock.t
         assert farm_ws.send({"seq": 1})
         took = clock.t - t0
-    assert took <= link_health.SEND_TIMEOUT_S + 0.05, took     # its deadline, no more
+        assert took <= 0.05, took                        # EAGAIN: parked at once, no spinning
+        clock.t += link_health.SEND_TIMEOUT_S
+        farm_ws.poll()                                   # nothing taken for the bound: cut
     assert farm_ws._clients == [good] and stuck.closed
     assert stuck_conn.data == bytearray()                # cut: no close frame queued in lwIP
     assert good_conn.data.endswith(b'{"seq": 1}')        # the other client got it
@@ -712,9 +720,10 @@ def test_broadcast_to_every_stuck_client_stays_inside_the_poll_budget():
         t0 = clock.t
         farm_ws.send({"seq": 1})
         took = clock.t - t0
-    assert took <= link_health.POLL_BUDGET_S + link_health.SEND_TIMEOUT_S, took
-    for ws in list(farm_ws._clients):                     # whoever was not reached waits
-        assert farm_ws._meta[id(ws)]["todo"], "left over: queued for the next poll"
+    assert took <= 0.05, took                             # nobody is spun on: all parked at once
+    for ws in list(farm_ws._clients):                     # each frame waits in its own buffer
+        m = farm_ws._meta[id(ws)]
+        assert m["out"] or m["todo"], "left over: parked for the next poll"
 
 
 @case
@@ -1430,8 +1439,9 @@ def test_notes_for_the_log_say_what_the_model_decided():
     farm_ws.reset_state()
     with fake_clock(step=0.001) as clock:
         farm_ws._accept(RealishWs(FakeConn(take=0)))     # a peer whose buffer never drains
-        farm_ws.send({"seq": 1})                         # live send times out: dropped, bad
-        farm_ws.poll()
+        farm_ws.send({"seq": 1})                         # parked: nothing taken
+        clock.t += link_health.SEND_TIMEOUT_S
+        farm_ws.poll()                                   # past the bound: dropped, bad
         whats = [w for w, _ in farm_ws.take_link_notes()]
         assert "send_backoff" in whats, whats
         clock.t += 3.0
