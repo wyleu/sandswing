@@ -52,6 +52,10 @@ try:
     import ws_bounds               # deadlines on the library's waits, and what they cost
 except ImportError:                # pragma: no cover
     ws_bounds = None
+try:
+    import heap_watch              # the VM heap's size: it grows into lwIP's RAM
+except ImportError:                # pragma: no cover
+    heap_watch = None
 
 try:
     from adafruit_httpserver import Server, Request, Response, GET, Websocket
@@ -112,6 +116,19 @@ _refused = []                  # accepted over the limit; closed in poll()
 _new = []                      # accepted this poll: replay + note in poll()
 _meta = {}                     # id(ws) -> {"at", "rx", "hb"}
 _recent = []                   # last REPLAY_N event messages (json str)
+# Strokes are kept apart, longer, and replayed to EVERY new client whatever
+# the send level (2026-11-01 08:18-08:21: strokes made during 10 s stalls and
+# reconnects never reached Sandbells; level 5 replayed nothing).  Sandbells
+# ignores re-sends (UNIQUE(src, boot_id, seq)), so a stroke sent twice costs
+# bytes, a stroke not sent is lost.  A stroke counts as delivered when it was
+# written whole, in time, to a client that was then heard from (a frame that
+# lwIP's ERR_MEM loop held -- CircuitPython 10.0.3 reports it sent after 10 s
+# although it may not be -- cuts that client before it can be confirmed), or
+# when a client acknowledges it ({"ack_seq": n, "boot_id": ours}).
+STROKE_KEEP = 64               # link.stroke_keep: strokes held for replay (~0.3 kB each)
+_strokes = []                  # [(seq, msg)] oldest first, at most STROKE_KEEP
+_confirmed = set()             # stroke seqs known delivered (pruned with _strokes)
+_event_boot = [None]           # the boot_id our events carry (an ack must name it)
 _notes = []                    # (what, info) for concentrator.py
 _replies = []                  # queued HTTP replies (/status), oldest first: see _pump_replies
 _path = link_health.SendPath() # send-path state model: plan(now) says what is allowed
@@ -132,6 +149,11 @@ _nomem_until = [0.0]           # a MemoryError holds /status (and drains) until 
 _deaf = {"drain": False}       # was the send path draining last poll (see _credit_quiet)
 _last_end = [None]             # when the last poll() finished: a late loop is our own silence
 _accepting = []               # Websockets made by the route during this Server.poll()
+# settings.json link.ws_peers / link.status_peers: when a list is given, only
+# those addresses get /ws or /status; anyone else's request is closed by the
+# library with nothing written (no handshake, no 503: every byte written
+# costs lwIP a whole-MSS pbuf from the RAM it is short of).  Empty: everyone.
+_allow = {"ws": (), "status": ()}
 _payload_fn = lambda: {}
 stats = {"connects": 0, "drops": 0, "refused": 0, "send_timeouts": 0,
          "silent_drops": 0, "refused_backoff": 0, "replays_done": 0,
@@ -140,7 +162,9 @@ stats = {"connects": 0, "drops": 0, "refused": 0, "send_timeouts": 0,
          "replies_cancelled": 0, "replies_held": 0, "deltas": 0, "fulls": 0,
          "mem_low": 0, "status_version": 0, "status_cache_b": 0, "replies_gone": 0,
          "last_reply_s": None, "last_reply_b": None,
-         "gone": 0, "handshakes_lost": 0, "parked": 0,
+         "gone": 0, "handshakes_lost": 0, "parked": 0, "refused_peer": 0,
+         "strokes_kept": 0, "strokes_confirmed": 0, "strokes_dropped_unconfirmed": 0,
+         "strokes_replayed": 0, "acks": 0,
          "last_drop_reason": None, "last_drop_at": None,
          "hb_seen": False, "last_rx_at": None}
 
@@ -219,6 +243,88 @@ def configure_bounds(cfg):
     return block_s
 
 
+def configure_delivery(cfg):
+    """link.stroke_keep -> STROKE_KEEP (at least REPLAY_N)."""
+    global STROKE_KEEP
+    sec = (cfg.get("link", {}) if cfg is not None else {}) or {}
+    try:
+        STROKE_KEEP = max(REPLAY_N, int(sec.get("stroke_keep", link_health.STROKE_KEEP)))
+    except (TypeError, ValueError):
+        STROKE_KEEP = link_health.STROKE_KEEP
+    return STROKE_KEEP
+
+
+def _seq_of(msg):
+    """The "seq" of one of our event messages (json.dumps text), else None,
+    without parsing the whole message."""
+    i = msg.find('"seq": ')
+    if i < 0:
+        return None
+    i += len('"seq": ')
+    j = i
+    while j < len(msg) and msg[j].isdigit():
+        j += 1
+    return int(msg[i:j]) if j > i else None
+
+
+def _keep_stroke(seq, msg):
+    _strokes.append((seq, msg))
+    stats["strokes_kept"] += 1
+    while len(_strokes) > STROKE_KEEP:
+        old, _ = _strokes.pop(0)
+        if old in _confirmed:
+            _confirmed.discard(old)
+        else:
+            stats["strokes_dropped_unconfirmed"] += 1
+            print("%.3f STROKE seq %d left the replay buffer UNCONFIRMED (link.stroke_keep %d)"
+                  % (time.monotonic(), old, STROKE_KEEP))
+
+
+def _confirm(seqs):
+    for q in seqs:
+        if q not in _confirmed and any(q == k for k, _ in _strokes):
+            _confirmed.add(q)
+            stats["strokes_confirmed"] += 1
+
+
+def undelivered_strokes():
+    """Strokes in the replay buffer not known delivered (oldest first seqs)."""
+    return [q for q, _ in _strokes if q not in _confirmed]
+
+
+def _is_stroke(seq):
+    return seq is not None and any(seq == k for k, _ in _strokes)
+
+
+def configure_peers(cfg):
+    """link.ws_peers / link.status_peers -> _allow (lists of IPv4 strings)."""
+    sec = (cfg.get("link", {}) if cfg is not None else {}) or {}
+    for key, name in (("ws", "ws_peers"), ("status", "status_peers")):
+        v = sec.get(name) or ()
+        if isinstance(v, str):
+            v = [v]
+        _allow[key] = tuple(str(p).strip() for p in v if str(p).strip())
+    return dict(_allow)
+
+
+def _allowed(kind, request):
+    """True if this request's peer may use `kind` ("ws" / "status").  A
+    refused one is counted and noted once per request; the route returns
+    None and the library closes the socket without writing."""
+    allow = _allow.get(kind) or ()
+    if not allow:
+        return True
+    try:
+        peer = str(request.client_address[0])
+    except Exception:
+        peer = None
+    if peer in allow:
+        return True
+    stats["refused_peer"] += 1
+    _note("peer_refused", peer=peer, path=kind)
+    return False
+
+
 def start_server(cfg, payload_fn):
     """payload_fn() -> dict for GET /status. Also accepts /ws clients
     (up to MAX_WS_CLIENTS)."""
@@ -226,6 +332,11 @@ def start_server(cfg, payload_fn):
     _payload_fn = payload_fn
     _cfg = cfg
     block_s = configure_bounds(cfg)
+    configure_delivery(cfg)
+    allow = configure_peers(cfg)
+    for kind in ("ws", "status"):
+        if allow[kind]:
+            print("%s only for: %s (link.%s_peers)" % (kind, ", ".join(allow[kind]), kind))
     print("net bound: %d ms per operation (link.send_block_ms)" % int(block_s * link_health.MS_PER_S))
     if not HAS_HTTP:
         print("adafruit_httpserver missing – no /ws")
@@ -458,6 +569,8 @@ def route_status(request, path_status="/status"):
     whether this request gets a delta, the whole document, or the tiny held
     reply; whichever it is goes to the reply writer as pieces, never joined."""
     t_route = time.monotonic()
+    if not _allowed("status", request):
+        return None                    # closed by the library, nothing written
     try:
         peer = str(request.client_address[0])
     except Exception:
@@ -723,6 +836,8 @@ def _busy_response(request, retry_after_s):
 
 def route_ws(request):
     """GET /ws: ask the send-path model, obey the answer."""
+    if not _allowed("ws", request):
+        return None                    # closed by the library, nothing written
     plan = _path.plan(time.monotonic())
     if not plan.accept:
         _path.note_refused()
@@ -745,7 +860,8 @@ def _accept(ws):
         _meta[id(ws)] = {"at": time.monotonic(), "rx": None, "hb": False,
                          "todo": [], "left": 0, "next_at": 0.0,
                          "path": link_health.ClientPath(peer), "unheard_b": 0,
-                         "out": bytearray(), "out_at": None, "gone": False}
+                         "out": bytearray(), "out_at": None, "gone": False,
+                         "unconfirmed": [], "ack": 0}
         _new.append(ws)
         stats["connects"] += 1
         print("%.3f WS client connected %s" % (time.monotonic(), _count()))
@@ -968,6 +1084,20 @@ def _starved(where, took):
     if took < link_health.STARVED_S:
         return
     stats["starved"] += 1
+    if heap_watch is not None:
+        # the likely why: the VM heap grew into the RAM lwIP allocates from
+        try:
+            total, free = heap_watch.check(print, "lwIP stall")
+            h = heap_watch.status()
+            print("%.3f lwIP starved (%s took %.1f s): VM heap %d kB (%d kB free in it), "
+                  "largest this boot %d kB, grew %d time(s)"
+                  % (time.monotonic(), where, took, total // heap_watch.KB,
+                     free // heap_watch.KB, h["gc_heap_max_kb"], h["gc_heap_grew"]))
+            _note("lwip_starved", where=where, took_s=round(took, 2),
+                  gc_heap_kb=total // heap_watch.KB, gc_free_kb=free // heap_watch.KB,
+                  gc_heap_grew=h["gc_heap_grew"])
+        except Exception:
+            pass
     for ws in list(_clients):
         _event(ws, "starved", "not reading while lwIP starved (%s took %.1f s)"
                % (where, took))
@@ -999,6 +1129,9 @@ def _deliver(ws, msg, timeout_s, kind):
     m = _meta.get(id(ws))
     if m is not None:
         m["unheard_b"] += len(msg)
+        q = _seq_of(msg)
+        if _is_stroke(q):
+            m["unconfirmed"].append(q)       # confirmed when heard next with nothing parked
     return True
 
 
@@ -1034,15 +1167,21 @@ def _send_failed(ws, e, kind, took):
     connection the peer had given up on during its handshake) is "closed",
     not "failed": the client is gone, the link is not slow."""
     if e.errno in REPLY_GONE_ERRNOS:
-        stats["gone"] += 1
-        m = _meta.get(id(ws))
-        if m is not None:
-            m["gone"] = True
-        _event(ws, "closed", "gone: %s" % _why(e))
+        _gone(ws, e)
     else:
         _event(ws, "overran" if e.errno in (ETIMEDOUT, EAGAIN) else "failed",
                "not reading: %s" % _why(e) if e.errno in (ETIMEDOUT, EAGAIN) else e)
     _starved("%s send" % kind, took)
+
+
+def _gone(ws, e):
+    """ws's socket is dead (reset by the peer, or shut under us).  The client
+    is "closed": no close frame, no backoff (whether sending or reading)."""
+    stats["gone"] += 1
+    m = _meta.get(id(ws))
+    if m is not None:
+        m["gone"] = True
+    _event(ws, "closed", "gone: %s" % _why(e))
 
 
 def _send_frame(ws, opcode, payload, timeout_s):
@@ -1169,7 +1308,34 @@ def _receive(ws, now):
             if not m["hb"]:
                 m["hb"] = True
                 stats["hb_seen"] = True
+            if m["unconfirmed"] and not m["out"]:   # all written, and it talks: delivered
+                _confirm(m["unconfirmed"])
+                m["unconfirmed"] = []
+            if isinstance(msg, str) and '"ack_seq"' in msg:
+                _ack(ws, m, msg)
             _event(ws, "heard")
+
+
+def _ack(ws, m, msg):
+    """{"ack_seq": n, "boot_id": "<ours>"} from a client: every stroke of this
+    boot up to n has arrived; none of them is replayed to it again."""
+    try:
+        d = json.loads(msg)
+        n = int(d.get("ack_seq"))
+    except Exception:
+        return
+    boot = d.get("boot_id")
+    if boot is not None and boot != _event_boot[0]:
+        return                                  # an ack for an earlier boot
+    stats["acks"] += 1
+    m["ack"] = max(m["ack"], n)
+    _confirm([q for q, _ in _strokes if q <= n])
+    m["todo"] = [t for t in m["todo"] if not _acked(m, _seq_of(t))]
+    m["left"] = min(m["left"], len(m["todo"]))
+
+
+def _acked(m, seq):
+    return _is_stroke(seq) and seq <= m["ack"]
 
 
 def _flush_path_events():
@@ -1183,9 +1349,20 @@ def _begin_replay(ws, plan):
     if m is None:
         return
     todo = list(_recent)[-plan.replay_n:] if plan.replay_n > 0 else []
+    # every stroke still held goes too, at any level, in seq order (Sandbells
+    # drops the ones it has); events without a seq keep their place
+    have = set(_seq_of(t) for t in todo)
+    extra = [(q, t) for q, t in _strokes if q not in have and q > m["ack"]]
+    if extra:
+        keyed = [(_seq_of(t), t) for t in todo] + extra
+        keyed.sort(key=lambda e: -1 if e[0] is None else e[0])
+        todo = [t for _, t in keyed]
+        stats["strokes_replayed"] += len(extra)
+    if m["ack"]:                                # it said it has these
+        todo = [t for t in todo if not _acked(m, _seq_of(t))]
     m["todo"], m["left"], m["next_at"] = todo, len(todo), 0.0
     _note("client_connected", peer=_peer(ws), replay=len(todo),
-          level=plan.level)
+          strokes=len([1 for t in todo if _is_stroke(_seq_of(t))]), level=plan.level)
 
 
 def _pump(ws, m, plan, now, deadline):
@@ -1206,7 +1383,9 @@ def _pump(ws, m, plan, now, deadline):
         if left < link_health.MIN_SLICE_S:
             return                                  # resume next turn
         replaying = m["left"] > 0
-        if replaying and sent >= plan.chunk_frames:
+        # at the cap level the plan replays nothing (chunk 0), but strokes
+        # always go: at least one frame per turn
+        if replaying and sent >= max(link_health.STROKE_CHUNK_MIN, plan.chunk_frames):
             break
         if not _deliver(ws, m["todo"][0], min(plan.send_s, SEND_TIMEOUT_S, left),
                         "replay" if replaying else "live"):
@@ -1302,6 +1481,14 @@ def poll():
             break                                   # reads resume next turn (silence limit is 20 s)
         try:
             _receive(ws, now)
+        except OSError as e:
+            if e.errno in REPLY_GONE_ERRNOS:
+                # 08:18:49 / 08:20:51: EBADF reading a client the peer had
+                # already reset, 0.07 s after its handshake: gone, not failed
+                _gone(ws, e)
+            else:
+                _event(ws, "failed", e)
+            continue
         except Exception as e:
             _event(ws, "failed", e)
             continue
@@ -1352,6 +1539,9 @@ def send(obj, keep=True):
     if keep:
         _recent.append(msg)
         del _recent[:-REPLAY_N]
+        if isinstance(obj, dict) and obj.get("type") == "stroke" and obj.get("seq") is not None:
+            _event_boot[0] = obj.get("boot_id")
+            _keep_stroke(int(obj["seq"]), msg)
     if not _clients:
         return False
     sent = False
@@ -1460,6 +1650,7 @@ def link_status():
     d["send_state"] = _path.state
     d["send_level"] = _path.level
     d["clients_by_state"] = _by_state()
+    d["strokes_undelivered"] = len(undelivered_strokes())
     if d["last_drop_at"] is not None:
         d["last_drop_age_s"] = round(now - d["last_drop_at"], 1)
     del d["last_drop_at"]
@@ -1473,10 +1664,14 @@ def reset_state():
     del _refused[:]
     del _new[:]
     del _recent[:]
+    del _strokes[:]
+    _confirmed.clear()
+    _event_boot[0] = None
     del _stalls[:]
     del _notes[:]
     del _replies[:]
     del _accepting[:]
+    _allow["ws"] = _allow["status"] = ()
     _gate.reset()
     _doc.reset()
     _peers.clear()

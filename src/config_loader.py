@@ -31,7 +31,9 @@
 #   startup      – program filename or program registry key
 #   pins         – GPIO map (bell IR path)
 #   inputs       – sense edge scan: scan_interval_ms, event_queue_len, late_drain_ms (sandswing)
-#   link         – /ws and /status sockets: send_block_ms (most one network op may hold the loop)
+#   link         – /ws and /status sockets: send_block_ms (most one network op may hold the loop),
+#                  ws_peers / status_peers (only these addresses; [] = anyone),
+#                  stroke_keep (strokes held for replay), reset_hold_s (Pico reset waits for them)
 #   ir           – carrier / duty (bell IR path)
 #   detection    – num_bells, latch timings (bell path)
 #   hardware     – head counts, laser_via, notes (sense path)
@@ -98,6 +100,10 @@ DEFAULTS = {
     },
     "link": {
         "send_block_ms": 400,
+        "ws_peers": [],
+        "status_peers": [],
+        "stroke_keep": 64,
+        "reset_hold_s": 1800,
     },
     "ir": {},
     "detection": {},

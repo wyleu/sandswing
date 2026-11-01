@@ -94,8 +94,9 @@ from survey_state import SurveyState, SURVEYING, SETTLED, IDLE as SURVEY_IDLE
 from mux_errors import ChannelBusy
 from laser_measure import counts_to_ma
 from adc_avg import avg as _avg
-from link_health import LinkHealth, PICO_RESET_S, STALL_WINDOW_S
+from link_health import LinkHealth, PICO_RESET_S, STALL_WINDOW_S, RESET_HOLD_S, reset_decision
 from sense_keys import SenseKeys, settings as sense_settings, late_drain_ms
+import heap_watch                 # VM heap size: it grows into the RAM lwIP needs
 
 RING_WINDOW_S = 0.4
 SETTLE_S = 0.3
@@ -114,6 +115,7 @@ LOOP_LATE_S = 1.5               # heartbeat later than this = the loop was held 
 MEM_CHECK_S = 3.0                # heap tidy pass (only while the bells are quiet)
 MEM_QUIET_MS = 3000              # ...no stroke for this long
 MEM_LOG_EVERY = 20               # log free memory every 60 s
+RESET_HOLD_LOG_S = 60.0          # a held Pico reset says so this often
 LINK_CHECK_S = 2.0               # Wi-Fi supervision pass
 WIFI_REJOIN_S = 30.0             # rejoin attempts while the tower is quiet
 WIFI_REJOIN_RINGING_S = 120.0    # ...and while ringing (a join blocks sensing)
@@ -246,6 +248,10 @@ class Concentrator:
         self.sense_gps = self.pinmap["sense_gp"]
         
         self.link_health = LinkHealth()
+        self._reset_wanted_at = None     # LinkHealth asked for a Pico reset (held: strokes)
+        self._reset_said = None
+        self.reset_hold_s = max(0.0, cfg.get_float("link.reset_hold_s", RESET_HOLD_S)) \
+            if hasattr(cfg, "get_float") else RESET_HOLD_S
         
         self.n = len(self.sense_gps)          # set n first
         self.link = "no_wifi"
@@ -480,6 +486,7 @@ class Concentrator:
             # prints it; a live reading counts garbage not yet collected and
             # looks like a leak (73 kB on the page against 126 kB in the log)
             more["mem_free"] = getattr(self, "mem_free_gc", None) or gc.mem_free()
+            more["heap"] = heap_watch.status()
         except (ImportError, AttributeError):
             pass
         return more
@@ -906,10 +913,12 @@ class Concentrator:
             "watchdog": self.guard.armed,
             "edges_lost": self.sense.overflows,   # keypad queue overflows this boot
             "late_drains": self.sense.late_drains,  # loop held > inputs.late_drain_ms
+            "strokes_undelivered": len(farm_ws.undelivered_strokes()),
         })
         try:
             import gc
             body["mem_free"] = gc.mem_free()
+            body.update(heap_watch.status())       # gc_heap_kb, gc_heap_grew, ...
         except (ImportError, AttributeError):
             pass
         doc = make_event("heartbeat", sn, body, src=self.events.src,
@@ -1017,9 +1026,11 @@ class Concentrator:
                     gc.collect()
                     self.mem_free_gc = gc.mem_free()     # the page shows this one
                 n += 1
+                total, free = heap_watch.check(emit, "mem check")
                 if n % MEM_LOG_EVERY == 0:
-                    emit("mem free %d kB%s" % (gc.mem_free() // 1024,
-                                              "" if quiet else " (busy)"))
+                    emit("mem free %d kB%s, VM heap %d kB" % (
+                        free // heap_watch.KB, "" if quiet else " (busy)",
+                        total // heap_watch.KB))
             except Exception as e:
                 emit("mem_task: %r" % e)
 
@@ -1053,9 +1064,28 @@ class Concentrator:
         # a power cycle): after PICO_RESET_S unhealthy with the tower quiet, reset
         # the Pico.  Independent of the hardware watchdog, and handled before the
         # Wi-Fi-down branch below, which returns early.
-        if "pico_reset" in events:
-            self.link_event("reset", reason="link unhealthy %d s: resetting the Pico"
-                            % PICO_RESET_S)
+        # A reset also loses every stroke still in RAM: while some are not yet
+        # delivered it waits up to link.reset_hold_s for the link to heal (a
+        # live client again cancels it), then resets anyway.
+        if "pico_reset" in events and self._reset_wanted_at is None:
+            self._reset_wanted_at = now
+        pending = len(farm_ws.undelivered_strokes())
+        what = reset_decision(self._reset_wanted_at, now, pending,
+                              farm_ws.live_clients() > 0, self.reset_hold_s)
+        if what == "cancel":
+            emit("Pico reset called off: a client is live again")
+            self._reset_wanted_at = None
+            self.link_health.reset_called_off()
+        elif what == "hold":
+            held = now - self._reset_wanted_at
+            if self._reset_said is None or now - self._reset_said >= RESET_HOLD_LOG_S:
+                self._reset_said = now
+                emit("Pico reset HELD %d s: %d stroke(s) not yet delivered would be"
+                     " lost (link.reset_hold_s %d)" % (held, pending, self.reset_hold_s))
+        elif what == "reset":
+            self.link_event("reset", reason="link unhealthy %d s: resetting the Pico%s"
+                            % (PICO_RESET_S, (" (%d undelivered stroke(s) lost)" % pending)
+                               if pending else ""))
             farm_ws.poll()
             import microcontroller
             watchdog_guard.mark_reset(b"SRST")
@@ -1112,6 +1142,11 @@ def start_app():
         except Exception as e:
             emit("first sync failed: %s" % e)
     start_server(cfg, app.status_payload)
+    total, free = heap_watch.check(emit, "boot")
+    start = heap_watch.start_setting()
+    emit("VM heap %d kB (%d kB free); settings.toml CIRCUITPY_HEAP_START_SIZE %s"
+         % (total // heap_watch.KB, free // heap_watch.KB,
+            "not set (8 kB, grows on demand)" if start is None else "%d" % start))
     app.guard.arm()
     return app
 

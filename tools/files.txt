@@ -35,6 +35,7 @@ farm_ws.py
 status_doc.py
 ws_bounds.py
 lastline.py
+heap_watch.py
 farm_log.py
 sand_status.py
 bell_machine.py

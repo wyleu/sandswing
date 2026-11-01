@@ -776,3 +776,120 @@ middle of a parked frame or onto a dead socket.
 | close frame | only when nothing is parked; `CLOSE_TIMEOUT_S` <= send_block |
 | close | `socket.close()` never waits in CircuitPython (lwIP aborts later) |
 | **any `send()` that meets ERR_MEM** | **10 s in C: cannot be bounded from Python** |
+
+
+## Where lwIP's memory goes (2026-11-01 08:18-08:21)
+
+With the bounded-send build the 10 s stalls stayed: `live frame took 10.08 s`,
+`617 B not taken in 10.00 s`, and a /status chunk of 1460 B to the desk Pi
+(192.168.0.120) `took 10.0 s` -- with ONE /ws client (sandbells2) and one
+poller.  A 617 B write cannot be refused for 10 s because of anything that one
+socket did: the allocation itself is failing, board-wide.
+
+### What lwIP allocates from (CircuitPython 10.0.3, RP2350 / CYW43)
+
+`ports/raspberrypi/lwip_inc/lwipopts.h`:
+
+| Setting | Value | Meaning here |
+|---|---|---|
+| `MEM_CUSTOM_ALLOCATOR` | 1 (`lwip_heap_malloc` -> `port_malloc`) | lwIP's heap IS the port heap (TLSF) |
+| `MEMP_MEM_MALLOC` | 1 | the MEMP_NUM_* pools are not pools: every pbuf, segment, pcb is a port-heap malloc, no count limit |
+| `MEM_SIZE` | 1600 | unused (custom allocator) |
+| `PBUF_POOL_SIZE`, `MEMP_NUM_TCP_SEG`, `MEMP_NUM_TCP_PCB` | 16, 16, 5 | not enforced (MEMP_MEM_MALLOC) |
+| `LWIP_NETIF_TX_SINGLE_PBUF` | 1 | every new TX segment is one whole-MSS pbuf (~1.5 kB), even for a 100 B frame |
+| `TCP_MSS`, `TCP_SND_BUF`, `TCP_WND` | 1460, 11680, 11680 | per socket: 8 MSS unacked before send() says EAGAIN |
+| `TCP_SND_QUEUELEN` | 32 | per socket: 32 queued pbufs before tcp_write says ERR_MEM |
+
+So the in-flight limit is not a number of packets, it is RAM: about 1.5 kB of
+contiguous port heap per unacked or unsent TX segment and per received packet
+not yet read.  A laggy /ws peer holds at most 8 segments (~12 kB, then
+EAGAIN, which we park); a 7 kB /status reply 5 (~7.5 kB).  Under ~20 kB in
+all, if the RAM is there.
+
+### Who else allocates from the port heap: the VM heap
+
+`py/circuitpy_mpconfig.h`: `MICROPY_GC_SPLIT_HEAP_AUTO 1`,
+`CIRCUITPY_HEAP_START_SIZE 8 kB`.  `py/gc.c gc_try_add_heap()`: when an
+allocation fails after a collection, the VM heap adds an area of the port
+heap, doubling its size; "If the new heap won't fit in the available free
+space, add the largest new heap that will fit (this may lead to failed system
+heap allocations elsewhere".  An area goes back only when entirely empty.
+After such a step the port heap has no 1.5 kB block left, `tcp_write()`
+returns ERR_MEM, and `lwip_tcp_send()` sleeps 200 x 50 ms.  gc.mem_free()
+cannot show it: "mem free 92 kB" is free space INSIDE the VM heap.
+
+### socket.send() and ERR_MEM
+
+A non-blocking socket says EAGAIN only when the send buffer is full
+(`tcp_sndbuf() == 0`).  ERR_MEM is never EAGAIN: the 200 x 50 ms loop runs
+whatever the timeout.  A smaller write does not help either (the pbuf is a
+whole MSS anyway), except when it fits the free tail of a segment still
+unsent, which needs no allocation and is not under our control.
+
+### What this build does
+
+* `heap_watch.py`: the VM heap's total (mem_free + mem_alloc) is sampled every
+  mem check and at every lwIP stall; a growth is logged at once (`HEAP GREW
+  a -> b kB ...`), the minute line reads `mem free X kB, VM heap Y kB`, and
+  /status `more.heap` and the heartbeat carry `gc_heap_kb`, `gc_heap_max_kb`,
+  `gc_heap_boot_kb`, `gc_heap_grew`.  A stall logs `lwIP starved (...): VM
+  heap Y kB ...` and a `lwip_starved` link note.  This confirms (or rules
+  out) the cause on the next ringing test.
+* `link.ws_peers`, `link.status_peers` (default `[]` = anyone): only those
+  addresses get /ws or /status; anyone else is closed with nothing written.
+* An EBADF while READING a client (`close NEW->failed` at 08:18:49 and
+  08:20:51) is now "gone" like a send's: no close frame, no backoff.
+
+### The fix that works: give the VM heap its size at start
+
+In `CIRCUITPY/settings.toml` (not settings.json):
+
+    CIRCUITPY_HEAP_START_SIZE = <bytes>
+
+`main.c` allocates that much as the first VM heap area, before the sockets
+are busy.  If the program never needs more, the VM heap never grows and the
+rest of the port heap stays lwIP's.  Size it from the log: the
+`VM heap ... kB` boot line and the largest `gc_heap_max_kb` seen after a
+ring, plus a margin; it must still leave lwIP tens of kB, so read the numbers
+first.  Too small is harmless (it grows as now); too large leaves lwIP less.
+Takes effect at the next start of the VM (power cycle or reload).
+
+Longer term: a CircuitPython build that gives up on ERR_MEM for a
+non-blocking socket (EAGAIN) and returns an error after the last retry,
+or reserves lwIP its own pool (`MEMP_MEM_MALLOC 0`, real `MEM_SIZE`).
+
+## Strokes are delivered, not just sent (2026-11-01: 20 presses, not all arrived)
+
+What lost them before this build:
+
+- a stroke made while no client was connected (the 10 s stall cuts the
+  client, then the drain, then the reconnect) was only in `_recent`, and at the
+  cap level (`SEND_LEVELS[5]`: replay 0, chunk 0) a new client got nothing;
+- CircuitPython 10.0.3 `lwip_tcp_send` returns the full length after 200
+  ERR_MEM retries (`err` is then tcp_output's ERR_OK), so a frame can be
+  reported sent and still be lost;
+- a Pico reset (`PICO_RESET_S`) throws away everything in RAM.
+
+Now (`farm_ws._strokes`, `link.stroke_keep`, default 64, at least `REPLAY_N`):
+
+- every `stroke` event is kept by seq and replayed to EVERY new client, at any
+  send level, in seq order, at least `STROKE_CHUNK_MIN` frame per turn.
+  Sandbells drops repeats (UNIQUE(src, boot_id, seq)), so re-sending is safe;
+- a stroke counts as delivered only when it was written whole, inside its
+  deadline (a 10 s "sent" call is an overrun: the client is cut, the stroke is
+  not confirmed), with nothing parked, to a client that is then heard from;
+- optional ack from a client: `{"ack_seq": n, "boot_id": "<the events' boot_id>"}`
+  confirms every stroke of this boot up to n and they are not replayed to it.
+  An ack naming another boot is ignored.  (Sandbells ingest change, optional:
+  send it after storing; until then the "heard after written" rule applies.)
+- `strokes_undelivered` is in `/status` link and in the heartbeat; a stroke
+  that leaves the full buffer unconfirmed is logged `STROKE seq N left the
+  replay buffer UNCONFIRMED` and counted (`strokes_dropped_unconfirmed`).
+
+Reset or wait: a Pico reset loses every undelivered stroke, while waiting
+loses nothing (keypad keeps stamping in its ISR; the buffer holds 64 strokes).
+So when LinkHealth asks for the reset and strokes are undelivered, it is held
+(`Pico reset HELD ...` each `RESET_HOLD_LOG_S`) up to `link.reset_hold_s`
+(default 1800 s); a live client calls it off (`LinkHealth.reset_called_off`,
+a later spell may ask again); with nothing undelivered, or after the hold,
+it resets as before.  The decision is `link_health.reset_decision`.

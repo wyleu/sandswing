@@ -40,3 +40,7 @@ def stalls_since(now, window_s):
     return 0
 def reset_radio():
     pass
+def live_clients(now=None):
+    return 0
+def undelivered_strokes():
+    return []

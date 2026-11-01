@@ -237,10 +237,10 @@ def test_send_block_ms_setting_tightens_every_bound():
         import json, os
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         ex = json.load(open(os.path.join(root, "settings_example.json")))
-        assert ex["link"] == {"send_block_ms": 400}, ex.get("link")
+        assert ex["link"]["send_block_ms"] == 400, ex.get("link")
         sys.path.insert(0, os.path.join(root, "src"))
         import config_loader
-        assert config_loader.DEFAULTS["link"] == {"send_block_ms": 400}
+        assert config_loader.DEFAULTS["link"]["send_block_ms"] == 400
 
 
 @case
@@ -254,6 +254,225 @@ def test_lwip_err_mem_sleep_is_the_one_wait_python_cannot_bound():
         assert took >= link_health.LWIP_ERR_MEM_S         # the C sleep: nothing to interrupt it
         assert ws not in farm_ws._clients
         assert farm_ws._path.state == link_health.SEND_DRAIN
+
+
+
+class ReadsDead(Ws):
+    """The library's receive() on a socket the peer reset: EBADF."""
+    def receive(self, fail_silently=False):
+        raise OSError(errno.EBADF, "EBADF")
+
+
+@case
+def test_ebadf_while_reading_a_new_client_is_gone_not_failed():
+    """08:18:49 and 08:20:51: 'close NEW->failed' from the read path."""
+    with rig() as r:
+        sock = FakeSocket(r.clock, [4096])
+        ws = farm_ws._accept(ReadsDead(types.SimpleNamespace(connection=sock,
+                                                             client_address=sock.peer)))
+        farm_ws._new.remove(ws)
+        farm_ws.poll()
+        assert ws not in farm_ws._clients and sock.closes == 1 and not sock.calls
+        d = notes()["client_dropped"]
+        assert d["how"] == "close NEW->closed" and d["reason"].startswith("gone"), d
+        assert farm_ws._path.state == "SEND_OK" and farm_ws._path.level == 0
+
+
+def request(peer):
+    sock = FakeSocket(Clock(), [4096], (peer, 50000))
+    return types.SimpleNamespace(connection=sock, client_address=sock.peer,
+                                 query_params={}, headers={}), sock
+
+
+@case
+def test_peer_allowlists_close_everyone_else_without_writing():
+    with rig():
+        allow = farm_ws.configure_peers({"link": {"ws_peers": ["192.168.0.106"],
+                                                  "status_peers": "192.168.0.106"}})
+        assert allow == {"ws": ("192.168.0.106",), "status": ("192.168.0.106",)}, allow
+        req, sock = request("192.168.0.22")
+        assert farm_ws.route_ws(req) is None and not farm_ws._clients
+        req, sock = request("192.168.0.120")
+        assert farm_ws.route_status(req) is None and not farm_ws._replies
+        assert not sock.calls and farm_ws.stats["refused_peer"] == 2
+        n = farm_ws.take_link_notes()
+        assert [w for w, _ in n].count("peer_refused") == 2, n
+        req, sock = request("192.168.0.106")
+        assert farm_ws.route_ws(req) is not None and len(farm_ws._clients) == 1
+        assert farm_ws.configure_peers({}) == {"ws": (), "status": ()}   # default: anyone
+        req, sock = request("192.168.0.22")
+        assert farm_ws.route_ws(req) is not None
+
+
+class FakeGc:
+    def __init__(self, total, free):
+        self.total, self.free = total, free
+
+    def mem_free(self):
+        return self.free
+
+    def mem_alloc(self):
+        return self.total - self.free
+
+
+@case
+def test_heap_growth_is_logged_and_shown_when_lwip_starves():
+    import heap_watch
+    real = heap_watch.gc
+    g = heap_watch.gc = FakeGc(128 * 1024, 90 * 1024)
+    heap_watch.reset()
+    lines = []
+    try:
+        heap_watch.check(lines.append, "boot")
+        heap_watch.check(lines.append)
+        assert not lines and heap_watch.status()["gc_heap_grew"] == 0
+        g.total = 300 * 1024                     # took the largest free block
+        heap_watch.check(lines.append, "mem check")
+        assert len(lines) == 1 and "HEAP GREW 128 -> 300 kB at mem check" in lines[0], lines
+        st = heap_watch.status()
+        assert (st["gc_heap_kb"], st["gc_heap_max_kb"], st["gc_heap_boot_kb"], st["gc_heap_grew"]) \
+            == (300, 300, 128, 1), st
+        with rig() as r:
+            import io, contextlib
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                farm_ws._starved("live send", link_health.LWIP_ERR_MEM_S)
+            assert "lwIP starved (live send took 10.0 s): VM heap 300 kB" in out.getvalue(), out.getvalue()
+            n = notes()
+            assert n["lwip_starved"]["gc_heap_kb"] == 300 and n["lwip_starved"]["gc_heap_grew"] == 1, n
+    finally:
+        heap_watch.gc = real
+        heap_watch.reset()
+
+
+
+
+# -- strokes reach Sandbells (2026-11-01: 20 presses, not all arrived) -------
+def stroke(seq, boot="b1"):
+    return {"type": "stroke", "seq": seq, "boot_id": boot, "pad": "s" * 200}
+
+
+def seqs(sock):
+    return [farm_ws.json.loads(f)["seq"] for f in sock.frames()]
+
+
+def at_the_cap_level(r):
+    """The send path at its last level: replay 0, chunk 0 in SEND_LEVELS."""
+    p = farm_ws._path
+    p.state, p.level = link_health.SEND_DEGRADED, link_health.SEND_MAX_LEVEL
+    p.last_bad = p.level_since = r.clock.t
+    plan = p.plan(r.clock.t)
+    assert plan.replay_n == 0 and plan.chunk_frames == 0, plan
+    return plan
+
+
+class Talks(Ws):
+    """A client that says something (a heartbeat, an ack) on every receive."""
+    def __init__(self, request, say=None):
+        Ws.__init__(self, request)
+        self.say = list(say or [])
+
+    def receive(self, fail_silently=False):
+        return self.say.pop(0) if self.say else None
+
+
+@case
+def test_strokes_made_with_no_client_are_replayed_even_at_the_cap_level():
+    with rig() as r:
+        for n in range(1, 6):
+            farm_ws.send(stroke(n))                       # nobody connected: a stall or reset
+        farm_ws.send({"type": "panel", "seq": 6, "boot_id": "b1"}, keep=False)
+        assert farm_ws.undelivered_strokes() == [1, 2, 3, 4, 5]
+        at_the_cap_level(r)
+        ws, sock = r.client([4096], replay=True)
+        for _ in range(40):
+            farm_ws.poll()
+            r.clock.t += 2.0
+            at_the_cap_level(r)
+        assert seqs(sock) == [1, 2, 3, 4, 5], seqs(sock)
+        assert farm_ws.stats["strokes_replayed"] == 5
+
+
+@case
+def test_a_stroke_lwip_said_it_sent_after_10s_goes_again_to_the_next_client():
+    """CircuitPython 10.0.3 returns len after 200 ERR_MEM retries: the frame
+    may be lost.  The client is cut, the stroke is never confirmed, and the
+    next client gets it (Sandbells drops it if it had it)."""
+    with rig() as r:
+        ws, sock = r.client([("block", link_health.LWIP_ERR_MEM_S)])
+        farm_ws.send(stroke(7))
+        assert ws not in farm_ws._clients
+        assert farm_ws.undelivered_strokes() == [7]
+        r.clock.t += 60.0                                  # past the drain
+        ws2, sock2 = r.client([4096], peer="192.168.0.22", replay=True)
+        for _ in range(20):
+            farm_ws.poll()
+            r.clock.t += 0.5
+        assert 7 in seqs(sock2), seqs(sock2)
+
+
+@case
+def test_a_written_stroke_is_confirmed_only_once_the_client_talks_again():
+    with rig() as r:
+        sock = FakeSocket(r.clock, [4096])
+        talk = Talks(types.SimpleNamespace(connection=sock, client_address=sock.peer))
+        ws = farm_ws._accept(talk)
+        farm_ws._new.remove(ws)
+        farm_ws.send(stroke(1))
+        assert seqs(sock) == [1] and farm_ws.undelivered_strokes() == [1]
+        talk.say = ['{"src": "ingest"}']
+        farm_ws.poll()
+        assert farm_ws.undelivered_strokes() == [], farm_ws.undelivered_strokes()
+        assert farm_ws.link_status()["strokes_undelivered"] == 0
+
+
+@case
+def test_an_ack_confirms_and_skips_strokes_of_this_boot_only():
+    with rig() as r:
+        for n in range(1, 5):
+            farm_ws.send(stroke(n))
+        sock = FakeSocket(r.clock, [4096])
+        talk = Talks(types.SimpleNamespace(connection=sock, client_address=sock.peer),
+                     ['{"ack_seq": 3, "boot_id": "old"}', '{"ack_seq": 2, "boot_id": "b1"}'])
+        ws = farm_ws._accept(talk)
+        farm_ws._new.remove(ws)
+        farm_ws._receive(ws, r.clock.t)                    # acks before the replay starts
+        assert farm_ws.undelivered_strokes() == [3, 4] and farm_ws.stats["acks"] == 1
+        farm_ws._begin_replay(ws, farm_ws._path.plan(r.clock.t))
+        for _ in range(20):
+            farm_ws.poll()
+            r.clock.t += 0.5
+        assert seqs(sock) == [3, 4], seqs(sock)
+
+
+@case
+def test_the_stroke_buffer_is_bounded_and_says_when_one_leaves_unconfirmed():
+    with rig():
+        farm_ws.configure_delivery({"link": {"stroke_keep": farm_ws.REPLAY_N}})
+        try:
+            for n in range(farm_ws.REPLAY_N + 2):
+                farm_ws.send(stroke(n))
+            assert len(farm_ws._strokes) == farm_ws.REPLAY_N
+            assert farm_ws.stats["strokes_dropped_unconfirmed"] == 2
+            assert farm_ws.configure_delivery({"link": {"stroke_keep": 1}}) == farm_ws.REPLAY_N
+        finally:
+            farm_ws.configure_delivery({})
+        assert farm_ws.STROKE_KEEP == link_health.STROKE_KEEP
+
+
+@case
+def test_a_pico_reset_waits_for_undelivered_strokes_then_goes_anyway():
+    hold = link_health.RESET_HOLD_S
+    d = link_health.reset_decision
+    assert d(None, 100.0, 3, False) is None
+    assert d(100.0, 100.0 + hold / 2, 3, False) == "hold"      # strokes would be lost
+    assert d(100.0, 100.0 + hold, 3, False) == "reset"         # waited long enough
+    assert d(100.0, 101.0, 0, False) == "reset"                # nothing to lose
+    assert d(100.0, 101.0, 3, True) == "cancel"                # the link healed
+    lh = link_health.LinkHealth()
+    lh._pico_asked = True
+    lh.reset_called_off()
+    assert not lh._pico_asked
 
 
 finish()

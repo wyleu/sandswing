@@ -450,6 +450,32 @@ REPLY_CHUNK_B = TCP_MSS          # at most one new pbuf per send(): 5964 B in 5 
 # reading: the client is cut.
 WS_CHUNK_B = TCP_MSS
 
+# Strokes (farm_ws._strokes): settings.json link.stroke_keep strokes are held
+# for replay to every new client, at every send level (a level that replays
+# nothing still replays strokes, STROKE_CHUNK_MIN frames per turn).  64 x
+# ~0.3 kB = ~20 kB of VM heap; it covers a 10 s stall, a few reconnects, and a
+# Pico-reset hold (RESET_HOLD_S) at funeral pace.
+STROKE_KEEP = 64
+STROKE_CHUNK_MIN = 1
+# settings.json link.reset_hold_s: a Pico reset (PICO_RESET_S unhealthy, tower
+# quiet) loses every stroke still in RAM.  While strokes are undelivered it
+# is held this long more, in case the link heals and they can go; then the
+# reset goes ahead (a wedged radio delivers nothing either).
+RESET_HOLD_S = 1800.0
+
+
+def reset_decision(wanted_at, now, pending, live, hold_s=RESET_HOLD_S):
+    """A Pico reset was asked for at wanted_at (None: not asked).  pending:
+    strokes not yet delivered; live: a client is live again.  Returns
+    None (nothing to do), "cancel", "hold" or "reset"."""
+    if wanted_at is None:
+        return None
+    if live:
+        return "cancel"
+    if pending and now - wanted_at < hold_s:
+        return "hold"
+    return "reset"
+
 # settings.json "link.send_block_ms": the most one network operation (a frame,
 # a handshake or reply chunk, a request read, a close) may hold the loop in
 # Python-visible code.  Default and ceiling: SEND_TIMEOUT_S (a lower value
@@ -609,6 +635,12 @@ class LinkHealth:
         self._pico_asked = False
         self._stall_reset_at = None  # last radio reset asked for because of stalls
         self.events = []
+
+    def reset_called_off(self):
+        """The Pico reset asked for was held (undelivered strokes) and the
+        link healed meanwhile: a later spell may ask again."""
+        self._pico_asked = False
+        self._bad_since = None
 
     def _spell(self, now_s, bad, good, tower_inactive):
         """Track one unhealthy spell across radio resets and rejoins, and say
