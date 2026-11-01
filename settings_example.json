@@ -39,7 +39,10 @@
     "ws_peers": [],
     "status_peers": [],
     "stroke_keep": 64,
-    "reset_hold_s": 1800
+    "reset_hold_s": 1800,
+    "ring_send": "live",
+    "batch_ms": 1000,
+    "ring_quiet_s": 120
   },
   "probe": {
     "present_delta": 2000,

@@ -99,6 +99,35 @@ def strokes(app, fh):
             "events": [[e["body"]["ch"], e["session"], e["mode"]] for e in sent]}
 
 
+def midi_first(app, fh):
+    """A laser-head stroke: its USB MIDI NoteOn is sent before the stroke goes
+    to the network (a live send can sit 10 s in lwIP's ERR_MEM loop)."""
+    import concentrator
+    from sntp_pico import TickClock
+    level = {0: True}                            # True = beam clear (not held)
+    fh.din_fn[0] = lambda: level[0]
+    app.head[0] = "new"
+    t = [1000000]
+    app.ticks = TickClock(lambda: t[0])
+    keypad_clock(t)
+    app.ring.clock_ms = app.ticks.now
+    order = []
+    concentrator.send = lambda obj, keep=True: order.append(["net", obj.get("type")])
+    app.ring._send_fn = lambda ch, note, on: order.append(["midi", on])
+    app.ring.heads = {0: "head_new"}
+    app.ring.rest_held[0] = app.ring.prev_held[0] = False
+    app.ring.running = True
+    app.sntp = SessionSntp()
+    app.poll_sense()                             # all clear: last_false set
+    for _ in range(2):
+        t[0] += 2000
+        level[0] = False
+        app.poll_sense()
+        level[0] = True
+        app.poll_sense()
+    return {"order": order}
+
+
 class RawSntp(FakeSntp):
     """Records the raw_tick each stamp() was given."""
     def __init__(self):
@@ -482,6 +511,8 @@ def child(scenario, src, extra):
             out.update(strokes(app, fh))
         if scenario == "stamps":
             out.update(stamps(app, fh))
+        if scenario == "midi_first":
+            out.update(midi_first(app, fh))
         if scenario == "watch":
             out.update(watch_empty(app, fh, plug_head))
         if scenario == "link":
@@ -612,6 +643,11 @@ def main():
     check("strokes: other channel independent of ch1's gap", ev[-1:] == [[2, 1, "ringing"]], ev)
     check("strokes: one session for the whole ring (one wake)",
           r.get("wakes") == 1 and all(e[1] == 1 for e in ev), (r.get("wakes"), ev))
+    r = spawn(me, "midi_first")
+    order = [o for o in (r.get("order") or []) if o[0] == "midi" or o[1] == "stroke"]
+    check("midi first: each head stroke's NoteOn goes out before its network send",
+          order == [["midi", True], ["net", "stroke"], ["midi", False]] * 2,
+          r.get("exc") or order)
     r = spawn(me, "stamps")
     S = r.get("stamps") or {}
     P = 1 << 29

@@ -33,7 +33,8 @@
 #   inputs       – sense edge scan: scan_interval_ms, event_queue_len, late_drain_ms (sandswing)
 #   link         – /ws and /status sockets: send_block_ms (most one network op may hold the loop),
 #                  ws_peers / status_peers (only these addresses; [] = anyone),
-#                  stroke_keep (strokes held for replay), reset_hold_s (Pico reset waits for them)
+#                  stroke_keep (strokes held for replay), reset_hold_s (Pico reset waits for them),
+#                  ring_send live/batched/shed, batch_ms, ring_quiet_s (the network while ringing)
 #   ir           – carrier / duty (bell IR path)
 #   detection    – num_bells, latch timings (bell path)
 #   hardware     – head counts, laser_via, notes (sense path)
@@ -104,6 +105,9 @@ DEFAULTS = {
         "status_peers": [],
         "stroke_keep": 64,
         "reset_hold_s": 1800,
+        "ring_send": "live",        # link_health.RING_SEND
+        "batch_ms": 1000,           # link_health.BATCH_PERIOD_S
+        "ring_quiet_s": 120,        # link_health.RING_QUIET_S
     },
     "ir": {},
     "detection": {},

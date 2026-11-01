@@ -172,6 +172,9 @@ stateDiagram-v2
     NEW --> GONE: closed
     LIVE --> GONE: closed
     LAGGING --> GONE: closed
+    NEW --> GONE: shed
+    LIVE --> GONE: shed
+    LAGGING --> GONE: shed
 ```
 
 Events: `heard` a frame arrived; `quiet` unheard `CLIENT_LAG_S`; `silent`
@@ -180,7 +183,8 @@ deadline (also when the send completed late), or a replay frame ran slow;
 `backlog` its queue reached `TODO_MAX`; `starved` some send or serve call
 took `STARVED_S` or more (lwIP out of buffers); `superseded` a newer
 connection from the same address exists; `failed` a socket error; `closed`
-the peer closed.  `failed` and `closed` close politely; every other drop is a
+the peer closed; `shed` the bells started ringing with `link.ring_send`
+"shed" (see "Ringing mode").  `failed` and `closed` close politely; every other drop is a
 `cut`.  A `NEW` or `LIVE` client ignores `starved` and `superseded`: Sandbells
 ingest and the page-3 widget can share one address, and only a client that
 has stopped talking is blamed or replaced.  A test checks that this diagram
@@ -893,3 +897,48 @@ So when LinkHealth asks for the reset and strokes are undelivered, it is held
 (default 1800 s); a live client calls it off (`LinkHealth.reset_called_off`,
 a later spell may ask again); with nothing undelivered, or after the hold,
 it resets as before.  The decision is `link_health.reset_decision`.
+
+## Ringing mode: MIDI first, the network second (2026-11-01)
+
+MIDI (USB, `usb_midi`, `ring.py`) is the product; the display is an
+analysis tool.  MIDI, the sense loop and `farm_ws` share ONE Python thread
+(asyncio).  A `send()` that meets ERR_MEM sleeps 10 s in C
+(`LWIP_ERR_MEM_S`); keypad keeps stamping edges meanwhile, but no Python code
+runs, so no NoteOn is sent until the sleep ends.  Before this build a
+laser-head stroke's network send came BEFORE its NoteOn (`poll_sense` called
+`_channel`, which sends, then `ring.edge`); now `ring.edge` goes first
+(`tests/test_concentrator.py` "midi first").
+
+`settings.json` `link.ring_send` (`link_health.NetMode`, `NET_PLAN`):
+
+| mode | while ringing | ERR_MEM stall possible? |
+|---|---|---|
+| `live` (default) | every stroke written as it happens, from the sense path | yes, inline: the next NoteOn waits up to 10 s |
+| `batched` | nothing written from the sense path; each client gets one write per `link.batch_ms` (`BATCH_PERIOD_S` 1 s) of every frame queued since, back to back, up to one segment (`BATCH_MAX_B` = `TCP_MSS`, ~4 strokes); heartbeats wait for the batch | yes, in the poll task: rarer (fewer pbufs), same 10 s when it happens |
+| `shed` | on the first stroke every client is cut (no close frame), `/status` replies cancelled; no `Server.poll()`, no write, no Wi-Fi rejoin | no lwIP send at all, so no ERR_MEM sleep |
+| `off` | the whole boot, ringing or not: no Wi-Fi join (boot or later), no server, no ping, no radio or Pico reset for the link | no network call at all: the only mode where nothing on the network side can hold MIDI |
+
+While ringing, no mode rejoins a lost Wi-Fi (`connect` blocks up to
+`WIFI_JOIN_TIMEOUT_S` 10 s per network).  Recovery that starts while quiet
+(rejoin, `reset_radio`'s 1 s sleep, a 1 s gateway ping, the boot join)
+still holds the loop, and a stroke made during it gets its NoteOn late:
+one Python thread does both.  Only `off` (or MIDI not made by Python) removes
+that.
+
+"Ringing" = a stroke within `link.ring_quiet_s` (`RING_QUIET_S` = 2 x
+`SLOWEST_TOLL_S` = 120 s), not TowerWatch's state (inactive 10 s after the
+last edge: a slow toll would bring the network back between tolls).  While
+ringing in any mode there is no gateway ping, radio reset or Pico reset
+(`concentrator.link_step` passes "tower quiet" only when both are quiet).
+
+Strokes keep their seq.  A batch carries the same `sand.event/v1` frames, so
+Sandbells needs no change.  In `shed` the strokes stay in `farm_ws._strokes`
+(`link.stroke_keep`, 64) and count as undelivered, which holds a Pico reset
+(`reset_decision`); after `ring_quiet_s` the server runs again and Sandbells'
+reconnect gets every kept stroke replayed.  More strokes than `stroke_keep`
+during one shed spell: the oldest go to MIDI only (`STROKE ... UNCONFIRMED`).
+
+Log: `ringing: link.ring_send <mode>, batch N ms, quiet N s` at boot;
+`link net_ringing {'mode', 'cut', 'quiet_s'}` and `link net_quiet {...}`;
+`net.ring_send`, `net.net_state`, `net.batches`, `net.batched_frames` in the
+heartbeat and `/status`.

@@ -133,6 +133,7 @@ _notes = []                    # (what, info) for concentrator.py
 _replies = []                  # queued HTTP replies (/status), oldest first: see _pump_replies
 _path = link_health.SendPath() # send-path state model: plan(now) says what is allowed
 _gate = link_health.StatusGate() # /status full or held, from the tower state: set_tower()
+_net = link_health.NetMode()     # the network while the bells ring (link.ring_send): MIDI first
 
 
 def _new_boot_id():
@@ -165,6 +166,7 @@ stats = {"connects": 0, "drops": 0, "refused": 0, "send_timeouts": 0,
          "gone": 0, "handshakes_lost": 0, "parked": 0, "refused_peer": 0,
          "strokes_kept": 0, "strokes_confirmed": 0, "strokes_dropped_unconfirmed": 0,
          "strokes_replayed": 0, "acks": 0,
+         "batches": 0, "batched_frames": 0,
          "last_drop_reason": None, "last_drop_at": None,
          "hb_seen": False, "last_rx_at": None}
 
@@ -254,6 +256,56 @@ def configure_delivery(cfg):
     return STROKE_KEEP
 
 
+def configure_ring(cfg):
+    """link.ring_send / batch_ms / ring_quiet_s -> NetMode (link_health.NET_PLAN)."""
+    mode, batch_s, quiet_s = link_health.ring_settings(cfg)
+    _net.configure(mode, batch_s, quiet_s)
+    return mode, batch_s, quiet_s
+
+
+def net_ringing():
+    """A stroke within link.ring_quiet_s: no radio or Pico reset, no gateway
+    ping (concentrator.link_step), whatever link.ring_send says."""
+    return _net.ringing()
+
+
+def net_off():
+    """link.ring_send "off": MIDI only, no network at all this boot."""
+    return _net.off()
+
+
+def net_rejoins():
+    """May a lost Wi-Fi be rejoined now (a join blocks the loop)?"""
+    return _net.rejoins()
+
+
+def _net_stroke(now):
+    """A stroke was made: NetMode may begin ringing.  "shed": every client is
+    cut (nothing written: no close frame) and every /status reply cancelled."""
+    action = _net.stroke(now)
+    if action != "ring":
+        return action
+    cut = 0
+    if _net.sheds():
+        for job in list(_replies):
+            _reply_event(job, "held", "ringing: network shed")
+        for ws in list(_clients):
+            if _event(ws, "shed", "ringing: network shed for MIDI (link.ring_send shed)"):
+                cut += 1
+        for ws in list(_refused):
+            _refused.remove(ws)
+            conn = getattr(getattr(ws, "_request", None), "connection", None)
+            if conn is not None:
+                _shut(ws, conn)
+    _note("net_ringing", mode=_net.mode, cut=cut, quiet_s=_net.quiet_s)
+    return action
+
+
+def _net_tick(now):
+    if _net.tick(now) == "calm":
+        _note("net_quiet", mode=_net.mode, strokes_undelivered=len(undelivered_strokes()))
+
+
 def _seq_of(msg):
     """The "seq" of one of our event messages (json.dumps text), else None,
     without parsing the whole message."""
@@ -333,6 +385,9 @@ def start_server(cfg, payload_fn):
     _cfg = cfg
     block_s = configure_bounds(cfg)
     configure_delivery(cfg)
+    ring = configure_ring(cfg)
+    print("ringing: link.ring_send %s, batch %d ms, quiet %d s"
+          % (ring[0], int(ring[1] * link_health.MS_PER_S), int(ring[2])))
     allow = configure_peers(cfg)
     for kind in ("ws", "status"):
         if allow[kind]:
@@ -1023,7 +1078,7 @@ def _event(ws, event, why=None):
         _drop(ws, event if why is None else why,
               WS_NORMAL if event == "closed" else WS_GOING_AWAY,
               frame=(action == link_health.CLOSE
-                     and link_health.SEND_WRITES[_path.state]),
+                     and link_health.SEND_WRITES[_path.state] and _net.writes()),
               how="%s %s->%s" % (action, before, event))
     elif action == link_health.HOLD:
         stats["lagging"] += 1
@@ -1132,6 +1187,72 @@ def _deliver(ws, msg, timeout_s, kind):
         q = _seq_of(msg)
         if _is_stroke(q):
             m["unconfirmed"].append(q)       # confirmed when heard next with nothing parked
+    return True
+
+
+def _frame_b(msg):
+    """Bytes of msg as one WS text frame (RFC 6455 header: 2, 4 or 10 B)."""
+    n = len(msg.encode("utf-8"))
+    return n + (2 if n < 126 else 4 if n < 65536 else 10)
+
+
+def _batch_len(todo):
+    """How many queued frames go in one batch: as many as fit BATCH_MAX_B
+    (one TCP segment, one pbuf), at least one (a bigger frame, a heartbeat,
+    goes alone)."""
+    n, size = 0, 0
+    for msg in todo:
+        b = _frame_b(msg)
+        if n and size + b > link_health.BATCH_MAX_B:
+            break
+        n += 1
+        size += b
+    return n
+
+
+def _deliver_batch(ws, m, msgs, timeout_s):
+    """Several frames to one client in ONE write: their bytes back to back
+    in its out buffer, then one _flush.  Outcome reported like _deliver's
+    (deadline, failure, strokes to confirm when it is heard next)."""
+    prep = getattr(ws, "_prepare_frame", None)
+    conn = getattr(getattr(ws, "_request", None), "connection", None)
+    if prep is None or conn is None:              # a fake / another library: one by one
+        for msg in msgs:
+            if not _deliver(ws, msg, timeout_s, "live"):
+                return False
+        return True
+    t0 = time.monotonic()
+    ok, gone = False, False
+    try:
+        if not m["out"]:
+            m["out_at"] = t0
+        for msg in msgs:
+            m["out"].extend(prep(1, msg.encode("utf-8")))     # 1 = TEXT
+        _flush(ws, m, timeout_s)
+        ok = True
+    except OSError as e:
+        gone = e.errno in REPLY_GONE_ERRNOS
+        t1 = time.monotonic()
+        _path.observe(t1, "gone" if gone else "live", t1 - t0, False)
+        _send_failed(ws, e, "batch", t1 - t0)
+        return False
+    except Exception as e:
+        _event(ws, "failed", e)
+        return False
+    t1 = time.monotonic()
+    took = t1 - t0
+    _path.observe(t1, "live", took, ok)
+    if took > timeout_s:
+        stats["send_timeouts"] += 1
+        _event(ws, "overran", "batch of %d frames took %.2f s (deadline %.2f s)"
+               % (len(msgs), took, timeout_s))
+        _starved("batch send", took)
+        return False
+    for msg in msgs:
+        m["unheard_b"] += len(msg)
+        q = _seq_of(msg)
+        if _is_stroke(q):
+            m["unconfirmed"].append(q)
     return True
 
 
@@ -1378,6 +1499,18 @@ def _pump(ws, m, plan, now, deadline):
             return
         if not _deliver_parked(ws, m, min(plan.send_s, SEND_TIMEOUT_S, left)):
             return                                  # still parked (or cut): next turn
+    if _net.batching() and m["left"] == 0 and m["todo"]:
+        left = deadline - time.monotonic() - plan.close_s
+        if left < link_health.MIN_SLICE_S:
+            return
+        n = _batch_len(m["todo"])
+        if not _deliver_batch(ws, m, m["todo"][:n], min(plan.send_s, SEND_TIMEOUT_S, left)):
+            return                                  # the model cut it (or it failed)
+        del m["todo"][:n]
+        stats["batches"] += 1
+        stats["batched_frames"] += n
+        m["next_at"] = now + _net.batch_s           # one write per period per client
+        return
     while m["todo"]:
         left = deadline - time.monotonic() - plan.close_s    # keep room to drop it
         if left < link_health.MIN_SLICE_S:
@@ -1401,6 +1534,15 @@ def _pump(ws, m, plan, now, deadline):
     m["next_at"] = now + plan.chunk_gap_s
 
 
+def _plan(now):
+    """SendPath's plan, narrowed by NetMode (ringing with link.ring_send
+    "shed": nothing served, nothing written)."""
+    plan = _path.plan(now)
+    plan.serve = plan.serve and _net.serves()
+    plan.writes = plan.writes and _net.writes()
+    return plan
+
+
 def poll():
     """Accept HTTP/WS requests, refuse clients over the limit, replay recent
     events to new clients (a chunk per turn), then read each client so pings
@@ -1409,7 +1551,8 @@ def poll():
     stops when link_health.POLL_BUDGET_S is spent and carries on next turn."""
     t0 = time.monotonic()
     answered0 = _answered[0]
-    plan = _path.plan(t0)
+    _net_tick(t0)
+    plan = _plan(t0)
     deadline = t0 + plan.poll_s
     if ws_bounds is not None:
         ws_bounds.clear_last()
@@ -1449,7 +1592,7 @@ def poll():
     while _new:
         ws = _new.pop(0)
         if ws in _clients:
-            _begin_replay(ws, _path.plan(time.monotonic()))
+            _begin_replay(ws, _plan(time.monotonic()))
     now = time.monotonic()
     for ws in list(_clients):
         m = _meta.get(id(ws))
@@ -1542,8 +1685,13 @@ def send(obj, keep=True):
         if isinstance(obj, dict) and obj.get("type") == "stroke" and obj.get("seq") is not None:
             _event_boot[0] = obj.get("boot_id")
             _keep_stroke(int(obj["seq"]), msg)
+            _net_stroke(time.monotonic())        # may shed the network: before any write
     if not _clients:
         return False
+    if not _net.inline():
+        # ringing, link.ring_send batched or shed: nothing is written from
+        # here (the sense path, the MIDI path); the poll task writes it
+        return _queue_all(msg, keep)
     sent = False
     # the whole broadcast is held to the poll budget: a client that cannot
     # take its frame costs at most its own deadline, and whoever is left
@@ -1575,6 +1723,28 @@ def send(obj, keep=True):
         if _deliver(ws, msg, min(SEND_TIMEOUT_S, left), "live"):
             sent = True
     return sent
+
+
+def _queue_all(msg, keep):
+    """Every client's queue, in order, for the poll task.  Shed: nothing
+    (no client is left; strokes are in _strokes for the replay).  Batched:
+    events and heartbeats both (the heartbeat keeps Sandbells' 20 s
+    silence rule happy and goes in the next batch, at most a period late)."""
+    if not _net.writes():
+        return False
+    queued = False
+    for ws in list(_clients):
+        m = _meta.get(id(ws))
+        if m is None or ws not in _clients:
+            continue
+        if not m["path"].writes() and not keep:
+            continue                                # LAGGING: heartbeats are skipped
+        if len(m["todo"]) >= TODO_MAX:
+            _event(ws, "backlog", "batch backlog")
+            continue
+        m["todo"].append(msg)
+        queued = True
+    return queued
 
 
 def ws_connected():
@@ -1651,6 +1821,8 @@ def link_status():
     d["send_level"] = _path.level
     d["clients_by_state"] = _by_state()
     d["strokes_undelivered"] = len(undelivered_strokes())
+    d["ring_send"] = _net.mode
+    d["net_state"] = _net.state
     if d["last_drop_at"] is not None:
         d["last_drop_age_s"] = round(now - d["last_drop_at"], 1)
     del d["last_drop_at"]
@@ -1673,6 +1845,7 @@ def reset_state():
     del _accepting[:]
     _allow["ws"] = _allow["status"] = ()
     _gate.reset()
+    _net.reset()
     _doc.reset()
     _peers.clear()
     _nomem_until[0] = 0.0

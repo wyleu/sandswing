@@ -391,6 +391,7 @@ for _st in _OPEN:
     CLIENT_TRANSITIONS[(_st, "backlog")] = (C_GONE, CUT)
     CLIENT_TRANSITIONS[(_st, "failed")] = (C_GONE, CLOSE)
     CLIENT_TRANSITIONS[(_st, "closed")] = (C_GONE, CLOSE)
+    CLIENT_TRANSITIONS[(_st, "shed")] = (C_GONE, CUT)     # NetMode: MIDI only while ringing
 del _st
 # What each state lets farm_ws do with a new frame for that client.
 CLIENT_WRITES = {C_NEW: True, C_LIVE: True, C_LAGGING: False, C_GONE: False}
@@ -622,6 +623,160 @@ class StatusGate:
         self.state, action = nxt
         self.since = now
         return action
+
+
+# ---------------------------------------------------------------------------
+# The network while the bells ring (NetMode): MIDI first, the link second.
+#
+# Why (2026-11-01, sandbells2 on weak Wi-Fi): one live frame took 10.0 s in
+# lwip_tcp_send's ERR_MEM loop (LWIP_ERR_MEM_S), the sense loop was held
+# 10.1 s (LATE DRAIN), and nothing in Python ran meanwhile -- not the next
+# USB MIDI note either: farm_ws, the sense loop and Ring share one thread.
+# MIDI is the product; the display is an analysis tool.  So while the bells
+# ring the network may be asked to give way, by settings.json link.ring_send:
+#
+#   "live"     as before: every stroke is written as it happens (one TCP
+#              segment, one ~1.5 kB lwIP pbuf, per stroke per client).
+#   "batched"  a stroke is never written from the sense path: it queues and
+#              each client gets one write per batch period carrying every
+#              frame queued since the last (several WS frames back to back in
+#              one segment: Sandbells sees the same sand.event/v1 frames, same
+#              seq).  Fewer pbufs in flight; the ERR_MEM stall can still happen,
+#              in the poll task, rarer.
+#   "shed"     MIDI only while ringing: on the first stroke every /ws client is
+#              cut (socket closed, nothing written), the server is not polled
+#              (no handshake, /status or 503 is sent), nothing is written and
+#              no Wi-Fi rejoin is tried.  With no send() there is no ERR_MEM
+#              sleep.  Strokes stay in the replay buffer by seq (link.stroke_keep)
+#              and go to Sandbells when it reconnects after RING_QUIET_S.
+#   "off"      MIDI only for the whole boot: no Wi-Fi join at boot or later,
+#              no server, no ping, no radio or Pico reset for the link.  The
+#              only mode in which no network call can ever hold the loop
+#              (a join blocks up to WIFI_JOIN_TIMEOUT_S per network, a radio
+#              reset sleeps 1 s, a ping waits up to 1 s, a send can sit in
+#              ERR_MEM 10 s).
+#
+# While ringing no mode rejoins a lost Wi-Fi: a join blocks the loop, and MIDI
+# with it.
+# Ringing here is "a stroke within link.ring_quiet_s", not TowerWatch's state:
+# TowerWatch goes inactive RINGDOWN_S (10 s) after the last edge, and a slow
+# funeral toll can be further apart than that; the network must not come back
+# (and stall) between two tolls.
+# ---------------------------------------------------------------------------
+RING_SEND_LIVE = "live"
+RING_SEND_BATCHED = "batched"
+RING_SEND_SHED = "shed"
+RING_SEND_OFF = "off"
+RING_SEND_MODES = (RING_SEND_LIVE, RING_SEND_BATCHED, RING_SEND_SHED, RING_SEND_OFF)
+RING_SEND = RING_SEND_LIVE          # default: behaviour as before this table
+# A minute bell tolls once per 60 s at the slowest; twice that bridges one
+# missed or late stroke without the network coming back between tolls.
+SLOWEST_TOLL_S = 60.0
+RING_QUIET_S = 2 * SLOWEST_TOLL_S   # link.ring_quiet_s
+# One batch per client per BATCH_PERIOD_S.  A stroke frame is ~320 B
+# (sand.event/v1, 4 B WS header), so one TCP_MSS segment holds
+# BATCH_MAX_B // 320 = 4.  Eight bells in changes strike ~3.7 times a second
+# (5040 changes x 8 strokes in ~3 h); 1 s gathers about that many: one
+# segment per second instead of ~4.  Shorter periods gather fewer and save
+# less; the price is up to one period of delay on the display (not on MIDI).
+BATCH_PERIOD_S = 1.0                # link.batch_ms
+BATCH_MAX_B = TCP_MSS               # one segment (one pbuf) per batch write
+N_QUIET = "QUIET"                   # no stroke for ring_quiet_s: the network as configured
+N_RINGING = "RINGING"               # ringing: link.ring_send applies
+NET_TRANSITIONS = {
+    (N_QUIET, "stroke"):  (N_RINGING, "ring"),
+    (N_RINGING, "quiet"): (N_QUIET, "calm"),
+}
+# (state, ring_send) -> (inline, writes, serves, rejoins):
+#   inline   a frame may be written from send(), i.e. from the sense path
+#   writes   the poll task may write frames and /status chunks
+#   serves   the library's Server.poll() may run (accept, read, reply)
+#   rejoins  a lost Wi-Fi may be rejoined (a join blocks the loop)
+NET_PLAN = {}
+for _m in (RING_SEND_LIVE, RING_SEND_BATCHED, RING_SEND_SHED):
+    NET_PLAN[(N_QUIET, _m)] = (True, True, True, True)
+NET_PLAN[(N_RINGING, RING_SEND_LIVE)] = (True, True, True, False)
+NET_PLAN[(N_RINGING, RING_SEND_BATCHED)] = (False, True, True, False)
+NET_PLAN[(N_RINGING, RING_SEND_SHED)] = (False, False, False, False)
+NET_PLAN[(N_QUIET, RING_SEND_OFF)] = (False, False, False, False)
+NET_PLAN[(N_RINGING, RING_SEND_OFF)] = (False, False, False, False)
+del _m
+
+
+def ring_settings(cfg):
+    """settings.json link.ring_send / batch_ms / ring_quiet_s ->
+    (mode, batch_s, quiet_s); anything unusable gives the default."""
+    sec = (cfg.get("link", {}) if cfg is not None else {}) or {}
+    mode = sec.get("ring_send", RING_SEND)
+    if mode not in RING_SEND_MODES:
+        mode = RING_SEND
+    try:
+        batch_s = max(MIN_SLICE_S, float(sec.get("batch_ms", BATCH_PERIOD_S * MS_PER_S)) / MS_PER_S)
+    except (TypeError, ValueError):
+        batch_s = BATCH_PERIOD_S
+    try:
+        quiet_s = max(0.0, float(sec.get("ring_quiet_s", RING_QUIET_S)))
+    except (TypeError, ValueError):
+        quiet_s = RING_QUIET_S
+    return mode, batch_s, quiet_s
+
+
+class NetMode:
+    """stroke(now) / tick(now) -> action or None ("ring", "calm"); the
+    columns of NET_PLAN say what farm_ws may do.  No sockets."""
+    def __init__(self, mode=RING_SEND, batch_s=BATCH_PERIOD_S, quiet_s=RING_QUIET_S):
+        self.configure(mode, batch_s, quiet_s)
+        self.reset()
+
+    def configure(self, mode, batch_s, quiet_s):
+        self.mode, self.batch_s, self.quiet_s = mode, batch_s, quiet_s
+
+    def reset(self):
+        self.state = N_QUIET
+        self.last_stroke = None
+
+    def _fire(self, event):
+        nxt = NET_TRANSITIONS.get((self.state, event))
+        if nxt is None:
+            return None
+        self.state, action = nxt
+        return action
+
+    def stroke(self, now):
+        self.last_stroke = now
+        return self._fire("stroke")
+
+    def tick(self, now):
+        if self.state == N_RINGING and now - self.last_stroke >= self.quiet_s:
+            return self._fire("quiet")
+        return None
+
+    def _col(self, i):
+        return NET_PLAN[(self.state, self.mode)][i]
+
+    def inline(self):
+        return self._col(0)
+
+    def writes(self):
+        return self._col(1)
+
+    def serves(self):
+        return self._col(2)
+
+    def rejoins(self):
+        return self._col(3)
+
+    def ringing(self):
+        return self.state == N_RINGING
+
+    def batching(self):
+        return self.state == N_RINGING and self.mode == RING_SEND_BATCHED
+
+    def sheds(self):
+        return self.state == N_RINGING and self.mode == RING_SEND_SHED
+
+    def off(self):
+        return self.mode == RING_SEND_OFF
 
 
 class LinkHealth:

@@ -208,6 +208,21 @@ def setup_sntp(ip):
 if farm_log:
     farm_log.start(cfg)
 
+def _net_ringing():
+    f = getattr(farm_ws, "net_ringing", None)
+    return bool(f()) if f is not None else False
+
+
+def _net_off():
+    f = getattr(farm_ws, "net_off", None)
+    return bool(f()) if f is not None else False
+
+
+def _net_rejoins():
+    f = getattr(farm_ws, "net_rejoins", None)
+    return bool(f()) if f is not None else True
+
+
 def emit(msg):
     print(msg)
     if farm_log:   
@@ -510,8 +525,11 @@ class Concentrator:
             if not edges:
                 break
             for i, held, raw in edges:
-                self._channel(i, held, now, raw)
+                # MIDI first: the note must never wait behind the stroke's
+                # network send in _channel (a live send can sit 10 s in
+                # lwIP's ERR_MEM loop: docs/link-health.md "Ringing mode")
                 self.ring.edge(i, held, self._edge_ms(raw))
+                self._channel(i, held, now, raw)
         for i in range(self.n):
             self._channel(i, self._prev_held[i], now)
 
@@ -1051,12 +1069,18 @@ class Concentrator:
     def link_step(self, now, state):
         """One supervision pass driven by LinkHealth.
         state: {"lost_at", "tried_at"}"""
+        if _net_off():
+            return                               # MIDI only: no join, ping or reset
         now_ms = self.ticks.now()
         recent = [m for m in self.stroke_ms if m is not None]
         quiet_ms = 999999 if not recent else int(now_ms - max(recent))
 
         # gateway check first, so this pass's decision sees its latest answer
-        if self.tower.tower == "inactive" and quiet_ms >= MEM_QUIET_MS:
+        # quiet = the tower AND the network's ringing mode (a stroke within
+        # link.ring_quiet_s): no ping, radio reset or Pico reset between two
+        # tolls of a slow toll, where TowerWatch is already inactive
+        quiet = self.tower.tower == "inactive" and not _net_ringing()
+        if quiet and quiet_ms >= MEM_QUIET_MS:
             self._gateway_check(now)
 
         obs = {
@@ -1068,7 +1092,7 @@ class Concentrator:
             "gw_fail_count": self._gw_fail,
             "gw_failing": self._gw_since is not None,
             "stalls": farm_ws.stalls_since(now, STALL_WINDOW_S),
-            "tower_inactive": self.tower.tower == "inactive",
+            "tower_inactive": quiet,
             "quiet_ms": quiet_ms,
         }
         _, events = self.link_health.update(now, obs)
@@ -1116,6 +1140,8 @@ class Concentrator:
                 self.link_event("wifi_lost", count=self.wifi_lost)
             gap = (WIFI_REJOIN_S if self.tower.tower == "inactive"
                    else WIFI_REJOIN_RINGING_S)
+            if not _net_rejoins():
+                return                           # ringing, network shed: MIDI only, no join
             if now - state.get("tried_at", 0) >= gap:
                 state["tried_at"] = now
                 if self._rejoin():
@@ -1142,7 +1168,12 @@ def start_app():
     """Everything up to the steady loop: net, Concentrator (survey,
     classify, self-test, ring), first time sync, server.  The watchdog is
     armed last."""
-    ip = setup_net()
+    from link_health import ring_settings, RING_SEND_OFF
+    net_off = ring_settings(cfg)[0] == RING_SEND_OFF
+    if net_off:
+        farm_ws.configure_ring(cfg)
+        emit("link.ring_send off: MIDI only, no Wi-Fi, no server this boot")
+    ip = None if net_off else setup_net()
     app = Concentrator(cfg)
     app.link = "wifi_only" if ip else "no_wifi"   # panel_task: ws_client when /ws connected
     app.wifi_up = bool(ip)                        # link_task rejoins if not
@@ -1154,7 +1185,8 @@ def start_app():
             app.sntp.burst_once()                 # first sync before arming
         except Exception as e:
             emit("first sync failed: %s" % e)
-    start_server(cfg, app.status_payload)
+    if not net_off:
+        start_server(cfg, app.status_payload)
     total, free = heap_watch.check(emit, "boot")
     start = heap_watch.start_setting()
     emit("VM heap %d kB (%d kB free); settings.toml CIRCUITPY_HEAP_START_SIZE %s"
