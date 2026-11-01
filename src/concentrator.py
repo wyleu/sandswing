@@ -410,6 +410,7 @@ class Concentrator:
         self.trig_open_ms = [None] * self.n  # tick ms the switch was seen open
         self.trig_low_ms = [None] * self.n   # tick ms the press began
         self.trig_stuck = [False] * self.n
+        self.trig_sounding = [False] * self.n   # trigger plug: its MIDI note is on
         self.trig_presses = [0] * self.n
         # survey result per channel: kind, why, and for a fault what latched it
         self.chan = [{"kind": "unknown", "why": [], "latched": None}
@@ -572,6 +573,7 @@ class Concentrator:
         stroke = False
         if self.head[i] == "trigger":
             stroke = self._trigger_edge(i, held, now, self._edge_ms(raw))
+            self._trigger_note(i, held, stroke)
         elif became and self.last_false[i] is not None:
             self.edge_at[i] = now
             t_ms, last = self._edge_ms(raw), self.stroke_ms[i]
@@ -667,6 +669,17 @@ class Concentrator:
         prev = getattr(self, "_prev_held", None)     # not yet at early boot
         return (prev is not None and i < self.n
                 and self.head[i] == "trigger" and prev[i])
+
+    def _trigger_note(self, i, held, stroke):
+        """Trigger plug MIDI: NoteOn with a counted press, NoteOff on the
+        release after it.  Sent before the stroke goes to the network, so a
+        slow send never delays the note."""
+        if stroke and not self.trig_sounding[i]:
+            self.trig_sounding[i] = True
+            self.ring.note(i, True)
+        elif (not held) and self.trig_sounding[i]:
+            self.trig_sounding[i] = False
+            self.ring.note(i, False)
 
     def _trigger_edge(self, i, held, now, t):
         """Trigger plug: True when this sample is a counted press.

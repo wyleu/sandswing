@@ -129,6 +129,12 @@ class Ring:
     def tripped(self):
         return set(ch for ch in self.heads if self.sounding[ch])
 
+    def note(self, ch, on):
+        """Send ch's bell note on or off outside the laser-head logic: a
+        trigger plug press plays the same note its channel's bell would."""
+        if 0 <= ch < self.n:
+            self._send(ch, on)
+
     def stop(self):
         """Notes off, lasers off (before a rescan or at exit)."""
         for ch in range(self.n):

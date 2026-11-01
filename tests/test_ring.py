@@ -131,6 +131,17 @@ def test_edge_uses_its_own_stamp_not_the_clock():
     assert not hasattr(r, "poll")                    # no pin polling left in Ring
 
 
+@case
+def test_note_plays_a_channel_note_without_a_head():
+    r, ins, las, sent = rig()
+    r.start({0: "trigger"})               # a trigger plug is not a laser head
+    assert r.heads == {} and las[0].duty_cycle == 0
+    r.note(0, True)
+    r.note(0, False)
+    r.note(r.n, True)                     # out of range: nothing
+    assert sent == [(0, 65, True), (0, 65, False)], sent
+
+
 n_fail = results.count(False)
 print("\n%d passed, %d failed" % (len(results) - n_fail, n_fail))
 sys.exit(1 if n_fail else 0)

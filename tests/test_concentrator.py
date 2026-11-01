@@ -357,6 +357,8 @@ def trigger(app, fh, pressed):
     keypad_clock(t)
     sent = []
     concentrator.send = lambda obj, keep=True: sent.append(obj)
+    notes = []
+    app.ring._send_fn = lambda ch, note, on: notes.append((ch, note, on))
     app.sntp = SessionSntp()
     app.tower.tower = "inactive"
 
@@ -387,6 +389,7 @@ def trigger(app, fh, pressed):
     res["doubt"] = app.survey_state.status()["doubt"]
     res["strokes"] = [e["body"] for e in sent if e.get("type") == "stroke"]
     res["types"] = sorted(set(e.get("type") for e in sent))
+    res["notes"] = list(notes)
     # held for ages with the tower quiet: one resurvey request
     app.tower.tower = "inactive"
     sample(True, 20)
@@ -662,6 +665,8 @@ def main():
     st = T.get("strokes") or []
     check("trigger: each press one labelled stroke; press/release bounce ignored",
           len(st) == 7 and all(b == {"ch": 1, "test": True, "src": "trigger"} for b in st), st)
+    check("trigger: each press plays ch1's note (65) on, its release off",
+          T.get("notes") == [[0, 65, True], [0, 65, False]] * 7, T.get("notes"))
     check("trigger: presses never ask for a resurvey", T.get("doubt") is False, T.get("doubt"))
     check("trigger: only stroke events sent", T.get("types") == ["stroke"], T.get("types"))
     check("trigger: held > TRIGGER_STUCK_MS (tower quiet) -> one resurvey of ch1",
