@@ -165,12 +165,12 @@ WIFI_ROUNDS = 6          # passes over wifi.networks at boot before giving up
 WIFI_RETRY_S = 10        # pause between passes (hotspot may still be starting)
 
 
-def setup_net():
-    for rnd in range(WIFI_ROUNDS):
+def setup_net(rounds=WIFI_ROUNDS):
+    for rnd in range(rounds):
         if connect_wifi(cfg):
             break
-        if rnd < WIFI_ROUNDS - 1:
-            emit("WiFi pass %d/%d failed – retry in %d s" % (rnd + 1, WIFI_ROUNDS, WIFI_RETRY_S))
+        if rnd < rounds - 1:
+            emit("WiFi pass %d/%d failed – retry in %d s" % (rnd + 1, rounds, WIFI_RETRY_S))
             time.sleep(WIFI_RETRY_S)
     else:
         emit("No WiFi – lineup still runs")
@@ -215,6 +215,11 @@ def _net_ringing():
 
 def _net_off():
     f = getattr(farm_ws, "net_off", None)
+    return bool(f()) if f is not None else False
+
+
+def _net_udp():
+    f = getattr(farm_ws, "net_udp", None)
     return bool(f()) if f is not None else False
 
 
@@ -970,13 +975,38 @@ class Concentrator:
                 # the whole loop was held this long: say what else was going on
                 emit("loop late %.1f s (survey %s, clients %d)" % (
                     late, self.survey_state.phase, farm_ws.ws_clients()))
-            if farm_ws.ws_clients():
+            if farm_ws.ws_clients() or _net_udp():   # "udp": one datagram, no wait
                 self.pump_edges()
                 try:
                     send(self.heartbeat_doc(), keep=False)
                 except Exception as e:           # never let it kill main()
                     emit("heartbeat: %r" % e)
                 self.pump_edges()
+
+    def _udp_link_step(self, now, state):
+        """link.ring_send "udp": no ping, no radio or Pico reset (each holds
+        the loop).  A lost Wi-Fi is noted and rejoined only while no stroke
+        was made within link.ring_quiet_s (a join holds the loop)."""
+        if farm_ws.wifi_ok():
+            if not self.wifi_up:
+                self.wifi_up = True
+                self.link = "wifi_only"
+                farm_ws.configure_udp(self.cfg)          # a fresh socket on the new link
+                self.link_event("wifi_back", down_s=None if state.get("lost_at") is None
+                                else round(now - state["lost_at"], 1))
+            return
+        if self.wifi_up:
+            self.wifi_up = False
+            self.wifi_lost += 1
+            self.link = "no_wifi"
+            state["lost_at"] = state["tried_at"] = now
+            self.link_event("wifi_lost", count=self.wifi_lost)
+        if not _net_rejoins():
+            return
+        if now - state.get("tried_at", 0) >= WIFI_REJOIN_S:
+            state["tried_at"] = now
+            if self._rejoin():
+                self.rejoins += 1
 
     def _rejoin(self):
         """Blocking join (paused watchdog).  True if we have an address."""
@@ -1071,6 +1101,9 @@ class Concentrator:
         state: {"lost_at", "tried_at"}"""
         if _net_off():
             return                               # MIDI only: no join, ping or reset
+        if _net_udp():
+            self._udp_link_step(now, state)      # best effort: rejoin when quiet, nothing else
+            return
         now_ms = self.ticks.now()
         recent = [m for m in self.stroke_ms if m is not None]
         quiet_ms = 999999 if not recent else int(now_ms - max(recent))
@@ -1168,12 +1201,26 @@ def start_app():
     """Everything up to the steady loop: net, Concentrator (survey,
     classify, self-test, ring), first time sync, server.  The watchdog is
     armed last."""
-    from link_health import ring_settings, RING_SEND_OFF
-    net_off = ring_settings(cfg)[0] == RING_SEND_OFF
-    if net_off:
+    from link_health import ring_settings, RING_SEND_OFF, RING_SEND_UDP
+    mode = ring_settings(cfg)[0]
+    net_off = mode == RING_SEND_OFF
+    no_tcp = mode in (RING_SEND_OFF, RING_SEND_UDP)
+    if hasattr(farm_ws, "configure_ring"):
         farm_ws.configure_ring(cfg)
+    if net_off:
         emit("link.ring_send off: MIDI only, no Wi-Fi, no server this boot")
-    ip = None if net_off else setup_net()
+    # "udp": one pass over the networks at boot, not WIFI_ROUNDS: MIDI starts
+    # after the join, and best-effort comms are not worth a minute of silence
+    if net_off:
+        ip = None
+    elif no_tcp:
+        ip = setup_net(1)
+    else:
+        ip = setup_net()                          # as before: WIFI_ROUNDS passes
+    if mode == RING_SEND_UDP and hasattr(farm_ws, "configure_udp"):
+        dest = farm_ws.configure_udp(cfg)
+        emit("link.ring_send udp: strokes as datagrams to %s, no TCP server"
+             % ("%s:%d" % dest if dest else "nowhere (link.udp_host not set)"))
     app = Concentrator(cfg)
     app.link = "wifi_only" if ip else "no_wifi"   # panel_task: ws_client when /ws connected
     app.wifi_up = bool(ip)                        # link_task rejoins if not
@@ -1185,7 +1232,7 @@ def start_app():
             app.sntp.burst_once()                 # first sync before arming
         except Exception as e:
             emit("first sync failed: %s" % e)
-    if not net_off:
+    if not no_tcp:
         start_server(cfg, app.status_payload)
     total, free = heap_watch.check(emit, "boot")
     start = heap_watch.start_setting()

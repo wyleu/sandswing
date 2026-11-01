@@ -942,3 +942,29 @@ Log: `ringing: link.ring_send <mode>, batch N ms, quiet N s` at boot;
 `link net_ringing {'mode', 'cut', 'quiet_s'}` and `link net_quiet {...}`;
 `net.ring_send`, `net.net_state`, `net.batches`, `net.batched_frames` in the
 heartbeat and `/status`.
+
+## Tier 3: best-effort strokes over UDP (`link.ring_send` "udp", 2026-11-01)
+
+CircuitPython 10.0.3 `ports/raspberrypi/common-hal/socketpool/Socket.c`:
+
+* `lwip_tcp_send()` (line 470).  Only when `tcp_sndbuf()` is 0 does a
+  non-blocking socket return EAGAIN (lines 479-491).  Past that, the
+  `for (i = 0; i < 200; ++i)` loop (lines 522-538) retries `tcp_write()` on
+  ERR_MEM with `mp_hal_delay_ms(50)`, "if the socket is non-blocking then this
+  code will actually block" (comment, lines 515-519).  ERR_MEM comes from the
+  allocation (pbuf / segment from the port heap) or the queue length, neither
+  visible to Python; `writable()` only checks `tcp_sndbuf() != 0` (line 1285);
+  TCP_NODELAY only changes `tcp_output_nagle` after the loop (line 542).  No
+  Python-side setting avoids the loop.
+* `lwip_raw_udp_send()` (lines 360-411): `pbuf_alloc` NULL -> ENOMEM at once
+  (368-373); any `udp_sendto` error returned at once (405-408); the pbuf is
+  freed before return (399).  No retry, no wait, nothing kept.
+
+So in "udp" the Pico has no TCP at all: every event and heartbeat is one
+datagram to `link.udp_host:link.udp_port` (default `UDP_PORT` 5055), at most
+`UDP_MAX_B` (1472, never fragmented).  A failure is a counted drop
+(`net.udp_dropped`), never a retry; Sandbells' gap tracker marks the missing
+seq.  No ping, no radio or Pico reset; a lost Wi-Fi is rejoined every
+`WIFI_REJOIN_S` only while no stroke was made within `ring_quiet_s`; one Wi-Fi
+pass at boot.  Sandbells side: `manage.py ingest_udp` (same parser and store as
+`ingest_events`).

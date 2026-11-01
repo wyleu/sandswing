@@ -167,6 +167,7 @@ stats = {"connects": 0, "drops": 0, "refused": 0, "send_timeouts": 0,
          "strokes_kept": 0, "strokes_confirmed": 0, "strokes_dropped_unconfirmed": 0,
          "strokes_replayed": 0, "acks": 0,
          "batches": 0, "batched_frames": 0,
+         "udp_sent": 0, "udp_dropped": 0, "udp_slow": 0, "udp_max_ms": 0, "udp_too_big": 0,
          "last_drop_reason": None, "last_drop_at": None,
          "hb_seen": False, "last_rx_at": None}
 
@@ -272,6 +273,79 @@ def net_ringing():
 def net_off():
     """link.ring_send "off": MIDI only, no network at all this boot."""
     return _net.off()
+
+
+def net_tcp():
+    """A TCP server this boot?  Not in "off" or "udp"."""
+    return _net.tcp()
+
+
+def net_udp():
+    return _net.udp()
+
+
+_udp = {"sock": None, "dest": None}
+
+
+def configure_udp(cfg, pool=None):
+    """link.udp_host / link.udp_port: where "udp" datagrams go.  The socket
+    is made lazily (after the Wi-Fi join) and again after any error."""
+    sec = (cfg.get("link", {}) if cfg is not None else {}) or {}
+    host = sec.get("udp_host")
+    try:
+        port = int(sec.get("udp_port", link_health.UDP_PORT))
+    except (TypeError, ValueError):
+        port = link_health.UDP_PORT
+    _udp["dest"] = (str(host), port) if host else None
+    if pool is not None:
+        _udp["pool"] = pool
+    _udp["sock"] = None
+    return _udp["dest"]
+
+
+def _udp_sock():
+    if _udp["sock"] is None:
+        pool = _udp.get("pool")
+        if pool is None:
+            import socketpool
+            pool = _udp["pool"] = socketpool.SocketPool(wifi.radio)
+        s = pool.socket(pool.AF_INET, pool.SOCK_DGRAM)
+        try:
+            s.setblocking(False)
+        except Exception:
+            pass
+        _udp["sock"] = s
+    return _udp["sock"]
+
+
+def udp_send(msg):
+    """One datagram, fire and forget: True if handed to lwIP.  Never waits
+    (lwip_raw_udp_send has no retry loop); any error is a drop, counted,
+    and the next event tries a fresh socket.  Too big for one frame: dropped
+    (never fragmented)."""
+    if _udp["dest"] is None:
+        return False
+    data = msg.encode("utf-8")
+    if len(data) > link_health.UDP_MAX_B:
+        stats["udp_too_big"] += 1
+        return False
+    t0 = time.monotonic()
+    ok = False
+    try:
+        ok = _udp_sock().sendto(data, _udp["dest"]) == len(data)
+    except Exception:
+        try:
+            _udp["sock"].close()
+        except Exception:
+            pass
+        _udp["sock"] = None
+    took = time.monotonic() - t0
+    stats["udp_max_ms"] = max(stats["udp_max_ms"], int(took * link_health.MS_PER_S))
+    if took > link_health.UDP_SLOW_S:
+        stats["udp_slow"] += 1
+        print("%.3f udp sendto took %.3f s" % (time.monotonic(), took))
+    stats["udp_sent" if ok else "udp_dropped"] += 1
+    return ok
 
 
 def net_rejoins():
@@ -1686,6 +1760,8 @@ def send(obj, keep=True):
             _event_boot[0] = obj.get("boot_id")
             _keep_stroke(int(obj["seq"]), msg)
             _net_stroke(time.monotonic())        # may shed the network: before any write
+    if _net.udp():
+        return udp_send(msg)                     # tier 3: one datagram, no TCP, no wait
     if not _clients:
         return False
     if not _net.inline():
@@ -1846,6 +1922,7 @@ def reset_state():
     _allow["ws"] = _allow["status"] = ()
     _gate.reset()
     _net.reset()
+    _udp["sock"] = _udp["dest"] = None
     _doc.reset()
     _peers.clear()
     _nomem_until[0] = 0.0

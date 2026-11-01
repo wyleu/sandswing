@@ -283,4 +283,72 @@ def test_client_diagram_lists_the_shed_cut():
         assert L.CLIENT_TRANSITIONS[(st, "shed")] == (L.C_GONE, L.CUT)
 
 
+class Pool:
+    AF_INET, SOCK_DGRAM = 2, 2
+
+    def __init__(self, fail=None):
+        self.fail, self.sent, self.socks = fail, [], 0
+
+    def socket(self, fam, typ):
+        self.socks += 1
+        pool = self
+
+        class S:
+            def setblocking(self, flag):
+                pass
+
+            def sendto(self, data, dest):
+                if pool.fail:
+                    raise OSError(pool.fail, "ENOMEM")
+                pool.sent.append((bytes(data), dest))
+                return len(data)
+
+            def close(self):
+                pass
+        return S()
+
+
+@case
+def test_udp_tier_sends_each_stroke_as_one_datagram_and_never_tcp():
+    with rig("udp") as r:
+        pool = Pool()
+        farm_ws.configure_udp({"link": {"udp_host": "10.42.0.50"}}, pool)
+        before = len(r.conn.data)
+        for q in (1, 2, 3):
+            assert farm_ws.send(stroke(q))
+        farm_ws.send({"type": "heartbeat"}, keep=False)
+        r.polls(1.0)
+        assert len(r.conn.data) == before                 # no TCP write at all
+        assert [json.loads(d)["seq"] for d, _ in pool.sent[:3]] == [1, 2, 3]
+        assert all(dest == ("10.42.0.50", L.UDP_PORT) for _, dest in pool.sent)
+        assert json.loads(pool.sent[0][0])["utc_ms"] == 1793800000000   # its own timestamp
+        assert not farm_ws.net_tcp() and farm_ws.net_udp()
+        assert not L.NET_PLAN[(L.N_RINGING, L.RING_SEND_UDP)][3]          # no join while ringing
+        assert L.NET_PLAN[(L.N_QUIET, L.RING_SEND_UDP)][3]
+
+
+@case
+def test_udp_error_is_a_counted_drop_not_a_wait_and_the_next_one_tries_again():
+    with rig("udp"):
+        pool = Pool(fail=12)
+        farm_ws.configure_udp({"link": {"udp_host": "10.42.0.50", "udp_port": 6000}}, pool)
+        assert not farm_ws.send(stroke(1))
+        assert farm_ws.stats["udp_dropped"] == 1
+        pool.fail = None
+        assert farm_ws.send(stroke(2)) and pool.sent[0][1] == ("10.42.0.50", 6000)
+        assert pool.socks == 2                            # a fresh socket after the error
+        assert farm_ws.stats["udp_sent"] == 1
+
+
+@case
+def test_udp_never_fragments_and_without_a_host_sends_nothing():
+    with rig("udp"):
+        pool = Pool()
+        farm_ws.configure_udp({"link": {"udp_host": "10.42.0.50"}}, pool)
+        assert not farm_ws.send({"type": "heartbeat", "pad": "x" * L.UDP_MAX_B}, keep=False)
+        assert farm_ws.stats["udp_too_big"] == 1 and not pool.sent
+        farm_ws.configure_udp({"link": {}}, pool)
+        assert not farm_ws.send(stroke(1)) and not pool.sent
+
+
 finish()

@@ -667,7 +667,28 @@ RING_SEND_LIVE = "live"
 RING_SEND_BATCHED = "batched"
 RING_SEND_SHED = "shed"
 RING_SEND_OFF = "off"
-RING_SEND_MODES = (RING_SEND_LIVE, RING_SEND_BATCHED, RING_SEND_SHED, RING_SEND_OFF)
+RING_SEND_UDP = "udp"
+RING_SEND_MODES = (RING_SEND_LIVE, RING_SEND_BATCHED, RING_SEND_SHED, RING_SEND_OFF,
+                   RING_SEND_UDP)
+# Tiers (the user's, 2026-11-01): 1 = MIDI by PIO, no Wi-Fi (not built yet:
+# "off" until it is); 2 = MIDI first, no Wi-Fi ("off"); 3 = MIDI first plus
+# best-effort strokes to Sandbells ("udp").
+#
+# "udp": no TCP at all on the Pico (no /ws, no /status server).  Every event
+# (stroke, link note) and the heartbeat goes as ONE UDP datagram to
+# link.udp_host:link.udp_port (Sandbells' ingest_udp), fire and forget.  Why
+# UDP: CircuitPython 10.0.3 ports/raspberrypi/common-hal/socketpool/Socket.c
+# lwip_tcp_send() retries tcp_write() on ERR_MEM 200 x mp_hal_delay_ms(50)
+# whatever the socket timeout (lines 515-538); lwip_raw_udp_send() returns
+# ENOMEM at once when pbuf_alloc fails and any udp_sendto error at once
+# (lines 360-411): no retry, no wait.  A lost datagram is a seq gap that
+# Sandbells' gap tracker marks; nothing is resent, nothing waits.
+# No gateway ping (1 s wait), no radio reset (1 s sleep), no Pico reset for
+# the link; a lost Wi-Fi is rejoined only when no stroke was made within
+# ring_quiet_s (a join can hold the loop up to WIFI_JOIN_TIMEOUT_S per network).
+UDP_PORT = 5055                     # link.udp_port; Sandbells events.constants.UDP_INGEST_PORT
+UDP_SLOW_S = 0.05                   # a sendto slower than this is logged (it should be ~1 ms)
+UDP_MAX_B = 1472                    # one Ethernet frame (1500 - IP 20 - UDP 8): never fragmented
 RING_SEND = RING_SEND_LIVE          # default: behaviour as before this table
 # A minute bell tolls once per 60 s at the slowest; twice that bridges one
 # missed or late stroke without the network coming back between tolls.
@@ -700,6 +721,8 @@ NET_PLAN[(N_RINGING, RING_SEND_BATCHED)] = (False, True, True, False)
 NET_PLAN[(N_RINGING, RING_SEND_SHED)] = (False, False, False, False)
 NET_PLAN[(N_QUIET, RING_SEND_OFF)] = (False, False, False, False)
 NET_PLAN[(N_RINGING, RING_SEND_OFF)] = (False, False, False, False)
+NET_PLAN[(N_QUIET, RING_SEND_UDP)] = (False, False, False, True)
+NET_PLAN[(N_RINGING, RING_SEND_UDP)] = (False, False, False, False)
 del _m
 
 
@@ -777,6 +800,13 @@ class NetMode:
 
     def off(self):
         return self.mode == RING_SEND_OFF
+
+    def udp(self):
+        return self.mode == RING_SEND_UDP
+
+    def tcp(self):
+        """Any TCP at all this boot (a /ws or /status server)?"""
+        return self.mode not in (RING_SEND_OFF, RING_SEND_UDP)
 
 
 class LinkHealth:
