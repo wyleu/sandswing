@@ -351,6 +351,29 @@ def test_udp_never_fragments_and_without_a_host_sends_nothing():
         assert not farm_ws.send(stroke(1)) and not pool.sent
 
 
+@case
+def test_udp_host_list_picks_the_sandbells_on_our_subnet_home_or_tower():
+    hosts = ["192.168.0.221", "10.42.0.1"]          # one per site, no other field
+    w = farm_ws.wifi
+    had = getattr(w, "radio", None)
+    try:
+        with rig("udp"):
+            pool = Pool()
+            w.radio = types.SimpleNamespace(ipv4_address="10.42.0.81", ipv4_subnet="255.255.255.0")
+            assert farm_ws.configure_udp({"link": {"udp_host": hosts}}, pool) == ("10.42.0.1", L.UDP_PORT)
+            w.radio = types.SimpleNamespace(ipv4_address="192.168.0.81", ipv4_subnet="255.255.255.0")
+            assert farm_ws.send(stroke(1))           # a fresh socket picks again
+            assert pool.sent[-1][1] == ("192.168.0.221", L.UDP_PORT)
+            w.radio = types.SimpleNamespace(ipv4_address=None, ipv4_subnet=None)
+            assert farm_ws.configure_udp({"link": {"udp_host": "192.168.0.221, 10.42.0.1"}},
+                                         pool) == ("192.168.0.221", L.UDP_PORT)   # no IP: first
+    finally:
+        if had is None:
+            del w.radio
+        else:
+            w.radio = had
+
+
 class CmdPool(Pool):
     """Pool whose sockets also take bind() and recvfrom_into() (non-blocking:
     EAGAIN when nothing is waiting, as Socket.c lwip_raw_udp_receive)."""

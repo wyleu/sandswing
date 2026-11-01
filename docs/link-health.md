@@ -995,3 +995,11 @@ tower inactive.  There is no "on"; a reboot or repower is back at the
 settings.json default.  Heartbeat / status: `net.ring_send`,
 `net.ring_send_boot`, `net.cmd` (accepted, refused, last_seq, last_why, by,
 radio_off).
+
+`link.udp_host` stays explicit (no default): the gateway is the home router
+and `time.ntp_ips` are the GPS boxes, neither is Sandbells.  It may be a list,
+one Sandbells per site, e.g. `["<home Sandbells IP>", "<tower Sandbells IP>"]`:
+the first on our own subnet is used, else the first listed (the
+`time_servers.candidates` rule for `ntp_ips`), picked again whenever the UDP
+socket is made (after a rejoin or an error).  Commands are taken only from
+the one picked.

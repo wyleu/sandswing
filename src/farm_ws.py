@@ -47,6 +47,7 @@ from lastline import print        # print as before, and remember the line
 import wifi
 import adafruit_connection_manager
 import link_health                 # the send-path state model: this file obeys it
+import time_servers                # subnet rule shared with time.ntp_ips (link.udp_host lists)
 import status_doc                  # /status as versioned pieces (never one big string)
 try:
     import ws_bounds               # deadlines on the library's waits, and what they cost
@@ -284,7 +285,7 @@ def net_udp():
     return _net.udp()
 
 
-_udp = {"sock": None, "dest": None}
+_udp = {"sock": None, "dest": None, "hosts": [], "port": None}
 # runtime commands from Sandbells (link_health "runtime commands")
 _cmd = {"sock": None, "port": link_health.CMD_PORT, "last_seq": None,
         "pending": None, "accepted": 0, "refused": 0, "last_why": None,
@@ -292,16 +293,38 @@ _cmd = {"sock": None, "port": link_health.CMD_PORT, "last_seq": None,
 _cmd_buf = bytearray(link_health.CMD_MAX_B + 1)     # made once: no allocation per read
 
 
+def _udp_pick():
+    """link.udp_host may list one Sandbells per site (home, tower): the
+    first one on our own subnet, else the first listed (time_servers'
+    rule for time.ntp_ips).  Pure arithmetic, no network call."""
+    hosts = _udp["hosts"]
+    if not hosts:
+        _udp["dest"] = None
+        return None
+    try:
+        own, mask = wifi.radio.ipv4_address, wifi.radio.ipv4_subnet
+        own = str(own) if own is not None else None
+        mask = str(mask) if mask is not None else None
+    except Exception:
+        own = mask = None
+    near = time_servers.candidates(hosts, own, mask, log=lambda *_: None)
+    _udp["dest"] = ((near or hosts)[0], _udp["port"])
+    return _udp["dest"]
+
+
 def configure_udp(cfg, pool=None):
-    """link.udp_host / link.udp_port: where "udp" datagrams go.  The socket
-    is made lazily (after the Wi-Fi join) and again after any error."""
+    """link.udp_host / link.udp_port: where "udp" datagrams go.  udp_host is
+    one IP or a list (one per site, picked by subnet: _udp_pick).  The socket
+    is made lazily (after the Wi-Fi join) and again after any error, and the
+    destination is picked again each time it is made."""
     sec = (cfg.get("link", {}) if cfg is not None else {}) or {}
-    host = sec.get("udp_host")
     try:
         port = int(sec.get("udp_port", link_health.UDP_PORT))
     except (TypeError, ValueError):
         port = link_health.UDP_PORT
-    _udp["dest"] = (str(host), port) if host else None
+    _udp["hosts"] = time_servers.normalise(sec.get("udp_host"))
+    _udp["port"] = port
+    _udp_pick()
     if pool is not None:
         _udp["pool"] = pool
     _udp["sock"] = None
@@ -332,6 +355,7 @@ def _cmd_sock():
         if pool is None:
             import socketpool
             pool = _udp["pool"] = socketpool.SocketPool(wifi.radio)
+        _udp_pick()                      # after a rejoin the subnet may differ
         s = pool.socket(pool.AF_INET, pool.SOCK_DGRAM)
         s.setblocking(False)                 # timeout 0: recvfrom_into never waits
         s.bind(("0.0.0.0", _cmd["port"]))
@@ -427,6 +451,7 @@ def _udp_sock():
         if pool is None:
             import socketpool
             pool = _udp["pool"] = socketpool.SocketPool(wifi.radio)
+        _udp_pick()                      # after a rejoin the subnet may differ
         s = pool.socket(pool.AF_INET, pool.SOCK_DGRAM)
         try:
             s.setblocking(False)
@@ -2049,6 +2074,7 @@ def reset_state():
     _gate.reset()
     _net.reset()
     _udp["sock"] = _udp["dest"] = None
+    _udp["hosts"], _udp["port"] = [], None
     _cmd.update(sock=None, last_seq=None, pending=None, accepted=0, refused=0,
                 last_why=None, radio_off=False)
     _doc.reset()
