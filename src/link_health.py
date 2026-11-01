@@ -689,6 +689,50 @@ RING_SEND_MODES = (RING_SEND_LIVE, RING_SEND_BATCHED, RING_SEND_SHED, RING_SEND_
 UDP_PORT = 5055                     # link.udp_port; Sandbells events.constants.UDP_INGEST_PORT
 UDP_SLOW_S = 0.05                   # a sendto slower than this is logged (it should be ~1 ms)
 UDP_MAX_B = 1472                    # one Ethernet frame (1500 - IP 20 - UDP 8): never fragmented
+
+# --- runtime commands (RAM only; settings.json is never written) -----------
+# settings.json link.ring_send is the BOOT default.  From the Sandbells farm
+# page a "Wi-Fi off until reboot" command may move a running Pico to "off"
+# (tier 2, MIDI only); there is no "on": with Wi-Fi off nothing is heard, and
+# the next power-up or reboot is back at the settings.json default.
+# A command is one UDP datagram to link.cmd_port, read without waiting
+# (Socket.c lwip_raw_udp_receive: timeout 0 and no datagram -> EAGAIN at once,
+# lines 416-421), one per poll turn, into a buffer made once (CMD_MAX_B).
+# {"schema": CMD_SCHEMA, "cmd": "wifi_off", "uid": "<cpu uid hex>",
+#  "boot_id": "<this boot's event boot_id>", "seq": n}
+# Accepted only from link.udp_host, with our uid and this boot's boot_id, and
+# a seq above the last one accepted this boot.  NOT protected against: anyone
+# on the same network can read uid and boot_id from our heartbeats (plain UDP)
+# and forge the source address; there is no secret and no crypto.  The worst
+# a forger can do is turn Wi-Fi off until the next reboot; MIDI is untouched.
+CMD_PORT = 5056                     # link.cmd_port; Sandbells bells.actions SANDSWING_CMD_PORT
+CMD_MAX_B = 256                     # a command is ~150 B; longer is refused
+CMD_SCHEMA = "sand.cmd/v1"
+CMD_WIFI_OFF = "wifi_off"
+# (boot or current mode, command) -> new mode.  Anything not listed is refused.
+MODE_COMMANDS = {}
+for _m in (RING_SEND_LIVE, RING_SEND_BATCHED, RING_SEND_SHED, RING_SEND_UDP):
+    MODE_COMMANDS[(_m, CMD_WIFI_OFF)] = RING_SEND_OFF
+del _m
+
+
+def cmd_check(doc, peer, allowed, uid, boot_id, last_seq):
+    """One decoded command -> (ok, why).  No sockets, no clock."""
+    if not isinstance(doc, dict) or doc.get("schema") != CMD_SCHEMA:
+        return False, "not a command"
+    if allowed is None or peer != allowed:
+        return False, "peer %s not link.udp_host" % peer
+    if doc.get("uid") != uid:
+        return False, "wrong uid"
+    if doc.get("boot_id") != boot_id:
+        return False, "another boot"
+    try:
+        seq = int(doc.get("seq"))
+    except (TypeError, ValueError):
+        return False, "no seq"
+    if last_seq is not None and seq <= last_seq:
+        return False, "seq %d not above %d (replay)" % (seq, last_seq)
+    return True, None
 RING_SEND = RING_SEND_LIVE          # default: behaviour as before this table
 # A minute bell tolls once per 60 s at the slowest; twice that bridges one
 # missed or late stroke without the network coming back between tolls.
@@ -753,6 +797,8 @@ class NetMode:
 
     def configure(self, mode, batch_s, quiet_s):
         self.mode, self.batch_s, self.quiet_s = mode, batch_s, quiet_s
+        self.boot_mode = mode
+        self.by_command = None
 
     def reset(self):
         self.state = N_QUIET
@@ -803,6 +849,16 @@ class NetMode:
 
     def udp(self):
         return self.mode == RING_SEND_UDP
+
+    def command(self, cmd):
+        """A runtime command (MODE_COMMANDS): the new mode, or None if refused.
+        RAM only: boot_mode (settings.json) is what the next boot starts in."""
+        nxt = MODE_COMMANDS.get((self.mode, cmd))
+        if nxt is None:
+            return None
+        self.mode = nxt
+        self.by_command = cmd
+        return nxt
 
     def tcp(self):
         """Any TCP at all this boot (a /ws or /status server)?"""

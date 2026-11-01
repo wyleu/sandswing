@@ -968,3 +968,30 @@ seq.  No ping, no radio or Pico reset; a lost Wi-Fi is rejoined every
 `WIFI_REJOIN_S` only while no stroke was made within `ring_quiet_s`; one Wi-Fi
 pass at boot.  Sandbells side: `manage.py ingest_udp` (same parser and store as
 `ingest_events`).
+
+### Wi-Fi off from the farm page, until reboot (RAM only)
+
+`settings.json` is never written at runtime; `link.ring_send` is the boot
+default (`NetMode.boot_mode`).  In "udp" the Pico reads one datagram per poll
+turn on `link.cmd_port` (`CMD_PORT` 5056) without waiting: CircuitPython
+10.0.3 `Socket.c` `lwip_raw_udp_receive()` returns EAGAIN at once when no
+datagram is queued and the timeout is 0 (lines 414-421; `setblocking(False)`
+sets timeout 0, shared-bindings `Socket.c` line 329), into a buffer made once
+(`CMD_MAX_B`).  lwIP keeps one datagram per socket and drops the rest (lines 215-217).
+
+`{"schema": "sand.cmd/v1", "cmd": "wifi_off", "uid", "boot_id", "seq"}` is
+taken (`link_health.cmd_check`) only from `link.udp_host`, with our cpu uid
+(in every heartbeat as `body.uid`), this boot's `boot_id`, and a seq above
+the last one taken this boot.  Not protected: uid and boot_id travel in the
+clear and a source address can be forged on the LAN; the worst is Wi-Fi off
+until the next reboot (MIDI untouched).
+
+Turn N: accepted, noted (`link net_command {cmd, cmd_seq, then, until}`),
+which goes out as a datagram while still in "udp": that is the ack.  Turn N+1:
+`MODE_COMMANDS` moves the mode to "off" (state only, no network call).  The
+radio is powered down (`wifi.radio.enabled = False`, a driver call) in the
+link pass only when `radio_off_due()`: no stroke within `ring_quiet_s` and the
+tower inactive.  There is no "on"; a reboot or repower is back at the
+settings.json default.  Heartbeat / status: `net.ring_send`,
+`net.ring_send_boot`, `net.cmd` (accepted, refused, last_seq, last_why, by,
+radio_off).

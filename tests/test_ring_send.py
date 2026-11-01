@@ -351,4 +351,128 @@ def test_udp_never_fragments_and_without_a_host_sends_nothing():
         assert not farm_ws.send(stroke(1)) and not pool.sent
 
 
+class CmdPool(Pool):
+    """Pool whose sockets also take bind() and recvfrom_into() (non-blocking:
+    EAGAIN when nothing is waiting, as Socket.c lwip_raw_udp_receive)."""
+    def __init__(self):
+        Pool.__init__(self)
+        self.inbox = []
+        self.bound = []
+
+    def socket(self, fam, typ):
+        s = Pool.socket(self, fam, typ)
+        pool = self
+
+        def bind(addr):
+            pool.bound.append(addr)
+
+        def recvfrom_into(buf):
+            if not pool.inbox:
+                raise OSError(farm_ws.EAGAIN, "EAGAIN")
+            data, peer = pool.inbox.pop(0)
+            n = min(len(buf), len(data))
+            buf[:n] = data[:n]
+            return len(data), peer
+        s.bind, s.recvfrom_into = bind, recvfrom_into
+        return s
+
+
+UID = "7091CDAB9DBD5305"
+SB = "10.42.0.50"
+
+
+def cmd(seq, **kw):
+    d = {"schema": L.CMD_SCHEMA, "cmd": L.CMD_WIFI_OFF, "uid": UID,
+         "boot_id": "7091cdab", "seq": seq}
+    d.update(kw)
+    return json.dumps(d).encode()
+
+
+class udp_rig(rig):
+    def __enter__(self):
+        rig.__enter__(self)
+        self.pool = CmdPool()
+        farm_ws.configure_udp({"link": {"udp_host": SB}}, self.pool)
+        self.real_uid = farm_ws._device_uid
+        farm_ws._device_uid = lambda: UID
+        farm_ws.send(stroke(1))                  # this boot's boot_id is known
+        return self
+
+    def __exit__(self, *a):
+        farm_ws._device_uid = self.real_uid
+        rig.__exit__(self, *a)
+
+
+@case
+def test_wifi_off_command_is_acked_while_still_udp_then_off_until_reboot():
+    with udp_rig("udp") as r:
+        r.polls(0.2)
+        assert r.pool.bound == [("0.0.0.0", L.CMD_PORT)]
+        r.pool.inbox.append((cmd(5), (SB, 40000)))
+        farm_ws.poll()                                       # received: noted, not applied
+        assert farm_ws.net_udp()
+        notes = dict(farm_ws.take_link_notes())
+        assert notes["net_command"]["cmd_seq"] == 5 and notes["net_command"]["then"] == "off"
+        assert farm_ws.send({"type": "link", "boot_id": "7091cdab", "seq": 2})   # the ack goes out
+        farm_ws.poll()                                       # applied now
+        assert farm_ws.net_off() and not farm_ws.net_udp()
+        st = farm_ws.link_status()
+        assert st["ring_send"] == "off" and st["ring_send_boot"] == "udp"
+        n = len(r.pool.sent)
+        assert not farm_ws.send(stroke(3)) and len(r.pool.sent) == n   # nothing more is sent
+        r.pool.inbox.append((cmd(6), (SB, 40000)))
+        r.polls(0.5)
+        assert r.pool.inbox                                  # off: not even read any more
+        farm_ws.configure_ring({"link": {"ring_send": "udp"}})   # the next boot: default again
+        assert farm_ws.net_udp()
+
+
+@case
+def test_radio_goes_down_only_when_the_tower_is_quiet():
+    with udp_rig("udp") as r:
+        farm_ws.set_tower("active")
+        r.pool.inbox.append((cmd(1), (SB, 1)))
+        farm_ws.poll()
+        farm_ws.poll()
+        assert farm_ws.net_off() and not farm_ws.radio_off_due()     # stroke just made, tower active
+        r.clock.t += L.RING_QUIET_S + 1
+        farm_ws.poll()
+        assert not farm_ws.radio_off_due()                           # tower still active
+        farm_ws.set_tower("inactive")
+        assert farm_ws.radio_off_due()
+
+
+@case
+def test_commands_from_anyone_else_or_replayed_or_for_another_boot_are_refused():
+    with udp_rig("udp") as r:
+        bad = [(cmd(1), ("192.168.0.99", 1)),                  # not link.udp_host
+               (cmd(1, uid="0F8A68C934D3A61C"), (SB, 1)),     # the sandtest Pico's uid
+               (cmd(1, boot_id="beefbeef"), (SB, 1)),         # an earlier boot
+               (cmd(1, cmd="wifi_on"), (SB, 1)),              # not in MODE_COMMANDS
+               (b"x" * (L.CMD_MAX_B + 10), (SB, 1)),          # too long
+               (b"not json", (SB, 1))]
+        for item in bad:
+            r.pool.inbox.append(item)
+            farm_ws.poll()
+        assert farm_ws.net_udp() and farm_ws._cmd["refused"] == len(bad)
+        r.pool.inbox.append((cmd(7), (SB, 1)))
+        farm_ws.poll()
+        assert farm_ws._cmd["last_seq"] == 7
+        farm_ws._cmd["pending"] = None                         # (not applied: test the seq rule)
+        r.pool.inbox.append((cmd(7), (SB, 1)))
+        farm_ws.poll()
+        assert "replay" in farm_ws._cmd["last_why"]
+
+
+@case
+def test_cmd_check_is_a_pure_table():
+    ok = dict(schema=L.CMD_SCHEMA, cmd=L.CMD_WIFI_OFF, uid="U", boot_id="B", seq=3)
+    assert L.cmd_check(ok, "h", "h", "U", "B", None) == (True, None)
+    assert not L.cmd_check(ok, "h", None, "U", "B", None)[0]   # no udp_host: nobody may
+    assert not L.cmd_check(ok, "h", "h", "U", "B", 3)[0]
+    n = L.NetMode(L.RING_SEND_UDP)
+    assert n.command(L.CMD_WIFI_OFF) == L.RING_SEND_OFF and n.boot_mode == L.RING_SEND_UDP
+    assert n.command(L.CMD_WIFI_OFF) is None                   # no way back on
+
+
 finish()

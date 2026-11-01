@@ -285,6 +285,11 @@ def net_udp():
 
 
 _udp = {"sock": None, "dest": None}
+# runtime commands from Sandbells (link_health "runtime commands")
+_cmd = {"sock": None, "port": link_health.CMD_PORT, "last_seq": None,
+        "pending": None, "accepted": 0, "refused": 0, "last_why": None,
+        "radio_off": False}
+_cmd_buf = bytearray(link_health.CMD_MAX_B + 1)     # made once: no allocation per read
 
 
 def configure_udp(cfg, pool=None):
@@ -300,7 +305,120 @@ def configure_udp(cfg, pool=None):
     if pool is not None:
         _udp["pool"] = pool
     _udp["sock"] = None
+    try:
+        _cmd["port"] = int(sec.get("cmd_port", link_health.CMD_PORT))
+    except (TypeError, ValueError):
+        _cmd["port"] = link_health.CMD_PORT
+    if _cmd["sock"] is not None:
+        try:
+            _cmd["sock"].close()
+        except Exception:
+            pass
+    _cmd["sock"] = None
     return _udp["dest"]
+
+
+def _device_uid():
+    try:
+        import microcontroller
+        return "".join("%02X" % b for b in microcontroller.cpu.uid)
+    except Exception:
+        return None
+
+
+def _cmd_sock():
+    if _cmd["sock"] is None:
+        pool = _udp.get("pool")
+        if pool is None:
+            import socketpool
+            pool = _udp["pool"] = socketpool.SocketPool(wifi.radio)
+        s = pool.socket(pool.AF_INET, pool.SOCK_DGRAM)
+        s.setblocking(False)                 # timeout 0: recvfrom_into never waits
+        s.bind(("0.0.0.0", _cmd["port"]))
+        _cmd["sock"] = s
+    return _cmd["sock"]
+
+
+def cmd_poll(uid=None):
+    """At most one command datagram per call, without waiting.  A valid one
+    is noted (the ack: a link "net_command" event, sent while still in udp)
+    and applied at the start of the next poll (cmd_apply)."""
+    if not _net.udp() or _udp["dest"] is None:
+        return None
+    try:
+        n, peer = _cmd_sock().recvfrom_into(_cmd_buf)
+    except OSError as e:
+        if e.errno != EAGAIN:
+            _cmd["sock"] = None                 # a fresh socket next turn
+        return None
+    except Exception:
+        _cmd["sock"] = None
+        return None
+    ip = peer[0] if isinstance(peer, tuple) else peer
+    why = None
+    if n > link_health.CMD_MAX_B:
+        why = "too long"
+    else:
+        try:
+            doc = json.loads(bytes(_cmd_buf[:n]).decode("utf-8"))
+        except Exception:
+            doc = None
+        ok, why = link_health.cmd_check(doc, ip, _udp["dest"][0],
+                                        uid if uid is not None else _device_uid(),
+                                        _event_boot[0], _cmd["last_seq"])
+        if ok and (_net.mode, doc.get("cmd")) not in link_health.MODE_COMMANDS:
+            ok, why = False, "unknown command %s in %s" % (doc.get("cmd"), _net.mode)
+    if why is not None:
+        _cmd["refused"] += 1
+        _cmd["last_why"] = why
+        print("%.3f command refused from %s: %s" % (time.monotonic(), ip, why))
+        return None
+    _cmd["last_seq"] = int(doc["seq"])
+    _cmd["accepted"] += 1
+    _cmd["pending"] = doc["cmd"]
+    _note("net_command", cmd=doc["cmd"], cmd_seq=_cmd["last_seq"], peer=ip,
+          then=link_health.MODE_COMMANDS[(_net.mode, doc["cmd"])],
+          until="reboot (settings.json %s)" % _net.boot_mode)
+    return doc["cmd"]
+
+
+def cmd_apply():
+    """A command accepted on the previous turn, its ack already sent: the
+    mode changes now (a state change only, no network call).  Powering the
+    radio down is a driver call: radio_off_due() says when (tower quiet)."""
+    cmd = _cmd["pending"]
+    if cmd is None:
+        return None
+    _cmd["pending"] = None
+    mode = _net.command(cmd)
+    if mode is not None:
+        print("%.3f net mode %s by command (until reboot; settings.json says %s)"
+              % (time.monotonic(), mode, _net.boot_mode))
+    return mode
+
+
+def radio_off_due():
+    """Wi-Fi off by command, radio still on, no stroke within ring_quiet_s and
+    the tower inactive: the radio may be powered down now."""
+    return (_net.by_command == link_health.CMD_WIFI_OFF and not _cmd["radio_off"]
+            and not _net.ringing() and _gate.tower == "inactive")
+
+
+def radio_off():
+    _cmd["radio_off"] = True
+    for k in ("sock",):
+        for d in (_udp, _cmd):
+            try:
+                if d[k] is not None:
+                    d[k].close()
+            except Exception:
+                pass
+            d[k] = None
+    try:
+        wifi.radio.enabled = False
+    except Exception as e:
+        print("radio off:", e)
+    print("%.3f Wi-Fi radio off by command until reboot" % time.monotonic())
 
 
 def _udp_sock():
@@ -1626,6 +1744,8 @@ def poll():
     t0 = time.monotonic()
     answered0 = _answered[0]
     _net_tick(t0)
+    cmd_apply()                            # last turn's command, its ack already out
+    cmd_poll()                             # at most one datagram, never waits
     plan = _plan(t0)
     deadline = t0 + plan.poll_s
     if ws_bounds is not None:
@@ -1753,6 +1873,8 @@ def send(obj, keep=True):
     keep: remember it for replay to the next new client (events yes,
     heartbeats no)."""
     msg = json.dumps(obj)
+    if isinstance(obj, dict) and obj.get("boot_id"):
+        _event_boot[0] = obj.get("boot_id")      # this boot (acks and commands must name it)
     if keep:
         _recent.append(msg)
         del _recent[:-REPLAY_N]
@@ -1898,6 +2020,10 @@ def link_status():
     d["clients_by_state"] = _by_state()
     d["strokes_undelivered"] = len(undelivered_strokes())
     d["ring_send"] = _net.mode
+    d["ring_send_boot"] = _net.boot_mode
+    d["cmd"] = {"accepted": _cmd["accepted"], "refused": _cmd["refused"],
+                "last_seq": _cmd["last_seq"], "last_why": _cmd["last_why"],
+                "by": _net.by_command, "radio_off": _cmd["radio_off"]}
     d["net_state"] = _net.state
     if d["last_drop_at"] is not None:
         d["last_drop_age_s"] = round(now - d["last_drop_at"], 1)
@@ -1923,6 +2049,8 @@ def reset_state():
     _gate.reset()
     _net.reset()
     _udp["sock"] = _udp["dest"] = None
+    _cmd.update(sock=None, last_seq=None, pending=None, accepted=0, refused=0,
+                last_why=None, radio_off=False)
     _doc.reset()
     _peers.clear()
     _nomem_until[0] = 0.0

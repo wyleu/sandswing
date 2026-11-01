@@ -943,6 +943,7 @@ class Concentrator:
                 "srv": sn.server, "stratum": sn.stratum, "last": sn.last,
                 "peer": getattr(sn, "peer", None)},
             "last_seq": self.events.seq,          # newest event seq this boot
+            "uid": farm_ws._device_uid() if hasattr(farm_ws, "_device_uid") else None,
             "chan": self.chan_brief(),
             "uptime_s": int(time.monotonic() - self.boot_at),
             "last_reset": self.guard.last_reset,
@@ -1100,6 +1101,8 @@ class Concentrator:
         """One supervision pass driven by LinkHealth.
         state: {"lost_at", "tried_at"}"""
         if _net_off():
+            if getattr(farm_ws, "radio_off_due", None) and farm_ws.radio_off_due():
+                farm_ws.radio_off()              # by command, tower quiet: power the radio down
             return                               # MIDI only: no join, ping or reset
         if _net_udp():
             self._udp_link_step(now, state)      # best effort: rejoin when quiet, nothing else
