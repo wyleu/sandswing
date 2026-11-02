@@ -689,6 +689,71 @@ RING_SEND_MODES = (RING_SEND_LIVE, RING_SEND_BATCHED, RING_SEND_SHED, RING_SEND_
 UDP_PORT = 5055                     # link.udp_port; Sandbells events.constants.UDP_INGEST_PORT
 UDP_SLOW_S = 0.05                   # a sendto slower than this is logged (it should be ~1 ms)
 UDP_MAX_B = 1472                    # one Ethernet frame (1500 - IP 20 - UDP 8): never fragmented
+UDP_DROP_LOG_EVERY = 100            # a failed sendto is printed the first time and every this many
+HB_DIAG_N = 3                       # heartbeats (and closed-gate loops) logged after boot
+UDP_STATS_S = 60.0                  # "udp stats" line this often (from heartbeat_task)
+
+
+class HeartbeatDiag:
+    """Log-only: what heartbeat_task does with its heartbeats (Sandbells
+    reported strokes and link events over UDP but no heartbeat).  The first
+    HB_DIAG_N heartbeats say their size, the send gate and what send()
+    returned; the first HB_DIAG_N loops with the gate closed say so; any
+    exception (heartbeat_doc or send) is printed with its type; every
+    UDP_STATS_S one line of farm_ws udp counters.  Nothing here sends or
+    waits; the size is measured (one extra json.dumps) only for the first
+    HB_DIAG_N."""
+
+    def __init__(self, now, log_n=HB_DIAG_N, stats_s=UDP_STATS_S):
+        self.loops = 0           # heartbeat_task turns
+        self.built = 0           # heartbeat_doc() returned a doc
+        self.log_n, self.stats_s = log_n, stats_s
+        self.stats_at = now
+
+    def gate(self, now, ws, udp, log):
+        """heartbeat_task's send gate (ws clients or "udp"): True if open."""
+        self.loops += 1
+        self.ws, self.udp = int(ws), int(bool(udp))
+        if not (ws or udp) and self.loops <= self.log_n:
+            log("%.3f hb gate closed, loop %d: ws=%d udp=%d" % (now, self.loops, self.ws, self.udp))
+        return bool(ws or udp)
+
+    def heartbeat(self, now, build, send, log, err=None):
+        """build() the heartbeat, send(doc) it; never raises.  log: the
+        first heartbeats' lines; err (default log): every exception."""
+        err = err or log
+        try:
+            doc = build()
+        except Exception as e:
+            err("%.3f hb build failed: %s: %s" % (now, type(e).__name__, e))
+            return None
+        self.built += 1
+        n = self.built
+        size = -1
+        if n <= self.log_n:
+            try:
+                import json
+                size = len(json.dumps(doc).encode("utf-8"))
+            except Exception as e:
+                err("%.3f hb #%d size failed: %s: %s" % (now, n, type(e).__name__, e))
+        try:
+            sent = send(doc)
+        except Exception as e:
+            err("%.3f hb #%d send failed: %s: %s" % (now, n, type(e).__name__, e))
+            return None
+        if n <= self.log_n:
+            log("%.3f hb #%d: %d B, ws=%d udp=%d, sent=%s" % (now, n, size, self.ws, self.udp, sent))
+        return sent
+
+    def stats(self, now, st, log):
+        """One "udp stats" line every stats_s (st: farm_ws.stats)."""
+        if now - self.stats_at < self.stats_s:
+            return False
+        self.stats_at = now
+        log("%.3f udp stats: hb=%d sent=%d dropped=%d too_big=%d slow=%d max_ms=%d" % (
+            now, self.built, st.get("udp_sent", 0), st.get("udp_dropped", 0),
+            st.get("udp_too_big", 0), st.get("udp_slow", 0), st.get("udp_max_ms", 0)))
+        return True
 
 # --- runtime commands (RAM only; settings.json is never written) -----------
 # settings.json link.ring_send is the BOOT default.  From the Sandbells farm

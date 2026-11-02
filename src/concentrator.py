@@ -95,6 +95,7 @@ from mux_errors import ChannelBusy
 from laser_measure import counts_to_ma
 from adc_avg import avg as _avg
 from link_health import LinkHealth, PICO_RESET_S, STALL_WINDOW_S, RESET_HOLD_S, reset_decision
+from link_health import HeartbeatDiag
 from sense_keys import SenseKeys, settings as sense_settings, late_drain_ms
 import heap_watch                 # VM heap size: it grows into the RAM lwIP needs
 
@@ -967,6 +968,7 @@ class Concentrator:
 
     async def heartbeat_task(self):
         last = time.monotonic()
+        diag = HeartbeatDiag(last)               # log only: first heartbeats, udp stats
         while True:
             await asyncio.sleep(PICO_HEARTBEAT_S)
             now = time.monotonic()
@@ -976,13 +978,14 @@ class Concentrator:
                 # the whole loop was held this long: say what else was going on
                 emit("loop late %.1f s (survey %s, clients %d)" % (
                     late, self.survey_state.phase, farm_ws.ws_clients()))
-            if farm_ws.ws_clients() or _net_udp():   # "udp": one datagram, no wait
+            if diag.gate(now, farm_ws.ws_clients(), _net_udp(), print):   # "udp": one datagram, no wait
                 self.pump_edges()
-                try:
-                    send(self.heartbeat_doc(), keep=False)
-                except Exception as e:           # never let it kill main()
-                    emit("heartbeat: %r" % e)
+                # never raises (never kills main()): console lines by print,
+                # any exception by emit (as before, also to farm_log)
+                diag.heartbeat(now, self.heartbeat_doc,
+                               lambda doc: send(doc, keep=False), print, emit)
                 self.pump_edges()
+            diag.stats(now, farm_ws.stats, print)
 
     def _udp_link_step(self, now, state):
         """link.ring_send "udp": no ping, no radio or Pico reset (each holds

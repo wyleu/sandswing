@@ -504,4 +504,121 @@ def test_cmd_check_is_a_pure_table():
     assert n.command(L.CMD_WIFI_OFF) is None                   # no way back on
 
 
+
+# --- diag: heartbeat UDP sends and udp stats (log only) ---------------------
+def hb_doc(seq):
+    return {"schema": "sand.panel/v1", "type": "heartbeat", "src": "sandswing",
+            "boot_id": "7091cdab", "seq": seq, "body": {"pad": "x" * 900}}
+
+
+@case
+def test_hb_diag_logs_the_first_three_heartbeats_with_size_gate_and_udp_result():
+    with rig("udp"):
+        pool = Pool()
+        farm_ws.configure_udp({"link": {"udp_host": "10.42.0.50"}}, pool)
+        d, lines = L.HeartbeatDiag(0.0), []
+        seq = [0]
+
+        def build():
+            seq[0] += 1
+            return hb_doc(seq[0])
+        for t in (5.0, 10.0, 15.0, 20.0):
+            assert d.gate(t, farm_ws.ws_clients(), farm_ws.net_udp(), lines.append)
+            assert d.heartbeat(t, build, lambda doc: farm_ws.send(doc, keep=False), lines.append)
+        size = len(json.dumps(hb_doc(1)).encode("utf-8"))
+        assert size < L.UDP_MAX_B
+        assert lines == ["%.3f hb #%d: %d B, ws=1 udp=1, sent=True" % (t, n, size)
+                         for n, t in ((1, 5.0), (2, 10.0), (3, 15.0))], lines
+        assert d.built == 4 and len(pool.sent) == 4
+        assert json.loads(pool.sent[3][0])["type"] == "heartbeat"
+
+
+@case
+def test_hb_diag_says_when_the_gate_is_closed_for_the_first_three_loops_only():
+    d, lines = L.HeartbeatDiag(0.0), []
+    for t in (5.0, 10.0, 15.0, 20.0):
+        assert not d.gate(t, 0, False, lines.append)
+    assert lines == ["%.3f hb gate closed, loop %d: ws=0 udp=0" % (t, n)
+                     for n, t in ((1, 5.0), (2, 10.0), (3, 15.0))], lines
+    d2, lines2 = L.HeartbeatDiag(0.0), []
+    for t in (5.0, 10.0, 15.0):
+        d2.gate(t, 1, False, lines2.append)
+    assert not d2.gate(20.0, 0, False, lines2.append) and lines2 == []   # loop 4: too late to log
+
+
+@case
+def test_hb_diag_prints_any_exception_with_its_type_and_never_raises():
+    d, lines, errs = L.HeartbeatDiag(0.0), [], []
+
+    def bad_doc():
+        raise TypeError("object of type 'int' has no len()")
+
+    def bad_send(doc):
+        raise OSError(12, "ENOMEM")
+    d.gate(5.0, 0, True, lines.append)
+    assert d.heartbeat(5.0, bad_doc, bad_send, lines.append, errs.append) is None
+    assert errs == ["5.000 hb build failed: TypeError: object of type 'int' has no len()"], errs
+    assert d.built == 0
+    assert d.heartbeat(10.0, lambda: hb_doc(1), bad_send, lines.append, errs.append) is None
+    assert errs[1].startswith("10.000 hb #1 send failed: OSError: ") and "ENOMEM" in errs[1], errs
+    assert lines == []                                     # no "sent=" line for a failed send
+    d.heartbeat(15.0, lambda: {"x": object()}, lambda doc: False, lines.append, errs.append)
+    assert errs[2].startswith("15.000 hb #2 size failed: TypeError: "), errs
+    assert lines == ["15.000 hb #2: -1 B, ws=0 udp=1, sent=False"], lines
+
+
+@case
+def test_hb_diag_udp_stats_line_every_60_s_from_farm_ws_stats():
+    with rig("udp"):
+        pool = Pool()
+        farm_ws.configure_udp({"link": {"udp_host": "10.42.0.50"}}, pool)
+        d, lines = L.HeartbeatDiag(0.0), []
+        t = 0.0
+        while t < 2 * L.UDP_STATS_S:
+            t += 5.0
+            d.gate(t, 0, True, lines.append)
+            d.heartbeat(t, lambda: hb_doc(1), lambda doc: farm_ws.send(doc, keep=False),
+                        lambda s: None)
+            d.stats(t, farm_ws.stats, lines.append)
+        farm_ws.send({"type": "heartbeat", "pad": "x" * L.UDP_MAX_B}, keep=False)
+        pool.fail = 12
+        farm_ws.send(stroke(1))
+        assert d.stats(t + L.UDP_STATS_S, farm_ws.stats, lines.append)
+        assert lines == ["60.000 udp stats: hb=12 sent=12 dropped=0 too_big=0 slow=0 max_ms=0",
+                         "120.000 udp stats: hb=24 sent=24 dropped=0 too_big=0 slow=0 max_ms=0",
+                         "180.000 udp stats: hb=24 sent=24 dropped=1 too_big=1 slow=0 max_ms=0"], lines
+        for k in ("udp_sent", "udp_dropped", "udp_too_big", "udp_slow", "udp_max_ms"):
+            assert k in farm_ws.stats
+
+
+@case
+def test_udp_send_says_why_on_the_first_drop_and_every_100th():
+    with rig("udp"):
+        pool = Pool(fail=12)
+        farm_ws.configure_udp({"link": {"udp_host": "10.42.0.50"}}, pool)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            for q in range(L.UDP_DROP_LOG_EVERY + 1):
+                assert not farm_ws.send(stroke(q + 1))
+        got = [x for x in out.getvalue().splitlines() if "udp sendto dropped" in x]
+        assert len(got) == 2, out.getvalue()
+        assert "OSError: " in got[0] and "ENOMEM" in got[0] and got[0].endswith(", 1 this boot"), got
+        assert got[1].endswith(", %d this boot" % L.UDP_DROP_LOG_EVERY), got
+        assert farm_ws.stats["udp_dropped"] == L.UDP_DROP_LOG_EVERY + 1
+
+
+@case
+def test_udp_send_says_so_when_sendto_takes_only_part_of_a_datagram():
+    with rig("udp"):
+        pool = Pool()
+        farm_ws.configure_udp({"link": {"udp_host": "10.42.0.50"}}, pool)
+        sock = farm_ws._udp_sock()
+        sock.sendto = lambda data, dest: 0
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert not farm_ws.send(hb_doc(1), keep=False)
+        assert "udp sendto dropped: sent 0 of " in out.getvalue(), out.getvalue()
+        assert farm_ws.stats["udp_dropped"] == 1
+
+
 finish()

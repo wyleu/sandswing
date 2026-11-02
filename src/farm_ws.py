@@ -479,9 +479,14 @@ def udp_send(msg):
         return False
     t0 = time.monotonic()
     ok = False
+    why = None
     try:
-        ok = _udp_sock().sendto(data, _udp["dest"]) == len(data)
-    except Exception:
+        n_out = _udp_sock().sendto(data, _udp["dest"])
+        ok = n_out == len(data)
+        if not ok:
+            why = "sent %r of %d B" % (n_out, len(data))
+    except Exception as e:
+        why = "%s: %s" % (type(e).__name__, e)
         try:
             _udp["sock"].close()
         except Exception:
@@ -493,6 +498,11 @@ def udp_send(msg):
         stats["udp_slow"] += 1
         print("%.3f udp sendto took %.3f s" % (time.monotonic(), took))
     stats["udp_sent" if ok else "udp_dropped"] += 1
+    if not ok:
+        n = stats["udp_dropped"]
+        if n == 1 or n % link_health.UDP_DROP_LOG_EVERY == 0:   # say why: a drop is otherwise silent
+            print("%.3f udp sendto dropped: %s (%d B, %s), %d this boot" % (
+                time.monotonic(), why, len(data), msg[:40], n))
     return ok
 
 
