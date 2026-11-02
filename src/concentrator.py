@@ -95,7 +95,7 @@ from mux_errors import ChannelBusy
 from laser_measure import counts_to_ma
 from adc_avg import avg as _avg
 from link_health import LinkHealth, PICO_RESET_S, STALL_WINDOW_S, RESET_HOLD_S, reset_decision
-from link_health import HeartbeatDiag
+from link_health import HeartbeatDiag, udp_heartbeat
 from sense_keys import SenseKeys, settings as sense_settings, late_drain_ms
 import heap_watch                 # VM heap size: it grows into the RAM lwIP needs
 
@@ -222,6 +222,11 @@ def _net_off():
 def _net_udp():
     f = getattr(farm_ws, "net_udp", None)
     return bool(f()) if f is not None else False
+
+
+def _udp_last_b(doc):
+    """Diag: the size of the datagram udp_send last made (the heartbeat's)."""
+    return farm_ws.stats.get("udp_last_b", -1)
 
 
 def _net_rejoins():
@@ -982,8 +987,11 @@ class Concentrator:
                 self.pump_edges()
                 # never raises (never kills main()): console lines by print,
                 # any exception by emit (as before, also to farm_log)
+                # "udp": the slim heartbeat, one datagram (udp_heartbeat);
+                # /ws gets heartbeat_doc as before
                 diag.heartbeat(now, self.heartbeat_doc,
-                               lambda doc: send(doc, keep=False), print, emit)
+                               lambda doc: send(doc, keep=False, udp_fit=udp_heartbeat),
+                               print, emit, size=_udp_last_b if _net_udp() else None)
                 self.pump_edges()
             diag.stats(now, farm_ws.stats, print)
 

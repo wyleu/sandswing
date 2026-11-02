@@ -256,6 +256,20 @@ def link(app):
                  "has": sorted(k for k in ("panel", "panel_state", "link", "net",
                                            "time", "tower", "last_seq")
                                if k in hb["body"])}
+    # ring_send "udp": the slim heartbeat of this real doc; the doc itself unchanged
+    import json
+    import link_health
+    whole = json.dumps(hb)
+    text, dropped = link_health.udp_heartbeat(hb)
+    slim = json.loads(text)
+    res["hb_udp"] = {"same_doc": json.dumps(hb) == whole, "dropped": dropped,
+                     "fits": len(text.encode("utf-8")) <= link_health.UDP_MAX_B,
+                     "smaller": len(text) < len(whole),
+                     "panel": slim["body"]["panel"] == hb["body"]["panel"]
+                     and slim["body"]["panel_state"] == hb["body"]["panel_state"]
+                     and slim["body"]["chan"] == hb["body"]["chan"],
+                     "ids": all(slim[k] == hb[k] for k in ("schema", "type", "src", "id",
+                                                            "boot_id", "seq"))}
     # Wi-Fi lost -> link event, LED1 no_wifi; rejoin after WIFI_REJOIN_S
     wifi = {"ok": True}
     joins, started, drops, resets = [], [], [], []
@@ -330,11 +344,13 @@ def link(app):
             raise _Stop()
         clock["now"] += s + 3.0                    # the loop was held 3 s
 
-    notes = []
+    notes, hb_sends = [], []
     saved = (concentrator.time, concentrator.asyncio.sleep, concentrator.emit,
-             farm_ws.ws_clients)
+             farm_ws.ws_clients, concentrator.send)
     concentrator.time, concentrator.asyncio.sleep = stub, fake_sleep
     concentrator.emit = notes.append
+    concentrator.send = lambda obj, **kw: hb_sends.append((obj.get("type"), sorted(kw),
+                                                           kw.get("keep"), kw.get("udp_fit")))
     farm_ws.ws_clients = lambda: 1
     try:
         asyncio.run(app.heartbeat_task())
@@ -342,8 +358,10 @@ def link(app):
         pass
     finally:
         (concentrator.time, concentrator.asyncio.sleep, concentrator.emit,
-         farm_ws.ws_clients) = saved
+         farm_ws.ws_clients, concentrator.send) = saved
     res["loop_late"] = notes
+    res["hb_sends"] = [[t, kw, keep, fit is link_health.udp_heartbeat]
+                       for t, kw, keep, fit in hb_sends]
     return {"link": res}
 
 
@@ -772,6 +790,13 @@ def main():
     check("link: heartbeat LED mimic is the ON phase, with link/net/time",
           hb.get("led6") == [40, 0, 0] and hb.get("has") == sorted(
               ["panel", "panel_state", "link", "net", "time", "tower", "last_seq"]), hb)
+    U = L.get("hb_udp") or {}
+    check("link: udp heartbeat of the real doc fits one datagram, keeps ids/panel/chan, doc unchanged",
+          U.get("same_doc") and U.get("fits") and U.get("smaller") and U.get("panel")
+          and U.get("ids") and U.get("dropped") == [], U or r.get("exc"))
+    check("link: heartbeat_task sends the whole doc, keep=False, udp_fit=udp_heartbeat",
+          L.get("hb_sends") == [["heartbeat", ["keep", "udp_fit"], False, True]],
+          L.get("hb_sends") or r.get("exc"))
     check("link: Wi-Fi lost -> LED1 no_wifi, clients dropped, no instant rejoin",
           L.get("lost") == ["no_wifi", 1, ["wifi lost"], []], L.get("lost"))
     check("link: rejoin only after WIFI_REJOIN_S, with a join timeout",

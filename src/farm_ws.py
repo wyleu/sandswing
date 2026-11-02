@@ -169,6 +169,7 @@ stats = {"connects": 0, "drops": 0, "refused": 0, "send_timeouts": 0,
          "strokes_replayed": 0, "acks": 0,
          "batches": 0, "batched_frames": 0,
          "udp_sent": 0, "udp_dropped": 0, "udp_slow": 0, "udp_max_ms": 0, "udp_too_big": 0,
+         "udp_last_b": 0, "udp_hb_trimmed": 0,
          "last_drop_reason": None, "last_drop_at": None,
          "hb_seen": False, "last_rx_at": None}
 
@@ -469,6 +470,7 @@ def udp_send(msg):
     if _udp["dest"] is None:
         return False
     data = msg.encode("utf-8")
+    stats["udp_last_b"] = len(data)
     if len(data) > link_health.UDP_MAX_B:
         stats["udp_too_big"] += 1
         n = stats["udp_too_big"]
@@ -1907,11 +1909,24 @@ def poll():
                   % (b["read_s"], b["reply_s"], b["reply_b"]))
 
 
-def send(obj, keep=True):
+def send(obj, keep=True, udp_fit=None):
     """Send one JSON message to every client; True if at least one got it.
     A failing client is dropped; the others still get the message.
     keep: remember it for replay to the next new client (events yes,
-    heartbeats no)."""
+    heartbeats no).  udp_fit: (obj) -> (text, dropped), used instead of
+    json.dumps on the "udp" path only and only with keep False (the
+    heartbeat: link_health.udp_heartbeat, one datagram); /ws is as before."""
+    if udp_fit is not None and not keep and _net.udp():
+        if isinstance(obj, dict) and obj.get("boot_id"):
+            _event_boot[0] = obj.get("boot_id")  # as below
+        msg, dropped = udp_fit(obj)
+        if dropped:
+            stats["udp_hb_trimmed"] += 1
+            n = stats["udp_hb_trimmed"]
+            if n == 1 or n % link_health.UDP_DROP_LOG_EVERY == 0:
+                print("%.3f udp heartbeat trimmed to %d B: dropped %s, %d this boot" % (
+                    time.monotonic(), len(msg.encode("utf-8")), ",".join(dropped), n))
+        return udp_send(msg)
     msg = json.dumps(obj)
     if isinstance(obj, dict) and obj.get("boot_id"):
         _event_boot[0] = obj.get("boot_id")      # this boot (acks and commands must name it)

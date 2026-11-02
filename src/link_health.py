@@ -689,6 +689,120 @@ RING_SEND_MODES = (RING_SEND_LIVE, RING_SEND_BATCHED, RING_SEND_SHED, RING_SEND_
 UDP_PORT = 5055                     # link.udp_port; Sandbells events.constants.UDP_INGEST_PORT
 UDP_SLOW_S = 0.05                   # a sendto slower than this is logged (it should be ~1 ms)
 UDP_MAX_B = 1472                    # one Ethernet frame (1500 - IP 20 - UDP 8): never fragmented
+# The UDP heartbeat (ring_send "udp"): one datagram, never fragmented.  The
+# WebSocket heartbeat (heartbeat_doc) carries body.net = every farm_ws
+# counter (~60 keys, ~1.2 kB) and full sntp/heap detail: ~2.4 kB on the
+# Pico, so every one was too_big.  udp_heartbeat() sends what Sandbells
+# reads (ingest Ingest._panel_frame + LinkState.heartbeat: schema, type,
+# src, id, boot_id, seq, body.uid; link_widget.js: body.panel, panel_state,
+# chan, sync, time.srv/peer/last.ok/last.why, wifi.rssi, net.drops,
+# net.last_drop_reason) plus link, tower, last_seq, uptime_s, last_reset;
+# the counters are in the console's "udp stats" line.  Every string cut to
+# HB_UDP_STR_MAX, compact separators where json.dumps takes them.  Still too
+# big: HB_UDP_DROP, in order, until it fits; anything that cannot is
+# udp_send's too_big.  Same schema and type: Sandbells needs no change.
+HB_UDP_STR_MAX = 40                 # any string in the UDP heartbeat is cut to this many chars
+HB_UDP_FLOAT_DP = 1                 # ...and any float rounded to this many places
+HB_UDP_ENVELOPE = ("schema", "type", "src", "id", "boot_id", "seq")
+HB_UDP_BODY = ("panel", "panel_state", "sync", "uid", "chan", "link", "tower",
+               "last_seq", "uptime_s", "last_reset")
+HB_UDP_NET = ("drops", "last_drop_reason")
+HB_UDP_WIFI = ("ip", "rssi")
+HB_UDP_TIME = ("srv", "stratum", "peer")
+HB_UDP_TIME_LAST = ("ok", "why")
+HB_UDP_CHAN_WHY = ("body", "chan", "why")    # pseudo path: every chan why -> None
+# dropped first to last while the datagram is still too big (the worst case
+# fits without: test_ring_send); never dropped: the envelope, body.uid,
+# panel, panel_state, sync, chan kinds, time.srv/stratum/peer, wifi.rssi,
+# net.drops
+HB_UDP_DROP = (
+    ("body", "last_reset"), ("body", "uptime_s"), ("body", "last_seq"),
+    ("body", "wifi", "ip"), ("body", "tower"), ("body", "link"),
+    ("body", "time", "last"), ("body", "net", "last_drop_reason"),
+    HB_UDP_CHAN_WHY,
+)
+
+
+def dumps_compact(obj):
+    """json.dumps without spaces where CircuitPython's json takes
+    separators (MICROPY_PY_JSON_SEPARATORS), else the plain one."""
+    import json
+    try:
+        return json.dumps(obj, separators=(",", ":"))
+    except TypeError:
+        return json.dumps(obj)
+
+
+def _slim(v):
+    """Strings cut to HB_UDP_STR_MAX, floats rounded, lists/dicts walked."""
+    if isinstance(v, str):
+        return v[:HB_UDP_STR_MAX]
+    if isinstance(v, float):
+        return round(v, HB_UDP_FLOAT_DP)
+    if isinstance(v, (list, tuple)):
+        return [_slim(x) for x in v]
+    if isinstance(v, dict):
+        return dict((k, _slim(x)) for k, x in v.items())
+    return v
+
+
+def _pick(d, keys):
+    d = d if isinstance(d, dict) else {}
+    return dict((k, _slim(d[k])) for k in keys if k in d)
+
+
+def udp_heartbeat_doc(doc):
+    """The slim copy of a heartbeat_doc() (doc is not changed)."""
+    out = _pick(doc, HB_UDP_ENVELOPE)
+    body = doc.get("body") if isinstance(doc.get("body"), dict) else {}
+    b = _pick(body, HB_UDP_BODY)
+    b["net"] = _pick(body.get("net"), HB_UDP_NET)
+    b["wifi"] = _pick(body.get("wifi"), HB_UDP_WIFI)
+    t = body.get("time")
+    if isinstance(t, dict):
+        b["time"] = _pick(t, HB_UDP_TIME)
+        if isinstance(t.get("last"), dict):
+            b["time"]["last"] = _pick(t["last"], HB_UDP_TIME_LAST)
+    else:
+        b["time"] = None
+    out["body"] = b
+    return out
+
+
+def _drop(doc, path):
+    """Remove one HB_UDP_DROP path; True if something went."""
+    if path == HB_UDP_CHAN_WHY:
+        chan = doc.get("body", {}).get("chan") or []
+        hit = any(isinstance(c, list) and len(c) > 1 and c[1] is not None for c in chan)
+        for c in chan:
+            if isinstance(c, list) and len(c) > 1:
+                c[1] = None
+        return hit
+    d = doc
+    for k in path[:-1]:
+        d = d.get(k) if isinstance(d, dict) else None
+    if isinstance(d, dict) and path[-1] in d:
+        del d[path[-1]]
+        return True
+    return False
+
+
+def udp_heartbeat(doc, max_b=UDP_MAX_B, dumps=dumps_compact):
+    """-> (text, dropped): the slim heartbeat as one datagram's text, and the
+    HB_UDP_DROP paths it took to fit (normally none).  The text may still
+    be over max_b if even the core is (udp_send counts that as too_big)."""
+    slim = udp_heartbeat_doc(doc)
+    text = dumps(slim)
+    dropped = []
+    for path in HB_UDP_DROP:
+        if len(text.encode("utf-8")) <= max_b:
+            break
+        if _drop(slim, path):
+            dropped.append(".".join(path))
+            text = dumps(slim)
+    return text, dropped
+
+
 UDP_DROP_LOG_EVERY = 100            # a failed sendto is printed the first time and every this many
 HB_DIAG_N = 3                       # heartbeats (and closed-gate loops) logged after boot
 UDP_STATS_S = 60.0                  # "udp stats" line this often (from heartbeat_task)
@@ -718,9 +832,11 @@ class HeartbeatDiag:
             log("%.3f hb gate closed, loop %d: ws=%d udp=%d" % (now, self.loops, self.ws, self.udp))
         return bool(ws or udp)
 
-    def heartbeat(self, now, build, send, log, err=None):
+    def heartbeat(self, now, build, send, log, err=None, size=None):
         """build() the heartbeat, send(doc) it; never raises.  log: the
-        first heartbeats' lines; err (default log): every exception."""
+        first heartbeats' lines; err (default log): every exception.
+        size: (doc) -> bytes actually sent, asked after the send (the UDP
+        datagram); None: the JSON of doc, measured before."""
         err = err or log
         try:
             doc = build()
@@ -729,11 +845,11 @@ class HeartbeatDiag:
             return None
         self.built += 1
         n = self.built
-        size = -1
-        if n <= self.log_n:
+        n_b = -1
+        if n <= self.log_n and size is None:
             try:
                 import json
-                size = len(json.dumps(doc).encode("utf-8"))
+                n_b = len(json.dumps(doc).encode("utf-8"))
             except Exception as e:
                 err("%.3f hb #%d size failed: %s: %s" % (now, n, type(e).__name__, e))
         try:
@@ -742,7 +858,12 @@ class HeartbeatDiag:
             err("%.3f hb #%d send failed: %s: %s" % (now, n, type(e).__name__, e))
             return None
         if n <= self.log_n:
-            log("%.3f hb #%d: %d B, ws=%d udp=%d, sent=%s" % (now, n, size, self.ws, self.udp, sent))
+            if size is not None:
+                try:
+                    n_b = size(doc)
+                except Exception as e:
+                    err("%.3f hb #%d size failed: %s: %s" % (now, n, type(e).__name__, e))
+            log("%.3f hb #%d: %d B, ws=%d udp=%d, sent=%s" % (now, n, n_b, self.ws, self.udp, sent))
         return sent
 
     def stats(self, now, st, log):

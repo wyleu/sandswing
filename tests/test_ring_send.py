@@ -3,10 +3,14 @@
 import io
 import contextlib
 import json
+import os
 import sys
 import types
 
 from support import case, finish
+
+# set: the worst-case slim heartbeat is written there as slim_hb.json (Sandbells check)
+TEST_OUT = os.environ.get("SANDSWING_TEST_OUT")
 
 for name in ("wifi", "adafruit_connection_manager"):
     sys.modules.setdefault(name, types.ModuleType(name))
@@ -619,6 +623,150 @@ def test_udp_send_says_so_when_sendto_takes_only_part_of_a_datagram():
             assert not farm_ws.send(hb_doc(1), keep=False)
         assert "udp sendto dropped: sent 0 of " in out.getvalue(), out.getvalue()
         assert farm_ws.stats["udp_dropped"] == 1
+
+
+
+# --- the UDP heartbeat: one datagram ----------------------------------------
+LONG = "x" * 200
+
+
+def worst_hb():
+    """heartbeat_doc() as the Pico can make it at its biggest: body.net =
+    the real farm_ws.link_status() (every counter, 5-6 digits), all 8
+    chans faulted with an 80-char why, long strings, floats everywhere."""
+    for k, v in farm_ws.stats.items():
+        if isinstance(v, int) and not isinstance(v, bool):
+            farm_ws.stats[k] = 123456
+    farm_ws.stats["last_drop_reason"] = "send timeout " + LONG
+    farm_ws.stats["last_reply_s"], farm_ws.stats["last_reply_b"] = 1.234567, 7012
+    net = farm_ws.link_status()
+    net.update({"wifi_up": True, "wifi_lost": 12345, "rejoins": 12345, "radio_resets": 12345,
+                "gw_fail": 12345, "gw_ms": 1234.5678})
+    stamp = {"tick_ms": 536870911, "utc_ms": 1793800000000, "err_ms": 12.345678,
+             "sync": "synced", "acc": "ok", "epoch": 123456, "session": 123456,
+             "mode": "ringing", "srv": "192.168.100.100", "stratum": 15}
+    body = {"panel": [[255, 255, 255]] * 6,
+            "panel_state": ["heartbeat_holdover"] * 6,
+            "link": "wifi_only", "tower": "ringing_down", "net": net,
+            "wifi": {"ip": "192.168.100.100", "rssi": -100},
+            "sync": "unsynced",
+            "time": {"srv": "192.168.100.100", "stratum": 15,
+                     "last": {"ok": True, "server": "192.168.100.100", "stratum": 15,
+                              "rtt_ms": 123.456789, "offset_ms": -12345.678901,
+                              "drift_ppm": 123.45678901, "why": "rtt 123.4 > 56.7 " + LONG},
+                     "peer": {"srv": "192.168.100.100", "stratum": 16, "leap": 3}},
+            "last_seq": 123456789, "uid": "7091CDAB9DBD5305",
+            "chan": [["unknown", "w" * 80]] * 8,
+            "uptime_s": 123456789, "last_reset": "BROWNOUT " + LONG, "watchdog": True,
+            "edges_lost": 123456, "late_drains": 123456, "strokes_undelivered": 123456,
+            "mem_free": 123456789, "gc_heap_kb": 123456, "gc_heap_max_kb": 123456,
+            "gc_heap_boot_kb": 123456, "gc_heap_grew": 123456}
+    doc = dict(stamp, schema="sand.panel/v1", type="heartbeat", src="sandswing",
+               id="sandswing-pico", boot_id="7091cdab", seq=123456789, body=body)
+    return doc
+
+
+def plain_dumps(obj):
+    return json.dumps(obj)                 # CircuitPython without separators: ", " ": "
+
+
+@case
+def test_worst_case_heartbeat_is_too_big_whole_but_the_slim_one_fits_one_datagram():
+    with rig("udp"):
+        doc = worst_hb()
+        whole = len(json.dumps(doc).encode("utf-8"))
+        assert whole > 2 * L.UDP_MAX_B, whole                       # why every one was too_big
+        assert len(json.dumps(doc["body"]["net"])) > L.UDP_MAX_B // 2  # body.net dominates
+        for dumps in (L.dumps_compact, plain_dumps):
+            text, dropped = L.udp_heartbeat(doc, dumps=dumps)
+            assert len(text.encode("utf-8")) <= L.UDP_MAX_B and dropped == [], (dumps, len(text))
+        assert len(L.udp_heartbeat(doc)[0]) < len(L.udp_heartbeat(doc, dumps=plain_dumps)[0])
+
+
+@case
+def test_slim_heartbeat_keeps_what_sandbells_reads_and_cuts_long_strings():
+    with rig("udp"):
+        doc = worst_hb()
+        before = json.dumps(doc)
+        slim = json.loads(L.udp_heartbeat(doc)[0])
+        assert json.dumps(doc) == before                             # the /ws doc is not touched
+        for k in ("schema", "type", "src", "id", "boot_id", "seq"):
+            assert slim[k] == doc[k], k
+        assert (slim["schema"], slim["type"]) == ("sand.panel/v1", "heartbeat")
+        b, d = slim["body"], doc["body"]
+        for k in ("panel", "panel_state", "sync", "uid", "link", "tower", "last_seq"):
+            assert b[k] == d[k], k
+        assert [c[0] for c in b["chan"]] == [c[0] for c in d["chan"]] and len(b["chan"]) == 8
+        assert all(len(c[1]) == L.HB_UDP_STR_MAX for c in b["chan"])
+        assert b["wifi"] == {"ip": "192.168.100.100", "rssi": -100}
+        assert b["time"]["peer"] == {"srv": "192.168.100.100", "stratum": 16, "leap": 3}
+        assert b["time"]["srv"] == "192.168.100.100"
+        assert set(b["time"]["last"]) == {"ok", "why"} and len(b["time"]["last"]["why"]) == L.HB_UDP_STR_MAX
+        assert b["net"]["drops"] == 123456 and len(b["net"]["last_drop_reason"]) == L.HB_UDP_STR_MAX
+        assert set(b["net"]) == {"drops", "last_drop_reason"}     # the rest: console "udp stats"
+        assert not set(slim) - set(L.HB_UDP_ENVELOPE) - {"body"}
+        assert len(b["last_reset"]) == L.HB_UDP_STR_MAX
+        if TEST_OUT:
+            with open(os.path.join(TEST_OUT, "slim_hb.json"), "w") as f:
+                f.write(L.udp_heartbeat(doc)[0])
+
+
+@case
+def test_too_big_slim_heartbeat_drops_optional_fields_in_order_and_still_goes():
+    with rig("udp"):
+        doc = worst_hb()
+        full = len(L.udp_heartbeat(doc)[0].encode("utf-8"))
+        text, dropped = L.udp_heartbeat(doc, max_b=full - 30)
+        assert len(text) <= full - 30 and dropped and dropped[0] == "body.last_reset", dropped
+        assert dropped == [".".join(p) for p in L.HB_UDP_DROP[:len(dropped)]]
+        slim = json.loads(text)
+        assert slim["body"]["panel"] and slim["body"]["uid"] and "last_reset" not in slim["body"]
+        text, dropped = L.udp_heartbeat(doc, max_b=1)                # nothing fits: the core is left
+        core = json.loads(text)
+        assert "body.chan.why" in dropped and all(c[1] is None for c in core["body"]["chan"])
+        assert set(core) == {"schema", "type", "src", "id", "boot_id", "seq", "body"}
+        assert {"panel", "panel_state", "sync", "uid", "chan", "net", "wifi", "time"} == set(core["body"])
+        assert core["body"]["net"] == {"drops": 123456} and core["body"]["wifi"] == {"rssi": -100}
+
+
+@case
+def test_udp_heartbeat_goes_as_one_slim_datagram_and_ws_gets_the_whole_doc():
+    with rig("udp"):
+        pool = Pool()
+        farm_ws.configure_udp({"link": {"udp_host": "10.42.0.50"}}, pool)
+        doc = worst_hb()
+        for k in ("udp_too_big", "udp_sent", "udp_hb_trimmed"):
+            farm_ws.stats[k] = 0
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            for _ in range(12):                                     # one minute of heartbeats
+                assert farm_ws.send(doc, keep=False, udp_fit=L.udp_heartbeat)
+        assert farm_ws.stats["udp_too_big"] == 0 and farm_ws.stats["udp_sent"] == 12
+        assert farm_ws.stats["udp_hb_trimmed"] == 0 and "trimmed" not in out.getvalue()
+        assert farm_ws.stats["udp_last_b"] == len(pool.sent[-1][0]) <= L.UDP_MAX_B
+        assert json.loads(pool.sent[-1][0])["body"]["uid"] == "7091CDAB9DBD5305"
+        assert farm_ws._event_boot[0] == "7091cdab"
+        # without udp_fit (an event, or a caller that does not ask) it is as before
+        assert not farm_ws.send(doc, keep=False) and farm_ws.stats["udp_too_big"] == 1
+        # trimmed: said once, counted
+        with contextlib.redirect_stdout(out):
+            farm_ws.send(doc, keep=False, udp_fit=lambda o: L.udp_heartbeat(o, max_b=900))
+        assert farm_ws.stats["udp_hb_trimmed"] == 1 and "udp heartbeat trimmed to" in out.getvalue()
+    with rig("live") as r:                                          # /ws: the whole doc, as before
+        doc = {"schema": "sand.panel/v1", "type": "heartbeat", "boot_id": "b",
+               "body": {"net": {"connects": 1}, "pad": "y" * 100}}
+        before = len(r.conn.data)
+        farm_ws.send(doc, keep=False, udp_fit=L.udp_heartbeat)
+        got = [json.loads(f) for f in frames(bytes(r.conn.data[before:]))]
+        assert got == [doc], got
+
+
+@case
+def test_hb_diag_reports_the_datagram_size_when_given_one():
+    d, lines = L.HeartbeatDiag(0.0), []
+    d.gate(5.0, 0, True, lines.append)
+    d.heartbeat(5.0, lambda: hb_doc(1), lambda doc: True, lines.append, size=lambda doc: 812)
+    assert lines == ["5.000 hb #1: 812 B, ws=0 udp=1, sent=True"], lines
 
 
 finish()
