@@ -365,6 +365,73 @@ def link(app):
     return {"link": res}
 
 
+
+def udp_dead(app):
+    """ring_send "udp", Wi-Fi says up: acks stop -> a dead-link rejoin only
+    when quiet (never while ringing), then a fresh UDP socket; link LED
+    green while acked (fake farm_ws functions)."""
+    import concentrator
+    import farm_ws
+    res = {}
+    calls, events, lines = [], [], []
+    st = {"ok": True, "after_join": True, "dead": False, "quiet": False, "tries": 0,
+          "acked": False}
+
+    def tried(now):
+        st["tries"] += 1
+        return st["tries"]
+
+    def connect(cfg, timeout=None):
+        calls.append(("connect", timeout))
+        st["ok"] = st["after_join"]
+
+    farm_ws.wifi_ok = lambda: st["ok"]
+    farm_ws.wifi_ip = lambda: "192.168.0.81"
+    farm_ws.net_udp = lambda: True
+    farm_ws.net_rejoins = lambda: st["quiet"]
+    farm_ws.ack_dead_due = lambda now: st["dead"]
+    farm_ws.ack_silent_s = lambda now: 61.5
+    farm_ws.ack_tried = tried
+    farm_ws.ack_next_s = lambda: 300.0
+    farm_ws.ack_restart = lambda: calls.append(("restart",))
+    farm_ws.reset_radio = lambda: calls.append(("reset_radio",))
+    farm_ws.connect_wifi = connect
+    farm_ws.configure_udp = lambda cfg, pool=None: calls.append(("configure_udp",))
+    farm_ws.sandbells_connected = lambda: st["acked"]
+    concentrator.send = lambda obj, keep=True, **kw: events.append(
+        (obj["body"]["what"], obj["body"].get("after")) if obj.get("type") == "link" else None)
+    concentrator.emit = lines.append
+    app.wifi_up, app.link = True, "wifi_only"
+    state = {"lost_at": None, "tried_at": 0.0}
+    rejoins0 = app.rejoins
+
+    app.link_step(100.0, state)                       # acks coming: nothing
+    res["alive"] = [list(calls), list(events)]
+    st["dead"] = True                                 # no ack for ack_dead_s, but ringing
+    for t in (102.0, 104.0, 106.0):
+        app.link_step(t, state)
+    res["ringing"] = [list(calls), list(events), [l for l in lines if "link dead" in l]]
+    st["quiet"] = True                                # quiet: one rejoin
+    app.link_step(108.0, state)
+    res["rejoin"] = [list(calls), list(events), app.rejoins - rejoins0, app.link, app.wifi_up,
+                     [l for l in lines if "link dead" in l][-1]]
+    del calls[:], events[:]
+    st["dead"], st["after_join"] = True, False        # next one fails to join
+    app.link_step(500.0, state)
+    res["failed"] = [list(calls), list(events), app.link, app.wifi_up, state["lost_at"]]
+    st["dead"] = False
+    # LED1: green while acked, blue when not (panel_task copies sandbells_connected)
+    from hw import paint_once
+    st["ok"], app.wifi_up, app.link = True, True, "wifi_only"
+    st["acked"] = True
+    paint_once(app)
+    res["led_acked"] = [app.link, list(app.frame[0]["rgb"])]
+    st["acked"] = False
+    paint_once(app)
+    res["led_not"] = [app.link, list(app.frame[0]["rgb"])]
+    return {"udp_dead": res}
+
+
 def plug_trigger(fh, pressed, to_ground=False):
     """ch1 = trigger plug: Orange <-> Green/White strapped (GP28 loaded,
     GP26 follows it when ch1 is selected); Green -> Blue/White only while
@@ -533,6 +600,8 @@ def child(scenario, src, extra):
             out.update(midi_first(app, fh))
         if scenario == "watch":
             out.update(watch_empty(app, fh, plug_head))
+        if scenario == "udp_dead":
+            out.update(udp_dead(app))
         if scenario == "link":
             out.update(link(app))
         if scenario == "trigger":
@@ -797,6 +866,26 @@ def main():
     check("link: heartbeat_task sends the whole doc, keep=False, udp_fit=udp_heartbeat",
           L.get("hb_sends") == [["heartbeat", ["keep", "udp_fit"], False, True]],
           L.get("hb_sends") or r.get("exc"))
+    r = spawn(me, "udp_dead")
+    D = r.get("udp_dead") or {}
+    check("udp: acks coming -> no rejoin, no event",
+          D.get("alive") == [[], []], D.get("alive") or r.get("exc"))
+    rg = D.get("ringing") or [None, None, []]
+    check("udp: no ack for ack_dead_s while ringing -> no rejoin, one 'held' line",
+          rg[0] == [] and rg[1] == [] and len(rg[2]) == 1 and "rejoin held until quiet" in rg[2][0], rg)
+    rj = D.get("rejoin") or []
+    check("udp: quiet -> radio reset, join, fresh UDP socket, link_dead + wifi_back events",
+          rj[:5] == [[["reset_radio"], ["connect", 10], ["configure_udp"]],
+                     [["link_dead", None], ["wifi_back", "link_dead"]], 1, "wifi_only", True]
+          and "no ack for 61 s" in rj[5] and "rejoin 1" in rj[5], rj)
+    fl = D.get("failed") or []
+    check("udp: a dead-link join that fails -> wifi_lost, ordinary rejoin path",
+          fl[:4] == [[["reset_radio"], ["connect", 10]],
+                     [["link_dead", None], ["wifi_lost", "link_dead"]], "no_wifi", False]
+          and fl[4] == 500.0, fl)
+    check("udp: link LED green (ws_client) while acked, blue (wifi_only) when not",
+          D.get("led_acked") == ["ws_client", [0, 32, 0]]
+          and D.get("led_not") == ["wifi_only", [0, 0, 32]], [D.get("led_acked"), D.get("led_not")])
     check("link: Wi-Fi lost -> LED1 no_wifi, clients dropped, no instant rejoin",
           L.get("lost") == ["no_wifi", 1, ["wifi lost"], []], L.get("lost"))
     check("link: rejoin only after WIFI_REJOIN_S, with a join timeout",

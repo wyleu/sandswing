@@ -920,6 +920,124 @@ def cmd_check(doc, peer, allowed, uid, boot_id, last_seq):
         return False, "seq %d not above %d (replay)" % (seq, last_seq)
     return True, None
 RING_SEND = RING_SEND_LIVE          # default: behaviour as before this table
+
+
+# --- back chat: Sandbells acks each heartbeat (udp) -------------------------
+# Sandbells' ingest_udp answers each heartbeat datagram with one
+# {"schema": ACK_SCHEMA, "boot_id", "seq"} (< 100 B) to the heartbeat's
+# source (ip, port), i.e. to our own UDP send socket, which is read without
+# waiting (non-blocking: EAGAIN at once), at most ACK_POLL_N per poll, into a
+# buffer made once.  Accepted only from link.udp_host with this boot's
+# boot_id.  An ack within ACK_OK_S: link LED green ("ws_client", which
+# Sandbells already names "Sandbells connected").  No ack for ACK_DEAD_S
+# (from the last ack, else from our first send; 60 s = 12 heartbeats) while
+# wifi_ok() still says up: the link is dead (seen 2 Nov: the extender kept a
+# proxy MAC for us and nothing got through).  The Pico then cycles the radio
+# and rejoins, only through the quiet-gated path (NetMode: no stroke within
+# ring_quiet_s) and never while ringing, ACK_REJOIN_BACKOFF_S apart (the last
+# repeats) until an ack comes, so a Sandbells that is not running costs one
+# rejoin per 15 min of quiet at most.  settings.json link.ack_ok_s /
+# link.ack_dead_s are optional (defaults here); ack_dead_s 0: never rejoin
+# on silence.  Never written.
+ACK_SCHEMA = "sand.ack/v1"          # Sandbells events.constants.SCHEMA_ACK_V1
+ACK_MAX_B = 128                     # read buffer; an ack is < 100 B, longer is refused
+ACK_POLL_N = 4                      # datagrams read from the send socket per poll, at most
+ACK_OK_S = 15.0                     # link.ack_ok_s: an ack this recent = LED green (3 heartbeats)
+ACK_DEAD_S = 60.0                   # link.ack_dead_s: no ack this long = link dead (0: never)
+ACK_REJOIN_BACKOFF_S = (60.0, 300.0, 900.0)   # between dead-link rejoins; the last repeats
+ACK_LOG_EVERY = 100                 # a refused ack is printed the first time and every this many
+
+
+def ack_check(doc, peer, allowed, boot_id):
+    """One decoded ack -> (ok, why).  No sockets, no clock."""
+    if not isinstance(doc, dict) or doc.get("schema") != ACK_SCHEMA:
+        return False, "not an ack"
+    if allowed is None or peer != allowed:
+        return False, "peer %s not link.udp_host" % peer
+    if boot_id is None or doc.get("boot_id") != boot_id:
+        return False, "another boot"
+    seq = doc.get("seq")
+    if not isinstance(seq, int) or isinstance(seq, bool):
+        return False, "no seq"
+    return True, None
+
+
+class AckWatch:
+    """When was Sandbells last heard back, and is a dead-link rejoin due?
+    Pure: the caller passes the time and does the rejoin."""
+
+    def __init__(self, ok_s=ACK_OK_S, dead_s=ACK_DEAD_S, backoff=ACK_REJOIN_BACKOFF_S):
+        self.ok_s, self.dead_s, self.backoff = ok_s, dead_s, tuple(backoff)
+        self.reset()
+
+    def reset(self):
+        self.since = None          # silence counted from here (first send, ack, rejoin)
+        self.last_ack_at = None
+        self.last_seq = None
+        self.acks = 0
+        self.refused = 0
+        self.tries = 0             # dead-link rejoins since the last ack
+
+    def configure(self, sec):
+        """settings.json "link" section (optional keys; defaults above)."""
+        sec = sec or {}
+        try:
+            self.ok_s = max(0.0, float(sec.get("ack_ok_s", ACK_OK_S)))
+        except (TypeError, ValueError):
+            self.ok_s = ACK_OK_S
+        try:
+            self.dead_s = max(0.0, float(sec.get("ack_dead_s", ACK_DEAD_S)))
+        except (TypeError, ValueError):
+            self.dead_s = ACK_DEAD_S
+
+    def sent(self, now):
+        """A datagram went out: the silence clock starts if it was not running."""
+        if self.since is None:
+            self.since = now
+
+    def ack(self, now, seq):
+        """True for the first ack this boot."""
+        self.acks += 1
+        self.last_ack_at = self.since = now
+        self.last_seq = seq
+        self.tries = 0
+        return self.acks == 1
+
+    def restart(self):
+        """Wi-Fi came back: count silence again from the next send."""
+        self.since = None
+
+    def fresh(self, now):
+        return self.last_ack_at is not None and now - self.last_ack_at < self.ok_s
+
+    def silent_s(self, now):
+        return None if self.since is None else now - self.since
+
+    def wait_s(self):
+        """Silence that makes the next rejoin due."""
+        if self.tries == 0:
+            return self.dead_s
+        return max(self.dead_s, self.backoff[min(self.tries, len(self.backoff)) - 1])
+
+    def due(self, now):
+        """Dead: no ack for wait_s() (wifi_ok() is the caller's business)."""
+        if self.dead_s <= 0 or self.since is None:
+            return False
+        return now - self.since >= self.wait_s()
+
+    def tried(self, now):
+        """A dead-link rejoin was made: silence counts from now, the next
+        one waits longer.  -> attempt number."""
+        self.tries += 1
+        self.since = now
+        return self.tries
+
+    def status(self, now):
+        return {"acks": self.acks, "refused": self.refused,
+                "ack_age_s": None if self.last_ack_at is None else round(now - self.last_ack_at, 1),
+                "silent_s": None if self.since is None else round(now - self.since, 1),
+                "rejoin_tries": self.tries, "dead_s": self.dead_s}
+
 # A minute bell tolls once per 60 s at the slowest; twice that bridges one
 # missed or late stroke without the network coming back between tolls.
 SLOWEST_TOLL_S = 60.0

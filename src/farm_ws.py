@@ -292,6 +292,9 @@ _cmd = {"sock": None, "port": link_health.CMD_PORT, "last_seq": None,
         "pending": None, "accepted": 0, "refused": 0, "last_why": None,
         "radio_off": False}
 _cmd_buf = bytearray(link_health.CMD_MAX_B + 1)     # made once: no allocation per read
+# back chat: Sandbells' acks to our heartbeats, read from the send socket
+_acks = link_health.AckWatch()
+_ack_buf = bytearray(link_health.ACK_MAX_B + 1)     # made once: no allocation per read
 
 
 def _udp_pick():
@@ -325,6 +328,7 @@ def configure_udp(cfg, pool=None):
         port = link_health.UDP_PORT
     _udp["hosts"] = time_servers.normalise(sec.get("udp_host"))
     _udp["port"] = port
+    _acks.configure(sec)                  # optional link.ack_ok_s / ack_dead_s
     _udp_pick()
     if pool is not None:
         _udp["pool"] = pool
@@ -422,6 +426,71 @@ def cmd_apply():
     return mode
 
 
+def ack_poll(now=None):
+    """Sandbells' acks: up to ACK_POLL_N datagrams from the UDP send socket,
+    without waiting (non-blocking: EAGAIN at once).  Good ones (from
+    link.udp_host, this boot) are noted; anything else is read and dropped.
+    -> acks taken."""
+    s = _udp["sock"]
+    if s is None or not _net.udp() or _udp["dest"] is None:
+        return 0
+    now = time.monotonic() if now is None else now
+    took = 0
+    for _ in range(link_health.ACK_POLL_N):
+        try:
+            n, peer = s.recvfrom_into(_ack_buf)
+        except OSError as e:
+            if e.errno != EAGAIN:            # not "nothing there": a fresh socket on the next send
+                _udp["sock"] = None
+            break
+        except Exception:
+            break
+        ip = peer[0] if isinstance(peer, tuple) else peer
+        doc = None
+        if n <= link_health.ACK_MAX_B:
+            try:
+                doc = json.loads(bytes(_ack_buf[:n]).decode("utf-8"))
+            except Exception:
+                doc = None
+        ok, why = link_health.ack_check(doc, ip, _udp["dest"][0], _event_boot[0])
+        if not ok:
+            _acks.refused += 1
+            if _acks.refused == 1 or _acks.refused % link_health.ACK_LOG_EVERY == 0:
+                print("%.3f udp ack refused from %s: %s, %d this boot" % (
+                    now, ip, why if n <= link_health.ACK_MAX_B else "too long", _acks.refused))
+            continue
+        took += 1
+        if _acks.ack(now, doc["seq"]):
+            print("%.3f udp ack: first from %s (hb seq %d): Sandbells hears us, link LED green"
+                  % (now, ip, doc["seq"]))
+    return took
+
+
+def ack_fresh(now=None):
+    return _acks.fresh(time.monotonic() if now is None else now)
+
+
+def ack_dead_due(now):
+    """udp: no ack for AckWatch.wait_s() (the caller checks wifi_ok and quiet)."""
+    return _net.udp() and _acks.due(now)
+
+
+def ack_silent_s(now):
+    return _acks.silent_s(now)
+
+
+def ack_tried(now):
+    return _acks.tried(now)
+
+
+def ack_next_s():
+    return _acks.wait_s()
+
+
+def ack_restart():
+    _acks.restart()
+
+
 def radio_off_due():
     """Wi-Fi off by command, radio still on, no stroke within ring_quiet_s and
     the tower inactive: the radio may be powered down now."""
@@ -500,6 +569,8 @@ def udp_send(msg):
         stats["udp_slow"] += 1
         print("%.3f udp sendto took %.3f s" % (time.monotonic(), took))
     stats["udp_sent" if ok else "udp_dropped"] += 1
+    if ok:
+        _acks.sent(t0)                        # the silence clock (dead-link rejoin) runs from here
     if not ok:
         n = stats["udp_dropped"]
         if n == 1 or n % link_health.UDP_DROP_LOG_EVERY == 0:   # say why: a drop is otherwise silent
@@ -1788,6 +1859,7 @@ def poll():
     _net_tick(t0)
     cmd_apply()                            # last turn's command, its ack already out
     cmd_poll()                             # at most one datagram, never waits
+    ack_poll(t0)                           # Sandbells' acks: a few datagrams, never waits
     plan = _plan(t0)
     deadline = t0 + plan.poll_s
     if ws_bounds is not None:
@@ -2018,9 +2090,12 @@ def live_clients(now=None):
 
 
 def sandbells_connected():
-    """LED1 green.  Once any client has sent a heartbeat this boot, only a
+    """LED1 green.  "udp": Sandbells acked a heartbeat within ACK_OK_S.
+    Otherwise: once any client has sent a heartbeat this boot, only a
     live heartbeat client counts (a half-open socket no longer shows green);
     before that (old Sandbells), any client counts, as before."""
+    if _net.udp():
+        return _acks.fresh(time.monotonic())   # "udp": an ack within link.ack_ok_s
     if stats["hb_seen"]:
         return live_clients() > 0
     return bool(_clients)
@@ -2080,6 +2155,7 @@ def link_status():
                 "last_seq": _cmd["last_seq"], "last_why": _cmd["last_why"],
                 "by": _net.by_command, "radio_off": _cmd["radio_off"]}
     d["net_state"] = _net.state
+    d["ack"] = _acks.status(now)
     if d["last_drop_at"] is not None:
         d["last_drop_age_s"] = round(now - d["last_drop_at"], 1)
     del d["last_drop_at"]
@@ -2105,6 +2181,8 @@ def reset_state():
     _net.reset()
     _udp["sock"] = _udp["dest"] = None
     _udp["hosts"], _udp["port"] = [], None
+    _acks.reset()
+    _acks.configure(None)
     _cmd.update(sock=None, last_seq=None, pending=None, accepted=0, refused=0,
                 last_why=None, radio_off=False)
     _doc.reset()

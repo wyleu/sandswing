@@ -769,4 +769,175 @@ def test_hb_diag_reports_the_datagram_size_when_given_one():
     assert lines == ["5.000 hb #1: 812 B, ws=0 udp=1, sent=True"], lines
 
 
+
+# --- back chat: Sandbells' acks (udp) ---------------------------------------
+class AckPool(CmdPool):
+    """The send socket (never bound) reads pool.acks; the command socket
+    (bound to cmd_port) reads pool.inbox."""
+    def __init__(self):
+        CmdPool.__init__(self)
+        self.acks, self.reads = [], 0
+
+    def socket(self, fam, typ):
+        s = CmdPool.socket(self, fam, typ)
+        pool, cmd_read = self, s.recvfrom_into
+        state = {"bound": False}
+        bind = s.bind
+
+        def bind2(addr):
+            state["bound"] = True
+            bind(addr)
+
+        def recvfrom_into(buf):
+            if state["bound"]:
+                return cmd_read(buf)
+            pool.reads += 1
+            if not pool.acks:
+                raise OSError(farm_ws.EAGAIN, "EAGAIN")
+            item = pool.acks.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            data, peer = item
+            n = min(len(buf), len(data))
+            buf[:n] = data[:n]
+            return len(data), peer
+        s.bind, s.recvfrom_into = bind2, recvfrom_into
+        return s
+
+
+def ack(seq, boot_id="7091cdab", **kw):
+    d = {"schema": L.ACK_SCHEMA, "boot_id": boot_id, "seq": seq}
+    d.update(kw)
+    return json.dumps(d, separators=(",", ":")).encode()
+
+
+class ack_rig(udp_rig):
+    def __enter__(self):
+        rig.__enter__(self)
+        self.pool = AckPool()
+        farm_ws.configure_udp({"link": {"udp_host": SB}}, self.pool)
+        self.real_uid = farm_ws._device_uid
+        farm_ws._device_uid = lambda: UID
+        farm_ws.send(stroke(1))                  # this boot's boot_id; the send socket exists
+        return self
+
+
+@case
+def test_an_ack_from_udp_host_for_this_boot_turns_the_link_led_green_then_it_fades():
+    with ack_rig("udp") as r:
+        assert not farm_ws.sandbells_connected()             # udp, no ack yet: blue as before
+        r.pool.acks.append((ack(4), (SB, L.UDP_PORT)))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            farm_ws.poll()
+        assert "udp ack: first from %s (hb seq 4)" % SB in out.getvalue(), out.getvalue()
+        assert farm_ws.sandbells_connected() and farm_ws.ack_fresh()
+        st = farm_ws.link_status()["ack"]
+        assert st["acks"] == 1 and st["refused"] == 0 and st["ack_age_s"] == 0.0
+        r.clock.t += L.ACK_OK_S - 0.1
+        assert farm_ws.sandbells_connected()
+        r.clock.t += 0.2
+        assert not farm_ws.sandbells_connected()             # stale: blue again
+        r.pool.acks.append((ack(5), (SB, L.UDP_PORT)))
+        with contextlib.redirect_stdout(out):
+            farm_ws.poll()
+        assert farm_ws.sandbells_connected() and out.getvalue().count("first from") == 1
+
+
+@case
+def test_acks_from_anyone_else_another_boot_or_garbage_are_read_and_dropped_bounded():
+    with ack_rig("udp") as r:
+        bad = [(ack(1), ("10.9.9.9", 1)), (ack(1, boot_id="beefbeef"), (SB, 1)),
+               (ack(1, schema="sand.cmd/v1"), (SB, 1)), (ack("1"), (SB, 1)),
+               (b"not json", (SB, 1)), (b"x" * (L.ACK_MAX_B + 10), (SB, 1))]
+        r.pool.acks.extend(bad)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            r.pool.reads = 0
+            farm_ws.ack_poll()
+            assert r.pool.reads == L.ACK_POLL_N                 # bounded per poll
+            farm_ws.ack_poll()
+        assert not r.pool.acks and farm_ws._acks.refused == len(bad)
+        assert out.getvalue().count("udp ack refused") == 1, out.getvalue()   # the first, then every 100th
+        assert "not link.udp_host" in out.getvalue()
+        assert not farm_ws.sandbells_connected() and farm_ws._acks.acks == 0
+
+
+@case
+def test_ack_poll_never_waits_and_a_socket_error_means_a_fresh_socket():
+    with ack_rig("udp") as r:
+        r.pool.reads = 0
+        assert farm_ws.ack_poll() == 0 and r.pool.reads == 1  # EAGAIN: stop at once
+        r.pool.acks.append(OSError(104, "ECONNRESET"))
+        n = r.pool.socks
+        assert farm_ws.ack_poll() == 0 and farm_ws._udp["sock"] is None
+        assert farm_ws.send(stroke(2)) and r.pool.socks == n + 1   # the next send makes a new one
+        farm_ws.configure_ring({"link": {"ring_send": "live"}})
+        r.pool.acks.append((ack(1), (SB, 1)))
+        assert farm_ws.ack_poll() == 0 and r.pool.acks       # not udp: not read at all
+
+
+@case
+def test_dead_link_is_no_ack_for_ack_dead_s_then_backs_off_60_300_900_capped():
+    w = L.AckWatch()
+    assert not w.due(0.0) and w.silent_s(0.0) is None        # nothing sent yet: no clock
+    w.sent(100.0)
+    w.sent(150.0)                                            # the clock starts at the first send
+    assert not w.due(100.0 + L.ACK_DEAD_S - 1) and w.due(100.0 + L.ACK_DEAD_S)
+    t = 100.0 + L.ACK_DEAD_S
+    gaps = []
+    for _ in range(5):
+        n = w.tried(t)
+        gap = w.wait_s()
+        assert not w.due(t + gap - 1) and w.due(t + gap)
+        gaps.append(gap)
+        t += gap
+    assert gaps == [60.0, 300.0, 900.0, 900.0, 900.0] and n == 5, gaps
+    w.ack(t, 9)                                              # Sandbells is back: from the start
+    assert w.tries == 0 and w.wait_s() == L.ACK_DEAD_S and w.fresh(t)
+    assert not w.due(t + L.ACK_DEAD_S - 1) and w.due(t + L.ACK_DEAD_S)
+    w.restart()                                              # Wi-Fi came back: next send restarts it
+    assert not w.due(t + 1000) and w.silent_s(t) is None
+
+
+@case
+def test_ack_settings_are_optional_defaults_in_code_and_0_never_rejoins():
+    w = L.AckWatch()
+    w.configure(None)
+    assert (w.ok_s, w.dead_s) == (L.ACK_OK_S, L.ACK_DEAD_S)
+    w.configure({"ack_ok_s": "x", "ack_dead_s": None})
+    assert (w.ok_s, w.dead_s) == (L.ACK_OK_S, L.ACK_DEAD_S)
+    w.configure({"ack_ok_s": 20, "ack_dead_s": 0})
+    w.sent(0.0)
+    assert w.ok_s == 20.0 and not w.due(1e6)
+    with ack_rig("udp"):
+        farm_ws.configure_udp({"link": {"udp_host": SB, "ack_dead_s": 90}})
+        assert farm_ws._acks.dead_s == 90.0
+        farm_ws.configure_udp({"link": {"udp_host": SB}})
+        assert farm_ws._acks.dead_s == L.ACK_DEAD_S
+
+
+@case
+def test_ack_dead_due_only_in_udp_and_counts_from_the_first_send():
+    with ack_rig("udp") as r:
+        t0 = r.clock.t
+        assert not farm_ws.ack_dead_due(t0 + L.ACK_DEAD_S - 1)
+        assert farm_ws.ack_dead_due(t0 + L.ACK_DEAD_S)
+        r.pool.acks.append((ack(1), (SB, 1)))
+        farm_ws.ack_poll(t0 + 30)
+        assert not farm_ws.ack_dead_due(t0 + L.ACK_DEAD_S) and farm_ws.ack_dead_due(t0 + 30 + L.ACK_DEAD_S)
+        farm_ws.configure_ring({"link": {"ring_send": "live"}})
+        assert not farm_ws.ack_dead_due(t0 + 1e6)
+
+
+@case
+def test_ack_check_is_a_pure_table():
+    ok = {"schema": L.ACK_SCHEMA, "boot_id": "B", "seq": 3}
+    assert L.ack_check(ok, "h", "h", "B") == (True, None)
+    assert not L.ack_check(ok, "h", None, "B")[0]
+    assert not L.ack_check(ok, "h", "h", None)[0]
+    assert not L.ack_check(dict(ok, seq=True), "h", "h", "B")[0]
+    assert not L.ack_check([], "h", "h", "B")[0]
+
+
 finish()

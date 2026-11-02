@@ -224,6 +224,12 @@ def _net_udp():
     return bool(f()) if f is not None else False
 
 
+def _ack_call(name, *a):
+    """farm_ws back-chat call; None if this farm_ws has none (stubs)."""
+    f = getattr(farm_ws, name, None)
+    return f(*a) if f is not None else None
+
+
 def _udp_last_b(doc):
     """Diag: the size of the datagram udp_send last made (the heartbeat's)."""
     return farm_ws.stats.get("udp_last_b", -1)
@@ -1004,8 +1010,11 @@ class Concentrator:
                 self.wifi_up = True
                 self.link = "wifi_only"
                 farm_ws.configure_udp(self.cfg)          # a fresh socket on the new link
+                _ack_call("ack_restart")                 # silence counts again from the next send
                 self.link_event("wifi_back", down_s=None if state.get("lost_at") is None
                                 else round(now - state["lost_at"], 1))
+                return
+            self._udp_dead_step(now, state)
             return
         if self.wifi_up:
             self.wifi_up = False
@@ -1019,6 +1028,43 @@ class Concentrator:
             state["tried_at"] = now
             if self._rejoin():
                 self.rejoins += 1
+
+    def _udp_dead_step(self, now, state):
+        """Wi-Fi says up, but Sandbells has not acked a heartbeat for
+        link.ack_dead_s (then ACK_REJOIN_BACKOFF_S): the link is dead (the
+        extender can keep a stale entry for us).  Radio off/on and rejoin,
+        only while quiet (no stroke within link.ring_quiet_s: a join holds
+        the loop), never while ringing; then a fresh UDP socket."""
+        if not _ack_call("ack_dead_due", now):
+            state["dead_held"] = False
+            return
+        silent = _ack_call("ack_silent_s", now) or 0.0
+        if not _net_rejoins():                   # ringing: MIDI first, the rejoin waits
+            if not state.get("dead_held"):
+                state["dead_held"] = True
+                emit("%.3f link dead: no ack for %d s, rejoin held until quiet" % (now, silent))
+            return
+        state["dead_held"] = False
+        attempt = _ack_call("ack_tried", now)
+        emit("%.3f link dead: no ack for %d s (wifi_ok says up), radio reset and rejoin %d"
+             % (now, silent, attempt))
+        self.link_event("link_dead", no_ack_s=int(silent), attempt=attempt)   # best effort
+        with self.guard.paused_for():
+            farm_ws.reset_radio()
+            farm_ws.connect_wifi(self.cfg, timeout=WIFI_JOIN_TIMEOUT_S)
+        if farm_ws.wifi_ok():
+            self.rejoins += 1
+            self.wifi_up = True
+            self.link = "wifi_only"
+            farm_ws.configure_udp(self.cfg)          # a fresh socket on the new link
+            self.link_event("wifi_back", after="link_dead", attempt=attempt,
+                            ip=farm_ws.wifi_ip(), next_s=_ack_call("ack_next_s"))
+        else:                                    # the ordinary lost-Wi-Fi path takes over
+            self.wifi_up = False
+            self.wifi_lost += 1
+            self.link = "no_wifi"
+            state["lost_at"] = state["tried_at"] = now
+            self.link_event("wifi_lost", count=self.wifi_lost, after="link_dead")
 
     def _rejoin(self):
         """Blocking join (paused watchdog).  True if we have an address."""
