@@ -347,6 +347,12 @@ def test_udp_never_fragments_and_without_a_host_sends_nothing():
         farm_ws.configure_udp({"link": {"udp_host": "10.42.0.50"}}, pool)
         assert not farm_ws.send({"type": "heartbeat", "pad": "x" * L.UDP_MAX_B}, keep=False)
         assert farm_ws.stats["udp_too_big"] == 1 and not pool.sent
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            farm_ws.stats["udp_too_big"] = 0
+            farm_ws.send({"type": "heartbeat", "pad": "x" * L.UDP_MAX_B}, keep=False)
+            farm_ws.send({"type": "heartbeat", "pad": "x" * L.UDP_MAX_B}, keep=False)
+        assert out.getvalue().count("udp too big, dropped") == 1, out.getvalue()
         farm_ws.configure_udp({"link": {}}, pool)
         assert not farm_ws.send(stroke(1)) and not pool.sent
 

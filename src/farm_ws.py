@@ -471,6 +471,11 @@ def udp_send(msg):
     data = msg.encode("utf-8")
     if len(data) > link_health.UDP_MAX_B:
         stats["udp_too_big"] += 1
+        n = stats["udp_too_big"]
+        if n == 1 or n % 100 == 0:           # say so: a silent drop hid the heartbeat
+            print("%.3f udp too big, dropped: %d B > %d B (%s), %d this boot" % (
+                time.monotonic(), len(data), link_health.UDP_MAX_B,
+                msg[:40], n))
         return False
     t0 = time.monotonic()
     ok = False
