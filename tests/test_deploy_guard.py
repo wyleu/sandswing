@@ -221,6 +221,73 @@ def test_unknown_argument_is_an_error():
     r.done()
 
 
+
+# --- settings.toml: only tools/board_settings.toml's keys --------------------
+TOML_WANT = "CIRCUITPY_HEAP_START_SIZE = 327680"
+BOARD_TOML = ('# board file\r\nCIRCUITPY_WIFI_SSID = "net"\r\n'
+              'CIRCUITPY_WIFI_PASSWORD = "%s"\r\nCIRCUITPY_HEAP_START_SIZE = 8192\r\n'
+              'CIRCUITPY_PYSTACK_SIZE = 4096\r\n' % SECRET)
+
+
+def board_toml(r):
+    path = os.path.join(r.dest, "settings.toml")
+    return open(path, "rb").read().decode() if os.path.isfile(path) else None
+
+
+def toml_backups(r):
+    return [b for b in r.backups() if os.path.basename(b).startswith("settings.toml-")]
+
+
+@case
+def test_deploy_sets_only_the_heap_key_in_settings_toml_and_backs_it_up():
+    r = Rig(project="sandswing", settings=SANDSWING_SETTINGS)
+    with open(os.path.join(r.dest, "settings.toml"), "wb") as f:
+        f.write(BOARD_TOML.encode())
+    p = r.deploy()
+    assert p.returncode == 0, r.out
+    assert board_toml(r) == BOARD_TOML.replace("= 8192\r\n", "= 327680\r\n"), repr(board_toml(r))
+    assert "settings.toml set: %s" % TOML_WANT in r.out, r.out
+    b = toml_backups(r)
+    assert len(b) == 1 and open(b[0], "rb").read().decode() == BOARD_TOML, b
+    assert os.stat(b[0]).st_mode & 0o777 == 0o600, oct(os.stat(b[0]).st_mode)
+    p = r.deploy()                                        # again: unchanged, no new backup
+    assert p.returncode == 0 and "settings.toml unchanged: %s" % TOML_WANT in r.out, r.out
+    assert len(toml_backups(r)) == 1
+    r.done()
+
+
+@case
+def test_deploy_adds_settings_toml_when_the_board_has_none_and_no_toml_skips():
+    r = Rig(project="sandswing", settings=SANDSWING_SETTINGS)
+    p = r.deploy("--no-toml")
+    assert p.returncode == 0 and board_toml(r) is None and "settings.toml" not in r.out, r.out
+    p = r.deploy()
+    assert p.returncode == 0 and board_toml(r) == TOML_WANT + "\n", repr(board_toml(r))
+    assert "settings.toml added: %s" % TOML_WANT in r.out and not toml_backups(r), r.out
+    r.done()
+
+
+@case
+def test_refused_deploy_never_touches_settings_toml():
+    r = Rig(project="sandtest", settings=SANDTEST_SETTINGS)
+    with open(os.path.join(r.dest, "settings.toml"), "wb") as f:
+        f.write(BOARD_TOML.encode())
+    p = r.deploy()
+    assert p.returncode == EXIT_REFUSED and board_toml(r) == BOARD_TOML, r.out
+    r.done()
+
+
+@case
+def test_settings_toml_merge_keeps_other_lines_and_one_copy_of_the_key():
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import settings_toml as T
+    keys = T.wanted(open(os.path.join(ROOT, "tools", "board_settings.toml")).read())
+    assert keys == [("CIRCUITPY_HEAP_START_SIZE", TOML_WANT)], keys
+    text, rep = T.merge('A = 1\nCIRCUITPY_HEAP_START_SIZE = 1\n# x\nCIRCUITPY_HEAP_START_SIZE = 2', keys)
+    assert text == "A = 1\n%s\n# x\n" % TOML_WANT and rep == [("CIRCUITPY_HEAP_START_SIZE", "set")], repr(text)
+    text, rep = T.merge('A = 1', keys)                    # no newline at the end
+    assert text == "A = 1\n%s\n" % TOML_WANT and rep[0][1] == "added", repr(text)
+
 n_fail = results.count(False)
 print("\n%d passed, %d failed" % (len(results) - n_fail, n_fail))
 sys.exit(1 if n_fail else 0)

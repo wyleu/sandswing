@@ -1,0 +1,15 @@
+# Keys tools/deploy.sh sets in the board's settings.toml (CircuitPython's
+# environment file, read at each VM start; separate from settings.json).
+# Only these keys are written; every other line on the board (Wi-Fi etc.)
+# is left as it is.  deploy.sh --no-toml skips this.  See docs/link-health.md
+# "The fix that works: give the VM heap its size at start".
+#
+# 320 kB: the VM heap's first area, one fixed block that is never freed, so
+# the heap need not grow in steps into the port heap lwIP and CYW43 share
+# (hardware: 8 -> ... -> 256 kB doubling, then 401 kB, then udp ENOMEM).
+# It must fit in one free block at VM start: in CircuitPython 10.0.3
+# main.c _allocate_memory falls back to 8 kB if it does not, but keeps the
+# asked-for size for gc_init, so never raise this past what the board had
+# (the VM heap reached 401 kB, in pieces, on hardware).  "HEAP GREW" after
+# boot means the program still needs more than this.
+CIRCUITPY_HEAP_START_SIZE = 327680

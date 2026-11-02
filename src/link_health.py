@@ -806,6 +806,7 @@ def udp_heartbeat(doc, max_b=UDP_MAX_B, dumps=dumps_compact):
 UDP_DROP_LOG_EVERY = 100            # a failed sendto is printed the first time and every this many
 HB_DIAG_N = 3                       # heartbeats (and closed-gate loops) logged after boot
 UDP_STATS_S = 60.0                  # "udp stats" line this often (from heartbeat_task)
+UDP_ENOMEM_GC_S = 10.0              # udp sendto ENOMEM: at most one gc.collect + retry per this many s
 
 
 class HeartbeatDiag:

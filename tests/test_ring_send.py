@@ -940,4 +940,108 @@ def test_ack_check_is_a_pure_table():
     assert not L.ack_check([], "h", "h", "B")[0]
 
 
+
+# --- the VM heap in udp: lwIP's RAM -----------------------------------------
+class FlakyPool(Pool):
+    """sendto raises OSError(errno) for the first n calls, then works."""
+    def __init__(self, errno, n):
+        Pool.__init__(self)
+        self.errno, self.left = errno, n
+
+    def socket(self, fam, typ):
+        s = Pool.socket(self, fam, typ)
+        pool, real = self, s.sendto
+
+        def sendto(data, dest):
+            if pool.left > 0:
+                pool.left -= 1
+                raise OSError(pool.errno, "ENOMEM")
+            return real(data, dest)
+        s.sendto = sendto
+        return s
+
+
+def logged(fn):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        got = fn()
+    return got, out.getvalue()
+
+
+@case
+def test_udp_enomem_when_quiet_collects_once_and_retries_once_on_the_same_socket():
+    with rig("udp") as r:
+        pool = FlakyPool(farm_ws.ENOMEM, 1)
+        farm_ws.configure_udp({"link": {"udp_host": "10.42.0.50"}}, pool)
+        assert not farm_ws.net_ringing()
+        ok, out = logged(lambda: farm_ws.send(hb_doc(1), keep=False))
+        assert ok and len(pool.sent) == 1 and pool.socks == 1, (ok, pool.sent, out)
+        assert "udp sendto ENOMEM: heap collected (" in out and "retrying once, 1 this boot" in out, out
+        assert farm_ws.stats["udp_enomem"] == 1 and farm_ws.stats["udp_enomem_retry_ok"] == 1
+        assert farm_ws.stats["udp_sent"] == 1 and farm_ws.stats["udp_dropped"] == 0
+        pool.left = 2                                      # bounded: no second collect within UDP_ENOMEM_GC_S
+        r.clock.t += L.UDP_ENOMEM_GC_S - 1
+        ok, out = logged(lambda: farm_ws.send(hb_doc(2), keep=False))
+        assert not ok and "heap collected" not in out and "udp sendto dropped" in out, out
+        assert farm_ws.stats["udp_enomem"] == 2 and farm_ws.stats["udp_dropped"] == 1
+        r.clock.t += L.UDP_ENOMEM_GC_S + 1                 # later: one collect, and the retry fails too
+        pool.left = 2
+        ok, out = logged(lambda: farm_ws.send(hb_doc(3), keep=False))
+        assert not ok and out.count("heap collected") == 1, out
+        assert pool.left == 0                              # exactly two sendto calls: one retry, never a loop
+        assert farm_ws.stats["udp_enomem_retry_ok"] == 1 and farm_ws.stats["udp_dropped"] == 2
+
+
+@case
+def test_udp_enomem_while_ringing_never_collects_it_just_drops():
+    with rig("udp"):
+        pool = FlakyPool(farm_ws.ENOMEM, 1)
+        farm_ws.configure_udp({"link": {"udp_host": "10.42.0.50"}}, pool)
+        ok, out = logged(lambda: farm_ws.send(stroke(1)))
+        assert farm_ws.net_ringing()
+        assert not ok and "heap collected" not in out, out
+        assert farm_ws.stats["udp_enomem"] == 1 and farm_ws.stats["udp_dropped"] == 1
+        assert farm_ws.send(stroke(2))                     # the next one goes, on a fresh socket
+
+
+@case
+def test_udp_other_oserror_is_not_retried():
+    with rig("udp"):
+        pool = FlakyPool(113, 1)                           # EHOSTUNREACH: not lwIP RAM
+        farm_ws.configure_udp({"link": {"udp_host": "10.42.0.50"}}, pool)
+        ok, out = logged(lambda: farm_ws.send(hb_doc(1), keep=False))
+        assert not ok and "heap collected" not in out and farm_ws.stats["udp_enomem"] == 0, out
+
+
+@case
+def test_udp_keeps_no_replay_buffer_and_never_says_unconfirmed():
+    with rig("udp"):
+        pool = Pool()
+        farm_ws.configure_udp({"link": {"udp_host": "10.42.0.50"}}, pool)
+        farm_ws._strokes.append((99, "{}"))                # left from a tcp tier earlier this boot
+        farm_ws._recent.append("{}")
+        _, out = logged(lambda: [farm_ws.send(stroke(q + 1)) for q in range(farm_ws.STROKE_KEEP + 5)])
+        assert len(pool.sent) == farm_ws.STROKE_KEEP + 5
+        assert not farm_ws._strokes and not farm_ws._recent and not farm_ws.undelivered_strokes()
+        assert "UNCONFIRMED" not in out, out
+        assert farm_ws.stats["strokes_kept"] == 0 and farm_ws.stats["replay_freed"] == 2
+        assert farm_ws.net_ringing()                       # still counted as ringing (rejoin waits)
+
+
+@case
+def test_tcp_tiers_still_keep_the_replay_buffer():
+    with rig("live"):
+        for q in (1, 2):
+            farm_ws.send(stroke(q))
+        assert [q for q, _ in farm_ws._strokes] == [1, 2] and len(farm_ws._recent) == 2
+
+
+@case
+def test_link_brief_is_just_the_asked_counters():
+    with rig("udp"):
+        farm_ws.stats["drops"] = 3
+        assert farm_ws.link_brief(L.HB_UDP_NET) == {"drops": 3, "last_drop_reason": None}
+        assert farm_ws.link_brief(("nope",)) == {"nope": None}
+
+
 finish()

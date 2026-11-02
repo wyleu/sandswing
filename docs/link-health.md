@@ -858,6 +858,36 @@ ring, plus a margin; it must still leave lwIP tens of kB, so read the numbers
 first.  Too small is harmless (it grows as now); too large leaves lwIP less.
 Takes effect at the next start of the VM (power cycle or reload).
 
+**Deployed** (2026-11-02): `tools/deploy.sh` sets the keys in
+`tools/board_settings.toml` (now `CIRCUITPY_HEAP_START_SIZE = 327680`, 320 kB)
+in the board's settings.toml, changing only that line (other keys, Wi-Fi
+included, kept and never printed; the old file is backed up to
+`~/pico-settings/`).  `--no-toml` skips it.
+
+Why 320 kB, and its limits (from the 2026-11-02 log and the 10.0.3 source):
+
+- The heap grew 8 -> 16 -> 32 -> 64 -> 128 -> 256 kB by doubling, then took
+  what was left (to 401 kB), then kept growing by fragments ("HEAP GREW 401 ->
+  401"), each one a piece of RAM lwIP needed: `udp sendto dropped: OSError:
+  [Errno 12] ENOMEM`, then no ping (receiving needs pbufs from the same heap).
+  So the program needed more than 256 kB at some point.
+- Growth past the start area adds `MIN(largest free block, MAX(heap total,
+  need))` (`py/gc.c gc_try_add_heap`): any growth past 320 kB takes nearly all
+  of lwIP's RAM again.  "HEAP GREW" after boot means 320 kB is not enough.
+- Too large is NOT harmless: `main.c _allocate_memory` falls back to the 8 kB
+  default when the asked size does not fit, but leaves `*final_size` at the
+  asked size, which `gc_init` then uses (read from the source; not tried).
+  Never set it past what the board can give in one block (the heap reached
+  401 kB, in pieces).
+- `CIRCUITPY_PYSTACK_SIZE` (default 2048) is the Python call stack; it has
+  nothing to do with this.
+
+In "udp" the code also holds less: no stroke replay buffer (nothing is
+confirmed or replayed there), the heartbeat's `net` is only the two counters
+the slim heartbeat sends (`farm_ws.link_brief`, not a 60-key copy every 5 s),
+`udp_send` on ENOMEM collects once and retries once (only when quiet, at most
+every `UDP_ENOMEM_GC_S`), and a dead-link rejoin collects first.
+
 Longer term: a CircuitPython build that gives up on ERR_MEM for a
 non-blocking socket (EAGAIN) and returns an error after the last retry,
 or reserves lwIP its own pool (`MEMP_MEM_MALLOC 0`, real `MEM_SIZE`).

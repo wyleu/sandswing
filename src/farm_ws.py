@@ -74,6 +74,10 @@ try:
 except ImportError:                     # pragma: no cover
     EAGAIN = 11
     ETIMEDOUT = 110
+try:
+    from errno import ENOMEM              # lwIP's pbuf_alloc failed: the port heap is full
+except ImportError:                     # pragma: no cover
+    ENOMEM = 12
 
 # a /status socket that is already gone when its next chunk is written: the
 # poller hung up (ECONNRESET / EPIPE / ENOTCONN / ECONNABORTED) or the socket
@@ -169,7 +173,8 @@ stats = {"connects": 0, "drops": 0, "refused": 0, "send_timeouts": 0,
          "strokes_replayed": 0, "acks": 0,
          "batches": 0, "batched_frames": 0,
          "udp_sent": 0, "udp_dropped": 0, "udp_slow": 0, "udp_max_ms": 0, "udp_too_big": 0,
-         "udp_last_b": 0, "udp_hb_trimmed": 0,
+         "udp_last_b": 0, "udp_hb_trimmed": 0, "udp_enomem": 0, "udp_enomem_retry_ok": 0,
+         "replay_freed": 0,
          "last_drop_reason": None, "last_drop_at": None,
          "hb_seen": False, "last_rx_at": None}
 
@@ -531,6 +536,34 @@ def _udp_sock():
     return _udp["sock"]
 
 
+_enomem_gc_at = [None]            # monotonic time of the last ENOMEM collect
+
+
+def _enomem_retry(err, now):
+    """sendto failed: was it lwIP out of RAM (pbuf_alloc -> ENOMEM), and
+    may we collect and try once more?  Bounded: one gc.collect, never while
+    ringing (a collect holds the loop), at most once per UDP_ENOMEM_GC_S.
+    A collect only gives lwIP RAM back if a whole added heap area empties;
+    it is a cheap try, not the fix (that is CIRCUITPY_HEAP_START_SIZE)."""
+    if (err.args[0] if err.args else None) != ENOMEM:
+        return False
+    stats["udp_enomem"] += 1
+    last = _enomem_gc_at[0]
+    if _net.ringing() or (last is not None and now - last < link_health.UDP_ENOMEM_GC_S):
+        return False
+    _enomem_gc_at[0] = now
+    free = None
+    try:
+        import gc
+        gc.collect()
+        free = gc.mem_free()
+    except (ImportError, AttributeError):    # pragma: no cover
+        pass
+    print("%.3f udp sendto ENOMEM: heap collected (%s B VM free), retrying once, %d this boot"
+          % (time.monotonic(), free, stats["udp_enomem"]))
+    return _udp["sock"] is not None
+
+
 def udp_send(msg):
     """One datagram, fire and forget: True if handed to lwIP.  Never waits
     (lwip_raw_udp_send has no retry loop); any error is a drop, counted,
@@ -552,7 +585,13 @@ def udp_send(msg):
     ok = False
     why = None
     try:
-        n_out = _udp_sock().sendto(data, _udp["dest"])
+        try:
+            n_out = _udp_sock().sendto(data, _udp["dest"])
+        except OSError as e:
+            if not _enomem_retry(e, t0):
+                raise
+            n_out = _udp["sock"].sendto(data, _udp["dest"])   # once: a second failure is a drop
+            stats["udp_enomem_retry_ok"] += 1
         ok = n_out == len(data)
         if not ok:
             why = "sent %r of %d B" % (n_out, len(data))
@@ -635,6 +674,17 @@ def _keep_stroke(seq, msg):
             stats["strokes_dropped_unconfirmed"] += 1
             print("%.3f STROKE seq %d left the replay buffer UNCONFIRMED (link.stroke_keep %d)"
                   % (time.monotonic(), old, STROKE_KEEP))
+
+
+def _drop_replay():
+    """The "udp" tier: nothing is ever confirmed or replayed there (no /ws
+    client), so the replay buffers only held heap (STROKE_KEEP strokes,
+    about 350 B each) and logged every stroke UNCONFIRMED.  Empty them."""
+    if _strokes or _recent or _confirmed:
+        stats["replay_freed"] += len(_strokes) + len(_recent)
+        del _strokes[:]
+        del _recent[:]
+        _confirmed.clear()
 
 
 def _confirm(seqs):
@@ -2002,14 +2052,19 @@ def send(obj, keep=True, udp_fit=None):
     msg = json.dumps(obj)
     if isinstance(obj, dict) and obj.get("boot_id"):
         _event_boot[0] = obj.get("boot_id")      # this boot (acks and commands must name it)
+    udp = _net.udp()
     if keep:
-        _recent.append(msg)
-        del _recent[:-REPLAY_N]
+        if udp:
+            _drop_replay()                       # udp never confirms or replays: keep nothing
+        else:
+            _recent.append(msg)
+            del _recent[:-REPLAY_N]
         if isinstance(obj, dict) and obj.get("type") == "stroke" and obj.get("seq") is not None:
             _event_boot[0] = obj.get("boot_id")
-            _keep_stroke(int(obj["seq"]), msg)
+            if not udp:
+                _keep_stroke(int(obj["seq"]), msg)
             _net_stroke(time.monotonic())        # may shed the network: before any write
-    if _net.udp():
+    if udp:
         return udp_send(msg)                     # tier 3: one datagram, no TCP, no wait
     if not _clients:
         return False
@@ -2138,6 +2193,12 @@ def _by_state():
     return out
 
 
+def link_brief(keys):
+    """Just these link counters (the "udp" heartbeat's net): no copy of
+    the whole stats dict (about 60 keys, rebuilt every heartbeat)."""
+    return {k: stats.get(k) for k in keys}
+
+
 def link_status():
     """For /status and the heartbeat: counters plus the last drop."""
     now = time.monotonic()
@@ -2183,6 +2244,7 @@ def reset_state():
     _udp["hosts"], _udp["port"] = [], None
     _acks.reset()
     _acks.configure(None)
+    _enomem_gc_at[0] = None
     _cmd.update(sock=None, last_seq=None, pending=None, accepted=0, refused=0,
                 last_why=None, radio_off=False)
     _doc.reset()

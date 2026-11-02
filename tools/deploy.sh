@@ -1,6 +1,8 @@
 #!/bin/bash
 # Stamp CIRCUITPY from ../src/. Does not nuke. lib/ only with --lib.
 # Optional --settings copies settings.json as well.
+# settings.toml: only the keys in tools/board_settings.toml are set (the VM
+# heap's start size); the rest of the board's file is kept.  --no-toml skips.
 #
 # Before copying anything, tools/board_guard.py checks that the board really
 # is a sandswing Pico (build_info.py PROJECT, settings.json shape, optional
@@ -17,6 +19,7 @@ LABEL="${PICO_LABEL:-CIRCUITPY}"
 PROJECT="sandswing"
 WITH_LIB=0
 WITH_SETTINGS=0
+WITH_TOML=1
 DEST=""
 GUARD_ARGS=()
 
@@ -24,6 +27,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --lib) WITH_LIB=1 ;;
     --settings) WITH_SETTINGS=1 ;;
+    --no-toml) WITH_TOML=0 ;;
     --force|--first-install) GUARD_ARGS+=("$1") ;;
     --dest)
       if [[ $# -lt 2 ]]; then
@@ -34,7 +38,7 @@ while [[ $# -gt 0 ]]; do
       shift ;;
     -*)
       echo "unknown argument: $1" >&2
-      echo "usage: tools/deploy.sh [--settings] [--lib] [--first-install] [--force] [--dest DIR]" >&2
+      echo "usage: tools/deploy.sh [--settings] [--lib] [--no-toml] [--first-install] [--force] [--dest DIR]" >&2
       exit 2 ;;
     *) DEST="$1" ;;              # tools/deploy.sh /media/$USER/CIRCUITPY, like sandtest
   esac
@@ -98,6 +102,11 @@ fi
 
 # wrong-board guard + settings backup; nothing has been copied yet
 python3 "$ROOT/tools/board_guard.py" --project "$PROJECT" --dest "$MP" ${GUARD_ARGS[@]+"${GUARD_ARGS[@]}"}
+
+if [[ "$WITH_TOML" -eq 1 ]]; then
+  # before the code: the auto-reload the copy causes is a VM start, which reads it
+  python3 "$ROOT/tools/settings_toml.py" "$ROOT/tools/board_settings.toml" "$MP"
+fi
 
 echo "stamp $SRC -> $MP (${DEV:-$MP}) $HASH"
 for f in "${FILES[@]}" build_info.py; do

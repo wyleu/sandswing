@@ -95,7 +95,7 @@ from mux_errors import ChannelBusy
 from laser_measure import counts_to_ma
 from adc_avg import avg as _avg
 from link_health import LinkHealth, PICO_RESET_S, STALL_WINDOW_S, RESET_HOLD_S, reset_decision
-from link_health import HeartbeatDiag, udp_heartbeat
+from link_health import HeartbeatDiag, udp_heartbeat, HB_UDP_NET
 from sense_keys import SenseKeys, settings as sense_settings, late_drain_ms
 import heap_watch                 # VM heap size: it grows into the RAM lwIP needs
 
@@ -222,6 +222,19 @@ def _net_off():
 def _net_udp():
     f = getattr(farm_ws, "net_udp", None)
     return bool(f()) if f is not None else False
+
+
+def _collect_brief():
+    """gc.collect() now (quiet: the rejoin only runs when not ringing), so
+    garbage is gone before the rejoin's DHCP / ARP need lwIP RAM; the VM
+    heap's size after, for the log line."""
+    try:
+        import gc
+        gc.collect()
+        total, free = heap_watch.sample()
+        return "%d kB VM free, VM heap %d kB" % (free // 1024, total // 1024)
+    except (ImportError, AttributeError):
+        return "no gc"
 
 
 def _ack_call(name, *a):
@@ -929,6 +942,15 @@ class Concentrator:
                   "gw_fail": self._gw_fail, "gw_ms": self._gw_ms})
         return d
 
+    def _hb_net(self):
+        """The heartbeat's "net": the slim UDP heartbeat keeps only
+        HB_UDP_NET, so in udp build just that (link_status copies about 60
+        counters every 5 s, heap churn the port heap pays for)."""
+        brief = getattr(farm_ws, "link_brief", None)
+        if brief is not None and _net_udp():
+            return brief(HB_UDP_NET)
+        return self.link_status()
+
     def _mimic(self):
         """The panel as it looks in its ON phase (a heartbeat sampled in
         the dark half of a blink would read as black)."""
@@ -947,7 +969,7 @@ class Concentrator:
         body.update({
             "link": self.link,
             "tower": self.tower.tower,
-            "net": self.link_status(),
+            "net": self._hb_net(),
             "wifi": {"ip": farm_ws.wifi_ip() if hasattr(farm_ws, "wifi_ip") else None,
                      "rssi": farm_ws.wifi_rssi() if hasattr(farm_ws, "wifi_rssi") else None},
             "sync": sn.state() if sn is not None else "unsynced",
@@ -1049,6 +1071,7 @@ class Concentrator:
         emit("%.3f link dead: no ack for %d s (wifi_ok says up), radio reset and rejoin %d"
              % (now, silent, attempt))
         self.link_event("link_dead", no_ack_s=int(silent), attempt=attempt)   # best effort
+        emit("%.3f rejoin: heap collected first, %s" % (now, _collect_brief()))
         with self.guard.paused_for():
             farm_ws.reset_radio()
             farm_ws.connect_wifi(self.cfg, timeout=WIFI_JOIN_TIMEOUT_S)

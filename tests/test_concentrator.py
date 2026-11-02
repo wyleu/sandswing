@@ -398,6 +398,13 @@ def udp_dead(app):
     farm_ws.connect_wifi = connect
     farm_ws.configure_udp = lambda cfg, pool=None: calls.append(("configure_udp",))
     farm_ws.sandbells_connected = lambda: st["acked"]
+    res["collect_real"] = concentrator._collect_brief()
+    concentrator._collect_brief = lambda: calls.append(("collect",)) or "0 kB VM free, VM heap 0 kB"
+    farm_ws.link_brief = lambda keys: {"brief": list(keys)}
+    res["hb_net_udp"] = app.heartbeat_doc()["body"]["net"]
+    farm_ws.net_udp = lambda: False
+    res["hb_net_tcp"] = sorted(app.heartbeat_doc()["body"]["net"])
+    farm_ws.net_udp = lambda: True
     concentrator.send = lambda obj, keep=True, **kw: events.append(
         (obj["body"]["what"], obj["body"].get("after")) if obj.get("type") == "link" else None)
     concentrator.emit = lines.append
@@ -414,7 +421,8 @@ def udp_dead(app):
     st["quiet"] = True                                # quiet: one rejoin
     app.link_step(108.0, state)
     res["rejoin"] = [list(calls), list(events), app.rejoins - rejoins0, app.link, app.wifi_up,
-                     [l for l in lines if "link dead" in l][-1]]
+                     [l for l in lines if "link dead" in l][-1],
+                     [l for l in lines if "rejoin: heap collected first" in l]]
     del calls[:], events[:]
     st["dead"], st["after_join"] = True, False        # next one fails to join
     app.link_step(500.0, state)
@@ -875,12 +883,21 @@ def main():
           rg[0] == [] and rg[1] == [] and len(rg[2]) == 1 and "rejoin held until quiet" in rg[2][0], rg)
     rj = D.get("rejoin") or []
     check("udp: quiet -> radio reset, join, fresh UDP socket, link_dead + wifi_back events",
-          rj[:5] == [[["reset_radio"], ["connect", 10], ["configure_udp"]],
+          rj[:5] == [[["collect"], ["reset_radio"], ["connect", 10], ["configure_udp"]],
                      [["link_dead", None], ["wifi_back", "link_dead"]], 1, "wifi_only", True]
           and "no ack for 61 s" in rj[5] and "rejoin 1" in rj[5], rj)
+    check("udp: heap collected (one line) before the radio reset of a dead-link rejoin",
+          len(rj) > 6 and len(rj[6]) == 1 and rj[6][0].endswith(
+              "rejoin: heap collected first, 0 kB VM free, VM heap 0 kB")
+          and isinstance(D.get("collect_real"), str) and "VM heap" in D.get("collect_real", ""),
+          [rj[6:], D.get("collect_real")])
+    check("udp: heartbeat net is link_brief(HB_UDP_NET), not the whole link_status",
+          D.get("hb_net_udp") == {"brief": ["drops", "last_drop_reason"]}
+          and "wifi_up" in (D.get("hb_net_tcp") or []),
+          [D.get("hb_net_udp"), D.get("hb_net_tcp")])
     fl = D.get("failed") or []
     check("udp: a dead-link join that fails -> wifi_lost, ordinary rejoin path",
-          fl[:4] == [[["reset_radio"], ["connect", 10]],
+          fl[:4] == [[["collect"], ["reset_radio"], ["connect", 10]],
                      [["link_dead", None], ["wifi_lost", "link_dead"]], "no_wifi", False]
           and fl[4] == 500.0, fl)
     check("udp: link LED green (ws_client) while acked, blue (wifi_only) when not",
