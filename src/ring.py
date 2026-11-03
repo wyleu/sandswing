@@ -15,6 +15,11 @@ octave, so these note numbers are sent as they stand.
     bell 1..8: 65, 64, 62, 60, 58, 57, 55, 53
     channel 1 (adafruit out_channel 0)
 
+Each stroke's NoteOn (a head trip here, a trigger press through note()) is
+followed at once by one SysEx with the stroke's own keypad stamp
+(midi_stamp.py; settings.json midi.stamp_sysex, default on).  A synth
+ignores it; Sandbells ingest_midi times the stroke by it.
+
 Does not sweep the orange threshold wire. Does not paint pixels: tripped()
 feeds panel.panel_frame via concentrator.
 """
@@ -37,6 +42,16 @@ def _ticks_ms():
     return time.monotonic_ns() // NS_PER_MS
 
 
+def midi_port():
+    """The usb_midi out port open_midi sends on (the stamps' port), or None."""
+    try:
+        import usb_midi
+    except ImportError:
+        return None
+    ports = usb_midi.ports
+    return ports[1] if len(ports) > 1 else (ports[0] if ports else None)
+
+
 def open_midi():
     """USB MIDI out, or None (no port / library missing)."""
     try:
@@ -45,8 +60,7 @@ def open_midi():
     except ImportError:
         print("USB MIDI: not available")
         return None
-    ports = usb_midi.ports
-    out = ports[1] if len(ports) > 1 else (ports[0] if ports else None)
+    out = midi_port()
     if out is None:
         print("USB MIDI: no port")
         return None
@@ -62,7 +76,7 @@ def _note_msg(note, on):
 
 class Ring:
     def __init__(self, inputs, lasers, midi=None, notes=NOTES, send_fn=None,
-                 clock_ms=None, min_gap_ms=MIN_STROKE_GAP_MS):
+                 clock_ms=None, min_gap_ms=MIN_STROKE_GAP_MS, stamp=None):
         self.inputs = inputs
         self.lasers = lasers
         self.midi = midi
@@ -78,6 +92,8 @@ class Ring:
         self.min_gap_ms = min_gap_ms
         self.on_at = [None] * self.n            # ms of the last counted stroke
         self.running = False
+        # midi_stamp.MidiStamp (or None): its SysEx follows each stroke's NoteOn
+        self.stamp = stamp
 
     def start(self, kinds, duty=None):
         """kinds: {ch: kind} from the survey.  Lasers on for heads only,
@@ -95,12 +111,16 @@ class Ring:
         self.running = True
         print("%.3f RINGING" % time.monotonic(), [(c + 1, k, self.notes[c]) for c, k in sorted(self.heads.items())])
 
-    def _send(self, ch, on):
+    def _send(self, ch, on, t_ms=None):
+        """Note on/off.  An on is a stroke: its stamp SysEx goes right after
+        the NoteOn (t_ms: the stroke's edge stamp; None = now)."""
         note = self.notes[ch]
         if self._send_fn is not None:
             self._send_fn(ch, note, on)
         elif self.midi is not None:
             self.midi.send(_note_msg(note, on))
+        if on and self.stamp is not None:
+            self.stamp.stroke(ch + 1, self.clock_ms() if t_ms is None else t_ms)
         print("%.3f ch %d %s %d%s" % (time.monotonic(), ch + 1, "ON" if on else "OFF", note,
                                        "" if (self.midi or self._send_fn) else " (no midi)"))
 
@@ -120,7 +140,7 @@ class Ring:
             self.on_at[ch] = now
             self.sounding[ch] = True
             self.strokes[ch] += 1
-            self._send(ch, True)
+            self._send(ch, True, now)
         elif (not trip) and self.sounding[ch]:
             self.sounding[ch] = False
             self._send(ch, False)
@@ -129,11 +149,18 @@ class Ring:
     def tripped(self):
         return set(ch for ch in self.heads if self.sounding[ch])
 
-    def note(self, ch, on):
+    def note(self, ch, on, t_ms=None):
         """Send ch's bell note on or off outside the laser-head logic: a
-        trigger plug press plays the same note its channel's bell would."""
+        trigger plug press plays the same note its channel's bell would.
+        t_ms: the press's edge stamp, for the NoteOn's stamp SysEx."""
         if 0 <= ch < self.n:
-            self._send(ch, on)
+            self._send(ch, on, t_ms)
+
+    def clock(self):
+        """Sense loop, after the edges: a stamp clock message when none has
+        gone for a while (midi_stamp.MidiStamp.clock).  Cheap when not due."""
+        if self.stamp is not None:
+            self.stamp.clock()
 
     def stop(self):
         """Notes off, lasers off (before a rescan or at exit)."""
@@ -145,9 +172,12 @@ class Ring:
         self.running = False
 
     def status(self):
-        return {"running": self.running,
-                "heads": dict((c + 1, k) for c, k in self.heads.items()),
-                "strokes": list(self.strokes), "sounding": sorted(self.tripped())}
+        st = {"running": self.running,
+              "heads": dict((c + 1, k) for c, k in self.heads.items()),
+              "strokes": list(self.strokes), "sounding": sorted(self.tripped())}
+        if self.stamp is not None:
+            st["stamp"] = self.stamp.status()
+        return st
 
 
 if __name__ == "__main__" or __name__ == "<module>":

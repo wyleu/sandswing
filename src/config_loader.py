@@ -109,6 +109,12 @@ DEFAULTS = {
         "batch_ms": 1000,           # link_health.BATCH_PERIOD_S
         "ring_quiet_s": 120,        # link_health.RING_QUIET_S
     },
+    # USB MIDI stamps (midi_stamp.py): a SysEx with the keypad stamp after
+    # each stroke's NoteOn, and a clock message when quiet (0: none)
+    "midi": {
+        "stamp_sysex": True,
+        "clock_s": 10,
+    },
     "ir": {},
     "detection": {},
     "hardware": {},

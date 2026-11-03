@@ -114,6 +114,7 @@ def midi_first(app, fh):
     order = []
     concentrator.send = lambda obj, keep=True: order.append(["net", obj.get("type")])
     app.ring._send_fn = lambda ch, note, on: order.append(["midi", on])
+    app.ring.stamp = StampLog(order, app.ticks.now)
     app.ring.heads = {0: "head_new"}
     app.ring.rest_held[0] = app.ring.prev_held[0] = False
     app.ring.running = True
@@ -468,6 +469,17 @@ def plug_trigger(fh, pressed, to_ground=False):
     fh.din_fn[0] = bw
 
 
+def StampLog(log, clock_ms):
+    """A midi_stamp.MidiStamp whose port appends ["sysex", [seq, ch, t]] to
+    log (the same list the notes go to: the order is checked).  No clocks."""
+    import midi_stamp
+
+    class Port:
+        def write(self, buf):
+            log.append(["sysex", list(midi_stamp.decode(bytes(buf)))])
+    return midi_stamp.MidiStamp(Port(), clock_ms, 0)
+
+
 def trigger(app, fh, pressed):
     """Trigger plug on ch1: classified 'trigger', a press is one labelled
     stroke on the normal path, bounce is ignored, presses never resurvey."""
@@ -481,6 +493,7 @@ def trigger(app, fh, pressed):
     concentrator.send = lambda obj, keep=True: sent.append(obj)
     notes = []
     app.ring._send_fn = lambda ch, note, on: notes.append((ch, note, on))
+    app.ring.stamp = StampLog(notes, app.ticks.now)
     app.sntp = SessionSntp()
     app.tower.tower = "inactive"
 
@@ -511,7 +524,8 @@ def trigger(app, fh, pressed):
     res["doubt"] = app.survey_state.status()["doubt"]
     res["strokes"] = [e["body"] for e in sent if e.get("type") == "stroke"]
     res["types"] = sorted(set(e.get("type") for e in sent))
-    res["notes"] = list(notes)
+    res["notes"] = [n for n in notes if n[0] != "sysex"]
+    res["note_stamps"] = list(notes)
     # held for ages with the tower quiet: one resurvey request
     app.tower.tower = "inactive"
     sample(True, 20)
@@ -743,6 +757,12 @@ def main():
     check("midi first: each head stroke's NoteOn goes out before its network send",
           order == [["midi", True], ["net", "stroke"], ["midi", False]] * 2,
           r.get("exc") or order)
+    order = [o for o in (r.get("order") or []) if o[0] in ("midi", "sysex") or o[1] == "stroke"]
+    check("midi stamp: each head NoteOn is followed at once by its SysEx (seq, ch 1, "
+          "the edge's keypad stamp), then the network send",
+          order == [["midi", True], ["sysex", [1, 1, 1002000]], ["net", "stroke"], ["midi", False],
+                    ["midi", True], ["sysex", [2, 1, 1004000]], ["net", "stroke"], ["midi", False]],
+          r.get("exc") or order)
     r = spawn(me, "stamps")
     S = r.get("stamps") or {}
     P = 1 << 29
@@ -798,6 +818,16 @@ def main():
           len(st) == 7 and all(b == {"ch": 1, "test": True, "src": "trigger"} for b in st), st)
     check("trigger: each press plays ch1's note (65) on, its release off",
           T.get("notes") == [[0, 65, True], [0, 65, False]] * 7, T.get("notes"))
+    NS = T.get("note_stamps") or []
+    check("trigger: each press NoteOn is followed by its stamp SysEx (seq 1..7, ch 1, "
+          "press 1 at its keypad stamp 5000100), stamps rising",
+          [n[0] for n in NS] == [0, "sysex", 0] * 7
+          and [n[1][0] for n in NS if n[0] == "sysex"] == list(range(1, 8))
+          and all(n[1][1] == 1 for n in NS if n[0] == "sysex")
+          and NS[1][1][2] == 5000100
+          and all(a < b for a, b in zip([n[1][2] for n in NS if n[0] == "sysex"],
+                                        [n[1][2] for n in NS if n[0] == "sysex"][1:])),
+          NS)
     check("trigger: presses never ask for a resurvey", T.get("doubt") is False, T.get("doubt"))
     check("trigger: only stroke events sent", T.get("types") == ["stroke"], T.get("types"))
     check("trigger: held > TRIGGER_STUCK_MS (tower quiet) -> one resurvey of ch1",

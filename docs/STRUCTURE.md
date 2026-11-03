@@ -59,6 +59,7 @@ concentrator.py is the root. It builds every object and injects it into the modu
 | report.py | assembles status payload from parts (+ `last_reset`) | 25 | 354 |
 | watchdog_guard.py | WatchdogGuard: hardware watchdog, OFF by default; arm/feed/pause/disarm, heartbeats, reset reason | 226 | 3017 |
 | ring.py | Ring (lasers on, rest level, MIDI, strokes; fed edges) | 128 | 1771 |
+| midi_stamp.py | MidiStamp: a SysEx with the keypad stamp after each stroke NoteOn, clock when quiet (docs/midi-stamp.md) | new | – |
 | sense_keys.py | SenseKeys: sense pins as keypad edges (own ticks_ms stamp), pins hand-over for surveys, overflow count | new | – |
 | sntp_pico.py | SNTP clock (copied as is) | 506 | 5914 |
 | pins_from_settings.py | load_pinmap only | 60 | 734 |

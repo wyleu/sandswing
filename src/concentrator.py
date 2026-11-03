@@ -81,7 +81,8 @@ from connector_boards import DEFAULT_BOARDS
 from socket_survey import SocketSurvey, survey_all
 from channel_gate import ChannelGate
 from threshold_refresh import refresher_from_cfg
-from ring import Ring, open_midi, FULL, MIN_STROKE_GAP_MS
+from ring import Ring, open_midi, midi_port, FULL, MIN_STROKE_GAP_MS
+from midi_stamp import open_stamp
 import panel
 import report
 
@@ -343,8 +344,11 @@ class Concentrator:
         self.refresher = refresher_from_cfg(self.mux, self.bells,
                                             self.pinmap["raw"].get("threshold_mux") or {},
                                             gate=self.gate)
-        self.ring = Ring(self.inputs, self.lasers, midi=open_midi(),
-                         clock_ms=self.ticks.now)
+        midi = open_midi()
+        # each stroke's NoteOn is followed by its keypad stamp (midi_stamp.py)
+        stamp = open_stamp(cfg, midi_port(), self.ticks.now) if midi is not None else None
+        self.ring = Ring(self.inputs, self.lasers, midi=midi,
+                         clock_ms=self.ticks.now, stamp=stamp)
         
         # early boot indication — before the long self-test
         self.kinds = {i: "examining" for i in range(min(4, self.n))}
@@ -562,6 +566,7 @@ class Concentrator:
                 self._channel(i, held, now, raw)
         for i in range(self.n):
             self._channel(i, self._prev_held[i], now)
+        self.ring.clock()             # MIDI stamp clock when quiet (cheap when not due)
 
     def _edge_ms(self, raw):
         """Extended tick ms of an edge: its keypad stamp (supervisor.ticks_ms,
@@ -724,7 +729,7 @@ class Concentrator:
         slow send never delays the note."""
         if stroke and not self.trig_sounding[i]:
             self.trig_sounding[i] = True
-            self.ring.note(i, True)
+            self.ring.note(i, True, self.stroke_ms[i])   # the press's own stamp
         elif (not held) and self.trig_sounding[i]:
             self.trig_sounding[i] = False
             self.ring.note(i, False)

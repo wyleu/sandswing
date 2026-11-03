@@ -44,6 +44,10 @@
     "batch_ms": 1000,
     "ring_quiet_s": 120
   },
+  "midi": {
+    "stamp_sysex": true,
+    "clock_s": 10
+  },
   "probe": {
     "present_delta": 2000,
     "lb_delta": 1000
