@@ -136,8 +136,12 @@ def test_settings_default_on_and_overrides():
     assert MS.settings({"midi": {"clock_s": 0}}) == (True, 0)
     assert MS.settings({"midi": {"clock_s": "x", "stamp_sysex": "yes"}}) == (True, 10000)
     ex = json.load(open(os.path.join(ROOT, "settings_example.json")))
-    assert ex["midi"] == {"stamp_sysex": True, "clock_s": 10}
-    assert config_loader.DEFAULTS["midi"] == ex["midi"]
+    assert set(ex["midi"]) >= {"usb", "five_pin"}
+    assert ex["midi"]["usb"]["stamp_sysex"] is True
+    assert ex["midi"]["five_pin"]["tx_pin"] == 16
+    assert config_loader.DEFAULTS["midi"] == {"stamp_sysex": True, "clock_s": 10}
+    usb_nested = {"midi": {"usb": {"stamp_sysex": False, "clock_s": 0}}}
+    assert MS.settings(usb_nested) == (False, 0)
 
 
 @case

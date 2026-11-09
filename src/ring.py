@@ -76,12 +76,14 @@ def _note_msg(note, on):
 
 class Ring:
     def __init__(self, inputs, lasers, midi=None, notes=NOTES, send_fn=None,
-                 clock_ms=None, min_gap_ms=MIN_STROKE_GAP_MS, stamp=None):
+                 clock_ms=None, min_gap_ms=MIN_STROKE_GAP_MS, stamp=None,
+                 outputs=None):
         self.inputs = inputs
         self.lasers = lasers
         self.midi = midi
         self.notes = notes
         self._send_fn = send_fn          # tests / alternative transports
+        self.outputs = list(outputs) if outputs else []
         self.n = min(len(inputs), len(lasers), len(notes))
         self.heads = {}                  # ch -> "head_new" / "head_old"
         self.rest_held = {}
@@ -114,15 +116,23 @@ class Ring:
     def _send(self, ch, on, t_ms=None):
         """Note on/off.  An on is a stroke: its stamp SysEx goes right after
         the NoteOn (t_ms: the stroke's edge stamp; None = now)."""
-        note = self.notes[ch]
-        if self._send_fn is not None:
-            self._send_fn(ch, note, on)
-        elif self.midi is not None:
-            self.midi.send(_note_msg(note, on))
-        if on and self.stamp is not None:
-            self.stamp.stroke(ch + 1, self.clock_ms() if t_ms is None else t_ms)
+        now = self.clock_ms() if t_ms is None else t_ms
+        if self.outputs:
+            for out in self.outputs:
+                out.send(ch, on, now)
+            note = self.notes[ch] if ch < len(self.notes) else (
+                self.outputs[0].notes[ch] if ch < len(self.outputs[0].notes) else 0)
+        else:
+            note = self.notes[ch]
+            if self._send_fn is not None:
+                self._send_fn(ch, note, on)
+            elif self.midi is not None:
+                self.midi.send(_note_msg(note, on))
+            if on and self.stamp is not None:
+                self.stamp.stroke(ch + 1, now)
+        has_out = self.outputs or self.midi or self._send_fn
         print("%.3f ch %d %s %d%s" % (time.monotonic(), ch + 1, "ON" if on else "OFF", note,
-                                       "" if (self.midi or self._send_fn) else " (no midi)"))
+                                       "" if has_out else " (no midi)"))
 
     def edge(self, ch, held, t_ms=None):
         """One sense edge on channel ch (held = beam state after it), at
@@ -159,7 +169,10 @@ class Ring:
     def clock(self):
         """Sense loop, after the edges: a stamp clock message when none has
         gone for a while (midi_stamp.MidiStamp.clock).  Cheap when not due."""
-        if self.stamp is not None:
+        if self.outputs:
+            for out in self.outputs:
+                out.clock()
+        elif self.stamp is not None:
             self.stamp.clock()
 
     def stop(self):
@@ -175,7 +188,11 @@ class Ring:
         st = {"running": self.running,
               "heads": dict((c + 1, k) for c, k in self.heads.items()),
               "strokes": list(self.strokes), "sounding": sorted(self.tripped())}
-        if self.stamp is not None:
+        if self.outputs:
+            st["midi"] = dict(
+                (out.name, out.stamp.status() if out.stamp is not None else {})
+                for out in self.outputs)
+        elif self.stamp is not None:
             st["stamp"] = self.stamp.status()
         return st
 

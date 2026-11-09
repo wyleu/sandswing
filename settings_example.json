@@ -45,8 +45,21 @@
     "ring_quiet_s": 120
   },
   "midi": {
-    "stamp_sysex": true,
-    "clock_s": 10
+    "usb": {
+      "enabled": true,
+      "channel": 1,
+      "notes": [65, 64, 62, 60, 58, 57, 55, 53],
+      "stamp_sysex": true,
+      "clock_s": 10
+    },
+    "five_pin": {
+      "enabled": false,
+      "tx_pin": 16,
+      "channel": 1,
+      "notes": [65, 64, 62, 60, 58, 57, 55, 53],
+      "stamp_sysex": true,
+      "clock_s": 10
+    }
   },
   "probe": {
     "present_delta": 2000,

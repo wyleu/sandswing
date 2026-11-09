@@ -74,10 +74,8 @@ CLOCK_S_DEFAULT = 10
 MS_PER_S = 1000
 
 
-def settings(cfg):
-    """(stamp_sysex, clock_ms) from cfg "midi", else the defaults.
-    cfg: a config_loader.Config, a plain dict or None."""
-    sec = cfg.get("midi", {}) if cfg is not None else {}
+def settings_from_section(sec):
+    """(stamp_sysex, clock_ms) from one port dict (usb or five_pin)."""
     sec = sec if isinstance(sec, dict) else {}
     on = sec.get("stamp_sysex", STAMP_SYSEX_DEFAULT)
     on = on if isinstance(on, bool) else STAMP_SYSEX_DEFAULT
@@ -86,6 +84,23 @@ def settings(cfg):
     except (TypeError, ValueError):
         clock_ms = CLOCK_S_DEFAULT * MS_PER_S
     return on, clock_ms
+
+
+def settings(cfg):
+    """(stamp_sysex, clock_ms) from cfg "midi", else the defaults.
+    A nested midi.usb block wins over a flat stamp pair.
+    cfg: a config_loader.Config, a plain dict or None."""
+    sec = cfg.get("midi", {}) if cfg is not None else {}
+    sec = sec if isinstance(sec, dict) else {}
+    if isinstance(sec.get("usb"), dict):
+        inherit = {}
+        if "stamp_sysex" in sec:
+            inherit["stamp_sysex"] = sec["stamp_sysex"]
+        if "clock_s" in sec:
+            inherit["clock_s"] = sec["clock_s"]
+        inherit.update(sec["usb"])
+        return settings_from_section(inherit)
+    return settings_from_section(sec)
 
 
 def fill(buf, seq, ch, t_ms):
@@ -171,6 +186,17 @@ class MidiStamp:
     def status(self):
         return {"seq": self.seq, "sent": self.sent, "clocks": self.clocks,
                 "errors": self.errors}
+
+
+def open_stamp_from_section(sec, port, clock_ms, name="usb"):
+    """MidiStamp on port per one port dict, or None (off, or no port)."""
+    on, clock_period_ms = settings_from_section(sec)
+    if not on or port is None:
+        return None
+    label = name + " MIDI stamps"
+    print("%s: SysEx after each NoteOn, clock every %d ms" % (label, clock_period_ms)
+          if clock_period_ms else "%s: SysEx after each NoteOn, no clock" % label)
+    return MidiStamp(port, clock_ms, clock_period_ms)
 
 
 def open_stamp(cfg, port, clock_ms):

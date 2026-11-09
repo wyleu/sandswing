@@ -81,8 +81,8 @@ from connector_boards import DEFAULT_BOARDS
 from socket_survey import SocketSurvey, survey_all
 from channel_gate import ChannelGate
 from threshold_refresh import refresher_from_cfg
-from ring import Ring, open_midi, midi_port, FULL, MIN_STROKE_GAP_MS
-from midi_stamp import open_stamp
+from ring import Ring, FULL, MIN_STROKE_GAP_MS
+from midi_ports import open_outputs
 import panel
 import report
 
@@ -344,11 +344,10 @@ class Concentrator:
         self.refresher = refresher_from_cfg(self.mux, self.bells,
                                             self.pinmap["raw"].get("threshold_mux") or {},
                                             gate=self.gate)
-        midi = open_midi()
-        # each stroke's NoteOn is followed by its keypad stamp (midi_stamp.py)
-        stamp = open_stamp(cfg, midi_port(), self.ticks.now) if midi is not None else None
-        self.ring = Ring(self.inputs, self.lasers, midi=midi,
-                         clock_ms=self.ticks.now, stamp=stamp)
+        # USB and (optional) 5-pin MIDI: each port has its own notes/channel/SysEx
+        outs = open_outputs(cfg, self.ticks.now, neopixel_gp=self.pinmap.get("neopixel_gp"))
+        self.ring = Ring(self.inputs, self.lasers, outputs=outs,
+                         clock_ms=self.ticks.now)
         
         # early boot indication — before the long self-test
         self.kinds = {i: "examining" for i in range(min(4, self.n))}

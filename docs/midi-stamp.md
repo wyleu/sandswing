@@ -53,12 +53,37 @@ and the first one after a (re)start (seq 0) tells it the Pico restarted.
 
 ## Settings
 
-`settings.json` `"midi"` (optional; nothing to change on a deployed board):
+`settings.json` `"midi"` (optional).  A deployed board can keep the flat
+form; that still means USB only:
 
     "midi": { "stamp_sysex": true, "clock_s": 10 }
 
-`stamp_sysex: false` sends no SysEx at all; `clock_s: 0` stamps strokes but
-sends no clock.  (`output.midi` is the old programs' section, unrelated.)
+USB and 5-pin DIN can also be separate, with the same basic keys.  `channel`
+is MIDI channel 1-16; `notes` is one note number per bell channel; 5-pin
+also names the UART TX pin (`tx_pin`: GP number, 16 on Pico 2 W).
+
+    "midi": {
+      "usb": {
+        "enabled": true,
+        "channel": 1,
+        "notes": [65, 64, 62, 60, 58, 57, 55, 53],
+        "stamp_sysex": true,
+        "clock_s": 10
+      },
+      "five_pin": {
+        "enabled": false,
+        "tx_pin": 16,
+        "channel": 1,
+        "notes": [65, 64, 62, 60, 58, 57, 55, 53],
+        "stamp_sysex": true,
+        "clock_s": 10
+      }
+    }
+
+`stamp_sysex: false` sends no SysEx on that port; `clock_s: 0` stamps
+strokes but sends no clock.  `five_pin.enabled` defaults to false so a
+board whose LED strip is still on GP16 is not driven as UART.
+(`output.midi` is the old programs' section, unrelated.)
 
 ## Host side
 

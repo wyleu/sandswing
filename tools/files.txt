@@ -6,6 +6,7 @@ link_health.py
 concentrator.py
 ring.py
 midi_stamp.py
+midi_ports.py
 sense_keys.py
 tower_watch.py
 tower_build.py
