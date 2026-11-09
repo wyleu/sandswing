@@ -68,7 +68,7 @@
   "pins": {
     "sense": [0, 1, 2, 3],
     "laser_pwm": [8, 9, 10, 11],
-    "neopixel": 16,
+    "neopixel": 17,
     "adc_mux": {
       "common": 26,
       "a": 18,
