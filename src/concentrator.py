@@ -351,8 +351,9 @@ class Concentrator:
                          clock_ms=self.ticks.now)
         # the heartbeat as JSON lines on the USB data port (no Wi-Fi needed);
         # None: off, or no data port.  Not counted as a heartbeat (hb_seq).
+        # LED echo (serial_status.leds): _paint hands it every frame's key
         self.serial_status = open_serial_status(
-            cfg, lambda: self.heartbeat_doc(count=False))
+            cfg, lambda: self.heartbeat_doc(count=False), render=self._led_render)
         
         # early boot indication — before the long self-test
         self.kinds = {i: "examining" for i in range(min(4, self.n))}
@@ -611,6 +612,9 @@ class Concentrator:
                                        right=right)
         self._frame_args = (kinds, self.link, activity, right)
         panel.paint(self.strip, self.frame)
+        ss = getattr(self, "serial_status", None)
+        if ss is not None and ss.leds is not None:
+            ss.leds.painted(self._frame_args)     # a compare; the line is built in its task
         
     def _channel(self, i, held, now, raw=None):
         """held: the level after this edge (or the current level, no edge).
@@ -965,9 +969,18 @@ class Concentrator:
         the dark half of a blink would read as black)."""
         if self._frame_args is None:
             return panel.payload(self.frame)
-        kinds, link, activity, right = self._frame_args
+        return self._mimic_of(self._frame_args)
+
+    @staticmethod
+    def _mimic_of(args):
+        kinds, link, activity, right = args
         return panel.payload(panel.panel_frame(kinds, link, activity, True,
                                                right=right))
+
+    def _led_render(self, args):
+        """serial_status.LedEcho: a frame key -> (panel rgb, panel_state)."""
+        p = self._mimic_of(args)
+        return p["panel"], p["panel_state"]
 
     def heartbeat_doc(self, count=True):
         """sand.panel/v1 heartbeat: same envelope as events (type, src, id,

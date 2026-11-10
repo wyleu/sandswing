@@ -291,6 +291,22 @@ def link(app):
                         "panel": line["body"]["panel"] == slim["body"]["panel"],
                         "extra": "edges_lost" in line["body"] and "late_drains" in line["body"],  # mem_free: Pico only
                         "host_none": app.serial_status is None}
+    # LED echo: _paint hands the frame key over; the line is the panel's ON phase
+    port = _Port()
+    port.out = bytearray()
+    app.serial_status = serial_status.SerialStatus(
+        port, lambda: app.heartbeat_doc(count=False), now=0.0,
+        leds=serial_status.LedEcho(app._led_render))
+    app._paint(False)
+    ss = app.serial_status
+    key_seen = ss.leds._seen == app._frame_args
+    ss.step(0.0)
+    led = [json.loads(l) for l in bytes(port.out).split(b"\n") if l.startswith(b'{"t"')]
+    res["hb_serial"]["led"] = (key_seen and len(led) == 1 and led[0]["t"] == "led"
+                               and led[0]["p"] == app._mimic()["panel"]
+                               and led[0]["s"] == app._mimic()["panel_state"]
+                               and len(led[0]["p"]) == 6)
+    app.serial_status = None
     # Wi-Fi lost -> link event, LED1 no_wifi; rejoin after WIFI_REJOIN_S
     wifi = {"ok": True}
     joins, started, drops, resets = [], [], [], []
@@ -922,6 +938,8 @@ def main():
           U.get("same_doc") and U.get("fits") and U.get("smaller") and U.get("panel")
           and U.get("ids") and U.get("dropped") == [], U or r.get("exc"))
     S = L.get("hb_serial") or {}
+    check("link: serial LED echo: _paint hands the key, one led line = the ON-phase panel",
+          S.get("led") is True, S)
     check("link: serial status line of the real doc: whole, fits, same panel, hb_seq kept, off on host",
           S.get("seq_kept") and S.get("whole") and S.get("fits") and S.get("panel")
           and S.get("extra") and S.get("host_none"), S or r.get("exc"))

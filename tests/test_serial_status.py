@@ -176,10 +176,14 @@ def test_settings_defaults_and_clamp():
     assert SS.serial_settings({"serial_status": {"period_s": 0.1}})[1] == SS.SERIAL_PERIOD_MIN_S
     assert SS.serial_settings({"serial_status": {"period_s": "x", "enabled": "y"}}) == (True, SS.SERIAL_PERIOD_S)
     ex = json.load(open(os.path.join(ROOT, "settings_example.json")))
-    assert ex["serial_status"] == {"enabled": True, "period_s": 10}
+    assert ex["serial_status"] == {"enabled": True, "period_s": 10, "leds": {"enabled": True}}
     assert config_loader.DEFAULTS["serial_status"] == ex["serial_status"]
     cfg = config_loader.Config(config_loader._deep_merge(config_loader.DEFAULTS, {}))
     assert SS.serial_settings(cfg) == (True, 10.0)
+    assert SS.led_settings(cfg) is True
+    off = config_loader.Config(config_loader._deep_merge(
+        config_loader.DEFAULTS, {"serial_status": {"leds": {"enabled": False}}}))
+    assert SS.led_settings(off) is False
 
 
 @case
@@ -249,6 +253,143 @@ def test_worst_case_line_fits_with_plain_dumps_too():
         assert s.lines == 1 and s.dropped == 0, (dumps, s.counters())
         assert len(p.out) <= SS.SERIAL_LINE_MAX_B, len(p.out)
         json.loads(bytes(p.out))
+
+
+# ---- LED echo -------------------------------------------------------------
+def render(key):
+    return [[0, 0, key]] * 6, ["s%d" % key] * 6
+
+
+def led_lines(port):
+    return [json.loads(l) for l in bytes(port.out).split(b"\n") if l.startswith(b'{"t"')]
+
+
+def led_status(room=10000, connected=True):
+    p = Port(room, connected)
+    s = SS.SerialStatus(p, doc, period_s=10, now=0.0, leds=SS.LedEcho(render))
+    s.step(0.0)                               # the heartbeat line goes first
+    p.out = bytearray()
+    return p, s
+
+
+@case
+def test_led_line_on_change_and_rate_limited():
+    p, s = led_status()
+    s.leds.painted(1)
+    assert s.step(0.01) == SS.SERIAL_LED_CHECK_S
+    got = led_lines(p)
+    assert got == [{"t": "led", "n": 1, "p": [[0, 0, 1]] * 6, "s": ["s1"] * 6}], got
+    s.leds.painted(1)                         # same frame: nothing
+    s.leds.painted(2)
+    s.step(0.01 + SS.SERIAL_LED_MIN_S / 2)    # too soon
+    assert len(led_lines(p)) == 1
+    s.step(0.01 + SS.SERIAL_LED_MIN_S)
+    assert [l["n"] for l in led_lines(p)] == [1, 2] and led_lines(p)[1]["p"][0] == [0, 0, 2]
+    s.step(1.0)                               # no change: no line
+    assert len(led_lines(p)) == 2
+
+
+@case
+def test_led_short_flash_is_held_not_lost():
+    p, s = led_status()
+    s.leds.painted(1)
+    s.step(0.0)
+    s.leds.painted(9)                         # a stroke's flash ...
+    s.leds.painted(1)                         # ... gone before the next line may go
+    s.step(SS.SERIAL_LED_MIN_S)
+    s.step(2 * SS.SERIAL_LED_MIN_S)
+    assert [l["p"][0][2] for l in led_lines(p)] == [1, 9, 1], led_lines(p)
+    s.step(3 * SS.SERIAL_LED_MIN_S)
+    assert len(led_lines(p)) == 3
+
+
+@case
+def test_led_buffer_full_dropped_then_retried():
+    p, s = led_status()
+    p.room = 0
+    s.leds.painted(1)
+    s.step(0.0)
+    assert s.leds.dropped == 1 and s.leds.lines == 0 and s._buf is None and s.cut == 0
+    p.room = 10000
+    s.step(SS.SERIAL_LED_MIN_S / 2)
+    assert led_lines(p) == []
+    s.step(SS.SERIAL_LED_MIN_S)
+    assert len(led_lines(p)) == 1 and s.leds.lines == 1
+
+
+@case
+def test_led_waits_for_a_part_written_heartbeat_and_partial_led_finishes():
+    p = Port(room=100)
+    s = SS.SerialStatus(p, doc, period_s=10, now=0.0, leds=SS.LedEcho(render))
+    s.leds.painted(1)
+    assert s.step(0.0) == SS.SERIAL_PUSH_S    # heartbeat part-written: LED waits
+    assert s.leds.lines == 0
+    t = 0.0
+    while s._buf is not None:
+        t += SS.SERIAL_PUSH_S
+        s.step(t)
+    assert s.leds.lines == 0 or s.leds.lines == 1
+    for _ in range(20):
+        t += SS.SERIAL_PUSH_S
+        s.step(t)
+    out = bytes(p.out).split(b"\n")
+    assert json.loads(out[0])["type"] == "heartbeat"
+    assert json.loads(out[1])["t"] == "led", out[1]
+    assert s.cut == 0 and s.leds.lines == 1
+
+
+@case
+def test_led_nothing_without_a_host_and_resent_when_one_opens():
+    p, s = led_status(connected=False)
+    s.leds.painted(1)
+    assert s.step(0.1) > SS.SERIAL_LED_CHECK_S          # no host: heartbeat pace
+    assert led_lines(p) == [] and s.leds.lines == 0
+    p.connected = True
+    s.step(0.2)
+    assert [l["p"][0][2] for l in led_lines(p)] == [1]
+    p.connected = False
+    s.step(0.3)
+    p.connected = True
+    s.step(0.3 + SS.SERIAL_LED_MIN_S)                   # reopened: current state again
+    assert [l["p"][0][2] for l in led_lines(p)] == [1, 1]
+
+
+@case
+def test_led_render_error_counted_never_raises():
+    def bad(key):
+        raise ValueError("boom")
+    p = Port()
+    s = SS.SerialStatus(p, doc, period_s=10, now=0.0, leds=SS.LedEcho(bad))
+    s.leds.painted(1)
+    s.step(0.0)
+    assert s.errors == 1 and "boom" in s.last_error and s._buf is None
+
+
+@case
+def test_led_counters_in_heartbeat_and_settings():
+    p, s = led_status()
+    s.leds.painted(1)
+    s.step(0.0)
+    p.out = bytearray()
+    s.step(10.0)
+    hb = json.loads(bytes(p.out).split(b"\n")[0])
+    assert hb["serial"]["leds"] == {"lines": 1, "dropped": 0, "min_s": SS.SERIAL_LED_MIN_S}, hb["serial"]
+    assert SS.SerialStatus(Port(), doc, now=0.0).counters()["leds"] is None
+    assert SS.led_settings({}) is True
+    assert SS.led_settings({"serial_status": {"leds": {"enabled": False}}}) is False
+    assert SS.led_settings({"serial_status": {"leds": "x"}}) is True
+    assert config_loader.DEFAULTS["serial_status"]["leds"]["enabled"] is True
+    with open(os.path.join(ROOT, "settings_example.json")) as f:
+        assert json.load(f)["serial_status"]["leds"] == {"enabled": True}
+
+
+@case
+def test_led_line_small():
+    p, s = led_status()
+    s.leds.render = lambda k: ([[255, 255, 255]] * 6, ["heartbeat_holdover"] * 6)
+    s.leds.painted(1)
+    s.step(0.0)
+    assert len(p.out) < 256, len(p.out)       # fits the USB CDC buffer in one write
 
 
 n_fail = results.count(False)

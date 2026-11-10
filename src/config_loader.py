@@ -120,6 +120,7 @@ DEFAULTS = {
     "serial_status": {
         "enabled": True,
         "period_s": 10,
+        "leds": {"enabled": True},    # LED echo line on each panel change
     },
     "ir": {},
     "detection": {},

@@ -63,7 +63,10 @@
   },
   "serial_status": {
     "enabled": true,
-    "period_s": 10
+    "period_s": 10,
+    "leds": {
+      "enabled": true
+    }
   },
   "probe": {
     "present_delta": 2000,
