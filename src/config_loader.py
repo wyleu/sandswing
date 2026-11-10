@@ -116,6 +116,11 @@ DEFAULTS = {
         "stamp_sysex": True,
         "clock_s": 10,
     },
+    # heartbeat JSON lines on the USB data port (serial_status.py)
+    "serial_status": {
+        "enabled": True,
+        "period_s": 10,
+    },
     "ir": {},
     "detection": {},
     "hardware": {},

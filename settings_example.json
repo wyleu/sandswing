@@ -61,6 +61,10 @@
       "clock_s": 10
     }
   },
+  "serial_status": {
+    "enabled": true,
+    "period_s": 10
+  },
   "probe": {
     "present_delta": 2000,
     "lb_delta": 1000

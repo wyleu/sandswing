@@ -271,6 +271,26 @@ def link(app):
                      and slim["body"]["chan"] == hb["body"]["chan"],
                      "ids": all(slim[k] == hb[k] for k in ("schema", "type", "src", "id",
                                                             "boot_id", "seq"))}
+    # serial status: the real doc as one JSON line; hb_seq not moved on
+    import serial_status
+
+    class _Port:
+        connected, out = True, bytearray()
+
+        def write(self, buf):
+            self.out += bytes(buf)
+            return len(buf)
+    seq_before = app.hb_seq
+    port = _Port()
+    ss = serial_status.SerialStatus(port, lambda: app.heartbeat_doc(count=False), now=0.0)
+    ss.step(0.0)
+    line = json.loads(bytes(port.out))
+    res["hb_serial"] = {"seq_kept": app.hb_seq == seq_before and line["seq"] == seq_before,
+                        "whole": ss.lines == 1 and ss.errors == 0 and port.out.endswith(b"\n"),
+                        "fits": len(port.out) <= serial_status.SERIAL_LINE_MAX_B,
+                        "panel": line["body"]["panel"] == slim["body"]["panel"],
+                        "extra": "edges_lost" in line["body"] and "late_drains" in line["body"],  # mem_free: Pico only
+                        "host_none": app.serial_status is None}
     # Wi-Fi lost -> link event, LED1 no_wifi; rejoin after WIFI_REJOIN_S
     wifi = {"ok": True}
     joins, started, drops, resets = [], [], [], []
@@ -901,6 +921,10 @@ def main():
     check("link: udp heartbeat of the real doc fits one datagram, keeps ids/panel/chan, doc unchanged",
           U.get("same_doc") and U.get("fits") and U.get("smaller") and U.get("panel")
           and U.get("ids") and U.get("dropped") == [], U or r.get("exc"))
+    S = L.get("hb_serial") or {}
+    check("link: serial status line of the real doc: whole, fits, same panel, hb_seq kept, off on host",
+          S.get("seq_kept") and S.get("whole") and S.get("fits") and S.get("panel")
+          and S.get("extra") and S.get("host_none"), S or r.get("exc"))
     check("link: heartbeat_task sends the whole doc, keep=False, udp_fit=udp_heartbeat",
           L.get("hb_sends") == [["heartbeat", ["keep", "udp_fit"], False, True]],
           L.get("hb_sends") or r.get("exc"))

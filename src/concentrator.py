@@ -83,6 +83,7 @@ from channel_gate import ChannelGate
 from threshold_refresh import refresher_from_cfg
 from ring import Ring, FULL, MIN_STROKE_GAP_MS
 from midi_ports import open_outputs
+from serial_status import open_serial_status
 import panel
 import report
 
@@ -348,6 +349,10 @@ class Concentrator:
         outs = open_outputs(cfg, self.ticks.now, neopixel_gp=self.pinmap.get("neopixel_gp"))
         self.ring = Ring(self.inputs, self.lasers, outputs=outs,
                          clock_ms=self.ticks.now)
+        # the heartbeat as JSON lines on the USB data port (no Wi-Fi needed);
+        # None: off, or no data port.  Not counted as a heartbeat (hb_seq).
+        self.serial_status = open_serial_status(
+            cfg, lambda: self.heartbeat_doc(count=False))
         
         # early boot indication — before the long self-test
         self.kinds = {i: "examining" for i in range(min(4, self.n))}
@@ -964,10 +969,12 @@ class Concentrator:
         return panel.payload(panel.panel_frame(kinds, link, activity, True,
                                                right=right))
 
-    def heartbeat_doc(self):
+    def heartbeat_doc(self, count=True):
         """sand.panel/v1 heartbeat: same envelope as events (type, src, id,
-        boot_id, seq = heartbeat count, stamp fields, body)."""
-        self.hb_seq += 1
+        boot_id, seq = heartbeat count, stamp fields, body).  count False
+        (the serial status line): the same doc, hb_seq not moved on."""
+        if count:
+            self.hb_seq += 1
         sn = self.sntp
         body = self._mimic()
         body.update({
@@ -1026,6 +1033,15 @@ class Concentrator:
                                print, emit, size=_udp_last_b if _net_udp() else None)
                 self.pump_edges()
             diag.stats(now, farm_ws.stats, print)
+
+    async def serial_status_task(self):
+        """The heartbeat as a JSON line on usb_cdc.data (serial_status.py).
+        SerialStatus.step never raises or waits; nothing to do without it."""
+        ss = self.serial_status
+        if ss is None:
+            return
+        while True:
+            await asyncio.sleep(ss.step(time.monotonic()))
 
     def _udp_link_step(self, now, state):
         """link.ring_send "udp": no ping, no radio or Pico reset (each holds
@@ -1340,6 +1356,7 @@ async def main():
         app.heartbeat_task(),
         app.link_task(),
         app.mem_task(),
+        app.serial_status_task(),
         ]
     
     if app.sntp is not None:

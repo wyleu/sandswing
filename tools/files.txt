@@ -7,6 +7,7 @@ concentrator.py
 ring.py
 midi_stamp.py
 midi_ports.py
+serial_status.py
 sense_keys.py
 tower_watch.py
 tower_build.py
