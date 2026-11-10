@@ -1,10 +1,11 @@
 # Every src module imports with the fake board modules (CircuitPython-style
-# names only; code.py and boot.py are launchers and run at import, so skip).
+# names only; code.py, boot.py and the bench script midi-5pin_test.py run
+# at import, so skip).
 import os
 import sys
 from hw import spawn, child_setup, child_finish, check, finish, NEXT_SRC
 
-SKIP = ("code.py", "boot.py")
+SKIP = ("code.py", "boot.py", "midi-5pin_test.py")   # midi-5pin_test: a bench script, runs at import
 
 
 def child(scenario, src, extra):
