@@ -123,10 +123,11 @@ def test_threshold_settings_from_cfg_and_defaults():
     s = threshold_refresh.threshold_settings(None)
     assert s == {"default_duty": threshold_refresh.DEFAULT_DUTY,
                  "min_duty": threshold_refresh.MIN_DUTY,
-                 "max_duty": threshold_refresh.MAX_DUTY}
+                 "max_duty": threshold_refresh.MAX_DUTY,
+                 "step": threshold_refresh.STEP}
     s = threshold_refresh.threshold_settings(
-        {"threshold": {"default_duty": 40000, "min_duty": 1000, "max_duty": 50000}})
-    assert s == {"default_duty": 40000, "min_duty": 1000, "max_duty": 50000}
+        {"threshold": {"default_duty": 40000, "min_duty": 1000, "max_duty": 50000, "step": 10}})
+    assert s == {"default_duty": 40000, "min_duty": 1000, "max_duty": 50000, "step": 10}
     s = threshold_refresh.threshold_settings(
         {"threshold": {"default_duty": 10, "min_duty": 100, "max_duty": 200}})
     assert s["default_duty"] == 100                     # clamped to min
@@ -135,12 +136,15 @@ def test_threshold_settings_from_cfg_and_defaults():
     assert s["min_duty"] == 100 and s["max_duty"] == 200  # swapped
     assert s["default_duty"] == threshold_refresh.clamp_duty(
         threshold_refresh.DEFAULT_DUTY, 100, 200)
+
+    s = threshold_refresh.threshold_settings({"threshold": {"step": 0}})
+    assert s["step"] == threshold_refresh.STEP
     import json, os
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ex = json.load(open(os.path.join(root, "settings_example.json")))["threshold"]
     import config_loader
     assert ex == config_loader.DEFAULTS["threshold"]
-    assert ex == {"default_duty": 32768, "min_duty": 0, "max_duty": 65535}
+    assert ex == {"default_duty": 32768, "min_duty": 0, "max_duty": 65535, "step": 655}
 
 
 @case

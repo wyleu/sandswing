@@ -170,6 +170,10 @@ class SerialStatus:
         c = getattr(self.port, "connected", True)
         return bool(c)
 
+    def busy(self):
+        """True while a line is part-written (a tune ack must wait)."""
+        return self._buf is not None
+
     def counters(self):
         return {"period_s": self.period_s, "lines": self.lines, "unread": self.unread,
                 "dropped": self.dropped, "cut": self.cut, "errors": self.errors,

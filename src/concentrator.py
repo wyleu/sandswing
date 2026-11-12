@@ -84,6 +84,7 @@ from threshold_refresh import refresher_from_cfg, threshold_settings
 from ring import Ring, FULL, MIN_STROKE_GAP_MS
 from midi_ports import open_outputs
 from serial_status import open_serial_status
+from tune import Tuner, open_serial_tune
 import panel
 import report
 
@@ -355,6 +356,16 @@ class Concentrator:
         # LED echo (serial_status.leds): _paint hands it every frame's key
         self.serial_status = open_serial_status(
             cfg, lambda: self.heartbeat_doc(count=False), render=self._led_render)
+        # live threshold / laser-duty commands on the same data port (RAM only)
+        self.tune = Tuner(self, cfg, clock_ms=self.ticks.now)
+        port = self.serial_status.port if self.serial_status is not None else None
+        if port is None:
+            try:
+                import usb_cdc
+                port = usb_cdc.data
+            except (ImportError, AttributeError):
+                port = None
+        self.serial_tune = open_serial_tune(port, self.tune)
         
         # early boot indication — before the long self-test
         self.kinds = {i: "examining" for i in range(min(4, self.n))}
@@ -453,7 +464,8 @@ class Concentrator:
         """Settle, then ring the surveyed heads.
         TODO(spec C4): settle from measured delays."""
         await asyncio.sleep(SETTLE_S)
-        self.ring.start(kinds)        # TODO(spec section 6): per-head laser_duty
+        # live laser-duty overrides (tune.py) kept across a re-survey this boot
+        self.ring.start(kinds, duty=self.tune.drive_map())
 
     def _init_edge_state(self):
         self.last_false = [None] * self.n
@@ -1057,11 +1069,18 @@ class Concentrator:
     async def serial_status_task(self):
         """The heartbeat as a JSON line on usb_cdc.data (serial_status.py).
         SerialStatus.step never raises or waits; nothing to do without it."""
-        ss = self.serial_status
-        if ss is None:
+        ss, st = self.serial_status, getattr(self, "serial_tune", None)
+        if ss is None and st is None:
             return
         while True:
-            await asyncio.sleep(ss.step(time.monotonic()))
+            now = time.monotonic()
+            wait = 0.05
+            if ss is not None:
+                wait = ss.step(now)
+            if st is not None:
+                w = st.poll(now, busy=ss is not None and ss.busy())
+                wait = min(wait, w)
+            await asyncio.sleep(wait)
 
     def _udp_link_step(self, now, state):
         """link.ring_send "udp": no ping, no radio or Pico reset (each holds

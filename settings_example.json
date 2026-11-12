@@ -71,7 +71,14 @@
   "threshold": {
     "default_duty": 32768,
     "min_duty": 0,
-    "max_duty": 65535
+    "max_duty": 65535,
+    "step": 655
+  },
+  "laser": {
+    "min_duty": 16384,
+    "max_duty": 65535,
+    "step": 1311,
+    "max_ma": 60.0
   },
   "probe": {
     "present_delta": 2000,

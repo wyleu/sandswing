@@ -38,6 +38,7 @@ PWM_DUTY_MAX = 65535
 MIN_DUTY = 0
 MAX_DUTY = PWM_DUTY_MAX
 DEFAULT_DUTY = 32768          # mid-rail; first target for a new LM393 head
+STEP = 655                    # ~1 % of PWM_DUTY_MAX; settings threshold.step
 ERR_CHARS = 80                # last_error kept, cut to this
 # After a survey, only these kinds get a target.  Old heads have no Orange
 # threshold; everything else must not be driven.
@@ -63,7 +64,7 @@ def clamp_duty(duty, lo=MIN_DUTY, hi=MAX_DUTY):
 def threshold_settings(cfg):
     """Named threshold values from settings (the state model).
     Missing or bad values become the defaults.  default_duty is clamped
-    to min_duty..max_duty.  -> dict default_duty, min_duty, max_duty."""
+    to min_duty..max_duty.  -> dict default_duty, min_duty, max_duty, step."""
     sec = cfg.get("threshold") if cfg is not None and hasattr(cfg, "get") else None
     sec = sec if isinstance(sec, dict) else {}
     lo = _int(sec.get("min_duty"), MIN_DUTY)
@@ -71,7 +72,10 @@ def threshold_settings(cfg):
     if lo > hi:
         lo, hi = hi, lo
     default = clamp_duty(_int(sec.get("default_duty"), DEFAULT_DUTY), lo, hi)
-    return {"default_duty": default, "min_duty": lo, "max_duty": hi}
+    step = _int(sec.get("step"), STEP)
+    if step < 1:
+        step = STEP
+    return {"default_duty": default, "min_duty": lo, "max_duty": hi, "step": step}
 
 
 class ThresholdRefresher:

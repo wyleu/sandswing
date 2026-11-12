@@ -127,6 +127,14 @@ DEFAULTS = {
         "default_duty": 32768,        # mid-rail; 16-bit PWM duty
         "min_duty": 0,
         "max_duty": 65535,
+        "step": 655,                  # ~1 %; live tune
+    },
+    # live laser-duty limits (tune.py); nothing writes these back to the file
+    "laser": {
+        "min_duty": 16384,            # 25 %; below ~half duty current is on the floor
+        "max_duty": 65535,
+        "step": 1311,                 # ~2 %
+        "max_ma": 60.0,               # refuse a raise at or above this
     },
     "ir": {},
     "detection": {},

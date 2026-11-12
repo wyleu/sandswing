@@ -61,3 +61,25 @@ Pico also sends the front panel as it is painted, on each change:
   "dropped", "min_s"}}` (`null` when off).
 * Off: `"leds": {"enabled": false}`, or on the Sandbells side
   `sudo systemctl stop sandbells-ingest-serial` (no host: nothing is sent).
+
+## Live tune (`tune.py`)
+
+The same data port also accepts command lines (and writes a short ack).
+Nothing is saved: `settings.json` is never written.  Limits and steps come
+from `threshold` and `laser` in settings (defaults in `config_loader.DEFAULTS`).
+
+    {"cmd":"tune","ch":1,"thr":32768}
+    {"cmd":"tune","ch":1,"thr_step":1}
+    {"cmd":"drive","ch":1,"drive":50000}
+    {"cmd":"drive","ch":1,"drive_step":-1}
+    {"cmd":"tune_get"}
+    {"cmd":"tune_get","ch":1}
+
+Acks: `{"t":"tune_ack","ok":true,"ch":1,"thr":...,"rb":...,"drv":...,"ma":...,"why":null}`.
+`tune_get` replies with `"t":"tune"`.  Adjustments are refused while the
+tower is not quiet or a survey is running.  A raise of laser duty is
+refused if the measured current is at or above `laser.max_ma`.
+
+Sandbells' `ingest_serial` currently opens the port read-only, so it cannot
+send these commands yet.
+
