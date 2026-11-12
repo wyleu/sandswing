@@ -122,6 +122,12 @@ DEFAULTS = {
         "period_s": 10,
         "leds": {"enabled": True},    # LED echo line on each panel change
     },
+    # new (LM393) heads: first threshold target after a survey (threshold_refresh.py)
+    "threshold": {
+        "default_duty": 32768,        # mid-rail; 16-bit PWM duty
+        "min_duty": 0,
+        "max_duty": 65535,
+    },
     "ir": {},
     "detection": {},
     "hardware": {},

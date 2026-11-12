@@ -80,7 +80,7 @@ from tower_build import build_from_pins
 from connector_boards import DEFAULT_BOARDS
 from socket_survey import SocketSurvey, survey_all
 from channel_gate import ChannelGate
-from threshold_refresh import refresher_from_cfg
+from threshold_refresh import refresher_from_cfg, threshold_settings
 from ring import Ring, FULL, MIN_STROKE_GAP_MS
 from midi_ports import open_outputs
 from serial_status import open_serial_status
@@ -342,9 +342,10 @@ class Concentrator:
         )
         self.survey_state.trigger("boot")
         
+        self.thr_settings = threshold_settings(cfg)
         self.refresher = refresher_from_cfg(self.mux, self.bells,
                                             self.pinmap["raw"].get("threshold_mux") or {},
-                                            gate=self.gate)
+                                            gate=self.gate, cfg=cfg)
         # USB and (optional) 5-pin MIDI: each port has its own notes/channel/SysEx
         outs = open_outputs(cfg, self.ticks.now, neopixel_gp=self.pinmap.get("neopixel_gp"))
         self.ring = Ring(self.inputs, self.lasers, outputs=outs,
@@ -868,6 +869,11 @@ class Concentrator:
                 self.gate.clear(i)
             for i, kind in self.survey_state.kinds.items():
                 self.gate.set_kind(i, kind)   # else gate.enforce zeroes the heads
+            # new (LM393) heads get a threshold target; old / empty / fault do not
+            self.refresher.seed_kinds(self.survey_state.kinds,
+                                      self.thr_settings["default_duty"])
+            # write the new targets now, before Ring learns rest
+            self.refresher.apply_once()
             # head[] now, not at the next panel pass: _watch_empty reads it
             self._paint_kinds(self.survey_state.kinds, True)
             self._survey_settled(self.survey_state.last_result,
@@ -1009,6 +1015,7 @@ class Concentrator:
             "edges_lost": self.sense.overflows,   # keypad queue overflows this boot
             "late_drains": self.sense.late_drains,  # loop held > inputs.late_drain_ms
             "strokes_undelivered": len(farm_ws.undelivered_strokes()),
+            "thr": self.refresher.serial_thr(self.n),
         })
         try:
             import gc

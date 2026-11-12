@@ -8,7 +8,8 @@ and fills the sandswing status page from it.
 
 The line is the slim UDP heartbeat (link_health.udp_heartbeat_doc, the
 same fields Sandbells already knows) plus a few memory / sense counters
-(SERIAL_BODY_EXTRA) and this writer's own counters ("serial").  One per
+(SERIAL_BODY_EXTRA, including thr: per-channel threshold target and last
+GP28 readback) and this writer's own counters ("serial").  One per
 serial_status.period_s, '\\n' terminated.
 
 Never in the way of the strokes:
@@ -53,7 +54,7 @@ SERIAL_ERR_CHARS = 40          # last error kept, cut to this
 SERIAL_VIA = "usb_cdc"         # the line's "via": Sandbells knows it came by serial
 # heartbeat body fields the UDP heartbeat leaves out (memory, sense queue)
 SERIAL_BODY_EXTRA = ("mem_free", "gc_heap_kb", "edges_lost", "late_drains",
-                     "strokes_undelivered", "watchdog")
+                     "strokes_undelivered", "watchdog", "thr")
 NEWLINE = b"\n"
 SERIAL_LED_MIN_S = 0.25        # LED echo: at most one line per this; a state shows at least this long
 SERIAL_LED_CHECK_S = 0.05      # LED echo on and a host there: look for a change this often (= panel_task)

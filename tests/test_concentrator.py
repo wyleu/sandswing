@@ -627,7 +627,8 @@ def child(scenario, src, extra):
         def bw():
             if state["trip"]:
                 return False
-            return not (21 in fh.pwm and fh.pwm[21].duty_cycle > 30000)
+            # trip above 75 % FS so the mid-rail default (32768) stays at rest
+            return not (21 in fh.pwm and fh.pwm[21].duty_cycle > 49152)
         fh.adc_fn[26] = cur
         fh.din_fn[0] = bw
 
@@ -689,6 +690,7 @@ def child(scenario, src, extra):
             run_survey(app, "empty-head", channel=0)
             out["heads_late"] = list(app.head)
             out["laser8_late"] = fh.pwm[8].duty_cycle
+            out["thr_target_late"] = dict(app.refresher.target)
         app.sntp = FakeSntp()                # after: only the tower steps below count
         out["heads"] = list(app.head)
         out["selftest_ok"] = app.selftest["ok"]
@@ -710,6 +712,10 @@ def child(scenario, src, extra):
         if scenario == "head":
             out["laser8"] = fh.pwm[8].duty_cycle
             out["laser9"] = fh.pwm[9].duty_cycle
+            out["thr_target"] = dict(app.refresher.target)
+            out["thr_default"] = app.thr_settings["default_duty"]
+            out["thr_rb"] = dict(app.refresher.readback)
+            out["hb_thr"] = app.heartbeat_doc(count=False)["body"]["thr"]
             app.poll_sense()
             paint_once(app)
             out["rest_state"] = app.frame[1]["state"]
@@ -772,11 +778,22 @@ def main():
           r.get("rest_state") == "head_new" and r.get("trip_state") == "response"
           and r.get("strokes") == 1, (r.get("rest_state"), r.get("trip_state"), r.get("strokes")))
     check("head: no 'GPxx in use'", r["ok"] and not r["errors"], r.get("exc") or r["errors"])
+    check("head: new head got the default threshold target, others none",
+          r.get("thr_default") == 32768 and r.get("thr_target") == {"0": 32768},
+          (r.get("thr_default"), r.get("thr_target"), r.get("exc")))
+    check("head: GP28 readback recorded and on the serial heartbeat",
+          isinstance((r.get("thr_rb") or {}).get("0"), int)
+          and (r.get("hb_thr") or {}).get("target") == [32768] + [None] * 7
+          and (r.get("hb_thr") or {}).get("readback", [None])[0] == (r.get("thr_rb") or {}).get("0"),
+          (r.get("thr_rb"), r.get("hb_thr"), r.get("exc")))
     r = spawn(me, "late")
     check("late head: a later survey finds ch1 and re-lights the ring",
           r["ok"] and r.get("laser8_boot") == 0 and r.get("heads_late") == ["new"] + ["empty"] * 7
           and r.get("laser8_late") == 65535,
           r.get("exc") or (r.get("laser8_boot"), r.get("heads_late"), r.get("laser8_late")))
+    check("late head: a later new head also gets the default threshold",
+          r.get("thr_target_late") == {"0": 32768},
+          r.get("thr_target_late") or r.get("exc"))
     r = spawn(me, "strokes")
     ev = r.get("events") or []
     check("strokes: tower inactive before the waking stroke", r.get("tower0") == "inactive",

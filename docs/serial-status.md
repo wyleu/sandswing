@@ -10,7 +10,8 @@ JSON, `\n` terminated.  Sandbells' `manage.py ingest_serial` (unit
 The line is the slim UDP heartbeat (`link_health.udp_heartbeat_doc`:
 `sand.panel/v1`, type `heartbeat`, same envelope and body fields) plus
 `mem_free`, `gc_heap_kb`, `edges_lost`, `late_drains`, `strokes_undelivered`,
-`watchdog`, `"via": "usb_cdc"`, and the writer's own counters:
+`watchdog`, `thr` (per-channel threshold `target` and last GP28 `readback`,
+0-based, `null` if none), `"via": "usb_cdc"`, and the writer's own counters:
 
     "serial": {"period_s": 10, "lines": 41, "unread": 0, "dropped": 0,
                "cut": 0, "errors": 0, "last_error": null}

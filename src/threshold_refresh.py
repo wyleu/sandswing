@@ -33,6 +33,46 @@ except ImportError:
 
 SHARE_FRAC = 100e-9 / (1e-6 + 100e-9)
 
+# 16-bit PWM full scale.  Settings "threshold" uses these as defaults.
+PWM_DUTY_MAX = 65535
+MIN_DUTY = 0
+MAX_DUTY = PWM_DUTY_MAX
+DEFAULT_DUTY = 32768          # mid-rail; first target for a new LM393 head
+ERR_CHARS = 80                # last_error kept, cut to this
+# After a survey, only these kinds get a target.  Old heads have no Orange
+# threshold; everything else must not be driven.
+SEED_KINDS = ("head_new",)
+
+
+def _int(v, default):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def clamp_duty(duty, lo=MIN_DUTY, hi=MAX_DUTY):
+    duty = int(duty)
+    if duty < lo:
+        return lo
+    if duty > hi:
+        return hi
+    return duty
+
+
+def threshold_settings(cfg):
+    """Named threshold values from settings (the state model).
+    Missing or bad values become the defaults.  default_duty is clamped
+    to min_duty..max_duty.  -> dict default_duty, min_duty, max_duty."""
+    sec = cfg.get("threshold") if cfg is not None and hasattr(cfg, "get") else None
+    sec = sec if isinstance(sec, dict) else {}
+    lo = _int(sec.get("min_duty"), MIN_DUTY)
+    hi = _int(sec.get("max_duty"), MAX_DUTY)
+    if lo > hi:
+        lo, hi = hi, lo
+    default = clamp_duty(_int(sec.get("default_duty"), DEFAULT_DUTY), lo, hi)
+    return {"default_duty": default, "min_duty": lo, "max_duty": hi}
+
 
 class ThresholdRefresher:
     """Fast refresh of the per-channel hold caps, plus the slow target store.
@@ -63,7 +103,8 @@ class ThresholdRefresher:
 
     def __init__(self, tower, drive, bells, gate=None, hold_c=100e-9,
                  ron=1000.0, bias_a=25e-9, tol_v=0.005, clock=None,
-                 interval_s=None, dwell_s=None):
+                 interval_s=None, dwell_s=None, min_duty=None, max_duty=None,
+                 default_duty=None):
         self.tower, self.drive, self.bells, self.gate = tower, drive, list(bells), gate
         self.dwell_s = 10.0 * ron * hold_c if dwell_s is None else float(dwell_s)
         self.datasheet_interval_s = refresh_interval_s(tol_v, bias_a, hold_c)
@@ -74,10 +115,20 @@ class ThresholdRefresher:
             self.interval_s = float(interval_s)
             self.interval_source = "measured"
         self.clock = clock or time.monotonic
+        lo = MIN_DUTY if min_duty is None else int(min_duty)
+        hi = MAX_DUTY if max_duty is None else int(max_duty)
+        if lo > hi:
+            lo, hi = hi, lo
+        self.min_duty, self.max_duty = lo, hi
+        self.default_duty = clamp_duty(
+            DEFAULT_DUTY if default_duty is None else default_duty, lo, hi)
         self.target = {}         # slow process writes, fast loop reads
         self.target_set_at = {}  # when each target last changed
         self.target_updates = 0
         self.last = {}           # when each channel was last refreshed
+        self.readback = {}       # last GP28 counts per channel (None never stored)
+        self.errors = 0          # exceptions from step(), counted in status
+        self.last_error = None
         self._i = 0
         self.skipped_busy = 0
         self.idle_s = 0.01       # nothing to refresh: don't spin
@@ -86,7 +137,7 @@ class ThresholdRefresher:
     def set_target(self, bell, duty):
         """Slow process: change one channel's target.  Does not touch the
         hardware; the fast loop re-writes it at that channel's next turn."""
-        duty = max(0, min(65535, int(duty)))
+        duty = clamp_duty(duty, self.min_duty, self.max_duty)
         if self.target.get(bell.index) != duty:
             self.target[bell.index] = duty
             self.target_set_at[bell.index] = self.clock()
@@ -102,6 +153,39 @@ class ThresholdRefresher:
         else:
             for b in self.bells:
                 self.set_target(b, targets)
+
+    def drop_target(self, index):
+        """Stop refreshing this channel (no longer a new head)."""
+        self.target.pop(index, None)
+        self.target_set_at.pop(index, None)
+        self.last.pop(index, None)
+        self.readback.pop(index, None)
+
+    def seed_kinds(self, kinds, default=None):
+        """After a survey: each new (LM393) head gets a target if it has
+        none yet; any other kind loses its target so we do not drive it.
+        An already-set target on a still-new head is kept (live tune)."""
+        if default is None:
+            default = self.default_duty
+        default = clamp_duty(default, self.min_duty, self.max_duty)
+        for b in self.bells:
+            if kinds.get(b.index) in SEED_KINDS:
+                if b.index not in self.target:
+                    self.set_target(b, default)
+            elif b.index in self.target:
+                self.drop_target(b.index)
+
+    def apply_once(self):
+        """Refresh every current target once (after a seed, before rest
+        is learnt).  Stops early if the tower is busy.  Returns the
+        channel indexes written."""
+        done = []
+        for _ in self.bells:
+            i = self.step()
+            if i is None or i in done:
+                break
+            done.append(i)
+        return done
 
     # ---- fast refresh process ----------------------------------------
     def _eligible(self, b):
@@ -133,6 +217,11 @@ class ThresholdRefresher:
                     self.drive.set(b.y, want)       # RC settle + GP28 verify
                 self.tower.pins.sleep(self.dwell_s)  # hold cap follows node
             finally:
+                try:
+                    if self.drive is not None and self.drive.back is not None:
+                        self.readback[b.index] = self.drive.readback(b.y)
+                except Exception:
+                    pass
                 sel.__exit__(None, None, None)
             self.last[b.index] = self.clock()
             return b.index
@@ -158,7 +247,15 @@ class ThresholdRefresher:
         return {"targets": dict(self.target), "stale": self.stale(),
                 "interval_s": self.interval_s,
                 "interval_source": self.interval_source,
-                "skipped_busy": self.skipped_busy}
+                "skipped_busy": self.skipped_busy,
+                "readback": dict(self.readback),
+                "errors": self.errors, "last_error": self.last_error}
+
+    def serial_thr(self, n):
+        """body.thr for the serial status line: target and last GP28
+        readback per channel (0-based; null if none)."""
+        return {"target": [self.target.get(i) for i in range(n)],
+                "readback": [self.readback.get(i) for i in range(n)]}
 
     async def run(self, idle_fn=None, idle_only=False):
         """Fast refresh loop (just rewrites targets; set_target is the slow side)."""
@@ -166,18 +263,31 @@ class ThresholdRefresher:
             if idle_only and idle_fn is not None and not idle_fn():
                 await asyncio.sleep(0.05)
                 continue
-            i = self.step()
+            try:
+                i = self.step()
+            except Exception as e:
+                # A failed GP28 verify (ThresholdMismatch) or a pin error must
+                # not end this task: an exception here ends main(), and main()
+                # resets the Pico.  DrivePath already records the duty it
+                # tried, so the next pass does not block on the same step again.
+                self.errors += 1
+                self.last_error = repr(e)[:ERR_CHARS]
+                i = None
             await asyncio.sleep(0 if i is not None else self.idle_s)
 
 
-def refresher_from_cfg(tower, bells, thr_cfg, gate=None, clock=None):
-    """ThresholdRefresher from settings threshold_mux (hold_c, refresh{...}).
+def refresher_from_cfg(tower, bells, thr_cfg, gate=None, clock=None, cfg=None):
+    """ThresholdRefresher from settings threshold_mux (hold_c, refresh{...})
+    and the top-level "threshold" limits (threshold_settings).
     refresh.interval_s = the user's measured value (null -> datasheet)."""
     r = thr_cfg.get("refresh") or {}
     drive = bells[0].drive if bells else None
+    s = threshold_settings(cfg)
     return ThresholdRefresher(tower, drive, bells, gate=gate,
                               hold_c=float(thr_cfg.get("hold_c", 100e-9)),
                               bias_a=float(r.get("bias_a", 25e-9)),
                               tol_v=float(r.get("tol_v", 0.005)),
                               dwell_s=r.get("dwell_s"),
-                              interval_s=r.get("interval_s"), clock=clock)
+                              interval_s=r.get("interval_s"), clock=clock,
+                              min_duty=s["min_duty"], max_duty=s["max_duty"],
+                              default_duty=s["default_duty"])

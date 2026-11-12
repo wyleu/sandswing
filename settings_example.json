@@ -68,6 +68,11 @@
       "enabled": true
     }
   },
+  "threshold": {
+    "default_duty": 32768,
+    "min_duty": 0,
+    "max_duty": 65535
+  },
   "probe": {
     "present_delta": 2000,
     "lb_delta": 1000

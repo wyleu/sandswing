@@ -44,7 +44,9 @@ def doc():
                      "wifi": {"ip": None, "rssi": None, "ssid_secret": "no"},
                      "time": None, "mem_free": 12345, "gc_heap_kb": 80,
                      "edges_lost": 0, "late_drains": 1, "strokes_undelivered": 0,
-                     "watchdog": False, "unlisted": "dropped"}}
+                     "watchdog": False,
+                     "thr": {"target": [32768, None], "readback": [32100, None]},
+                     "unlisted": "dropped"}}
 
 
 def lines(port):
@@ -65,6 +67,7 @@ def test_one_whole_line_when_due_and_slim():
     b = d["body"]
     assert b["uid"] == "7091CDAB9DBD5305" and b["mem_free"] == 12345
     assert b["late_drains"] == 1 and b["watchdog"] is False
+    assert b["thr"] == {"target": [32768, None], "readback": [32100, None]}
     assert "unlisted" not in b and "ssid_secret" not in b["wifi"]
     assert "big" not in b["net"]
     assert d["serial"]["period_s"] == 10 and d["serial"]["lines"] == 0
@@ -83,6 +86,8 @@ def test_same_fields_as_udp_heartbeat():
         assert d["body"][k] == v, k
     for k in link_health.HB_UDP_ENVELOPE:
         assert d[k] == slim[k], k
+    assert "thr" not in slim["body"]           # serial only; UDP heartbeat stays slim
+    assert d["body"]["thr"]["target"][0] == 32768
 
 
 @case
@@ -178,6 +183,7 @@ def test_settings_defaults_and_clamp():
     ex = json.load(open(os.path.join(ROOT, "settings_example.json")))
     assert ex["serial_status"] == {"enabled": True, "period_s": 10, "leds": {"enabled": True}}
     assert config_loader.DEFAULTS["serial_status"] == ex["serial_status"]
+    assert "thr" in SS.SERIAL_BODY_EXTRA
     cfg = config_loader.Config(config_loader._deep_merge(config_loader.DEFAULTS, {}))
     assert SS.serial_settings(cfg) == (True, 10.0)
     assert SS.led_settings(cfg) is True
@@ -234,7 +240,8 @@ def worst():
               "last_seq": 123456789, "chan": [["unknown", "w" * 80]] * 8,
               "uptime_s": 123456789, "last_reset": "BROWNOUT " + LONG, "watchdog": True,
               "edges_lost": 123456, "late_drains": 123456, "strokes_undelivered": 123456,
-              "mem_free": 123456789, "gc_heap_kb": 123456})
+              "mem_free": 123456789, "gc_heap_kb": 123456,
+              "thr": {"target": [65535] * 8, "readback": [65535] * 8}})
     b["net"].update(drops=123456, last_drop_reason="send timeout " + LONG)
     d.update(seq=123456789, boot_id="7091cdab", id="sandswing-pico")
     return d
