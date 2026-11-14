@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+import types
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 import serial_status as SS
@@ -251,15 +252,71 @@ def plain_dumps(obj):
     return json.dumps(obj)                 # CircuitPython without separators
 
 
+WORST_STAMP = dict((key, "z" * SS.SERIAL_BUILD_CHARS) for _, key in SS.SERIAL_BUILD_FIELDS)
+
+
 @case
 def test_worst_case_line_fits_with_plain_dumps_too():
     for dumps in (link_health.dumps_compact, plain_dumps):
         p = Port()
-        s = SS.SerialStatus(p, worst, dumps=dumps, now=0.0)
+        s = SS.SerialStatus(p, worst, dumps=dumps, now=0.0, stamp=WORST_STAMP)
         s.step(0.0)
         assert s.lines == 1 and s.dropped == 0, (dumps, s.counters())
         assert len(p.out) <= SS.SERIAL_LINE_MAX_B, len(p.out)
         json.loads(bytes(p.out))
+
+
+# ---- build stamp ----------------------------------------------------------
+class Info:
+    """A build_info module stand-in (tools/deploy.sh writes the real one)."""
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+@case
+def test_build_stamp_on_the_line():
+    info = Info(GIT="b441751+", BUILT="2026-11-14T12:00:00Z", PROJECT="sandswing")
+    p = Port()
+    s = SS.SerialStatus(p, doc, now=0.0, stamp=SS.build_stamp(info))
+    s.step(0.0)
+    b = json.loads(bytes(p.out))["body"]
+    assert b["build"] == "b441751+" and b["project"] == "sandswing", b
+    assert b["built"] == "2026-11-14T12:00:00Z"
+    assert "build" not in link_health.udp_heartbeat_doc(doc())["body"]   # serial only
+
+
+@case
+def test_build_stamp_unknown_when_missing_or_odd():
+    U = SS.SERIAL_BUILD_UNKNOWN
+    assert SS.build_stamp(Info()) == {"build": U, "project": U, "built": U}
+    st = SS.build_stamp(Info(GIT="", PROJECT=7, BUILT=None))
+    assert st == {"build": U, "project": U, "built": U}, st
+    st = SS.build_stamp(Info(GIT="a" * 100, PROJECT="sandtest"))
+    assert st["build"] == "a" * SS.SERIAL_BUILD_CHARS and st["project"] == "sandtest"
+    assert st["built"] == U
+
+
+@case
+def test_build_stamp_reads_build_info_or_says_unknown():
+    saved = sys.modules.get("build_info", "absent")
+    try:
+        mod = types.ModuleType("build_info")
+        mod.GIT, mod.BUILT, mod.PROJECT = "2e90acb", "2026-11-14T00:00:00Z", "sandswing"
+        sys.modules["build_info"] = mod
+        assert SS.build_stamp()["build"] == "2e90acb"
+        assert SS.SerialStatus(Port(), doc, now=0.0).stamp["project"] == "sandswing"
+        sys.modules["build_info"] = None          # import build_info raises: not deployed
+        U = SS.SERIAL_BUILD_UNKNOWN
+        assert SS.build_stamp() == {"build": U, "project": U, "built": U}
+        p = Port()
+        s = SS.SerialStatus(p, doc, now=0.0)
+        s.step(0.0)
+        assert json.loads(bytes(p.out))["body"]["build"] == U and s.errors == 0
+    finally:
+        if saved == "absent":
+            sys.modules.pop("build_info", None)
+        else:
+            sys.modules["build_info"] = saved
 
 
 # ---- LED echo -------------------------------------------------------------

@@ -9,8 +9,11 @@ and fills the sandswing status page from it.
 The line is the slim UDP heartbeat (link_health.udp_heartbeat_doc, the
 same fields Sandbells already knows) plus a few memory / sense counters
 (SERIAL_BODY_EXTRA, including thr: per-channel threshold target and last
-GP28 readback) and this writer's own counters ("serial").  One per
-serial_status.period_s, '\\n' terminated.
+GP28 readback), the build stamp (body "build", "project", "built": GIT,
+PROJECT, BUILT from build_info.py, which tools/deploy.sh writes; GIT ends
+in "+" when deployed from uncommitted files; SERIAL_BUILD_UNKNOWN when
+there is no build_info.py or no such field) and this writer's own
+counters ("serial").  One per serial_status.period_s, '\\n' terminated.
 
 Never in the way of the strokes:
   * nothing is built while no host has the port open (connected False);
@@ -56,6 +59,10 @@ SERIAL_VIA = "usb_cdc"         # the line's "via": Sandbells knows it came by se
 SERIAL_BODY_EXTRA = ("mem_free", "gc_heap_kb", "edges_lost", "late_drains",
                      "strokes_undelivered", "watchdog", "thr")
 NEWLINE = b"\n"
+# the build stamp: build_info.py name -> heartbeat body key (read once, at start)
+SERIAL_BUILD_FIELDS = (("GIT", "build"), ("PROJECT", "project"), ("BUILT", "built"))
+SERIAL_BUILD_UNKNOWN = "unknown"   # no build_info.py, or that field missing / not text
+SERIAL_BUILD_CHARS = 24        # each stamp value cut to this (a hash+"+" is 8, BUILT 20)
 SERIAL_LED_MIN_S = 0.25        # LED echo: at most one line per this; a state shows at least this long
 SERIAL_LED_CHECK_S = 0.05      # LED echo on and a host there: look for a change this often (= panel_task)
 SERIAL_LED_TYPE = "led"        # the LED line's "t"
@@ -84,6 +91,23 @@ def led_settings(cfg):
     leds = leds if isinstance(leds, dict) else {}
     on = leds.get("enabled", True)
     return on if isinstance(on, bool) else True
+
+
+def build_stamp(info=None):
+    """-> {"build", "project", "built"} (SERIAL_BUILD_FIELDS) from info,
+    default the build_info module tools/deploy.sh writes.  A missing or
+    broken build_info.py, or a field missing / not text / empty: that
+    value is SERIAL_BUILD_UNKNOWN.  Never raises."""
+    if info is None:
+        try:
+            import build_info as info
+        except Exception:                 # ImportError, or a cut / bad file
+            info = None
+    out = {}
+    for name, key in SERIAL_BUILD_FIELDS:
+        v = getattr(info, name, None)
+        out[key] = v[:SERIAL_BUILD_CHARS] if isinstance(v, str) and v else SERIAL_BUILD_UNKNOWN
+    return out
 
 
 class LedEcho:
@@ -140,11 +164,13 @@ class LedEcho:
 
 class SerialStatus:
     """port: usb_cdc.data (or a fake with write / connected).  build: () ->
-    a heartbeat_doc.  step(now) does the work and says how long to sleep."""
+    a heartbeat_doc.  step(now) does the work and says how long to sleep.
+    stamp: the body's build fields (default build_stamp(), read once)."""
 
     def __init__(self, port, build, period_s=SERIAL_PERIOD_S, dumps=dumps_compact,
-                 max_b=SERIAL_LINE_MAX_B, now=None, leds=None):
+                 max_b=SERIAL_LINE_MAX_B, now=None, leds=None, stamp=None):
         self.port = port
+        self.stamp = build_stamp() if stamp is None else stamp
         self.leds = leds         # LedEcho or None (off)
         self._host = False       # a host had the port open at the last step
         self.build = build
@@ -181,11 +207,13 @@ class SerialStatus:
                 "leds": None if self.leds is None else self.leds.counters()}
 
     def line(self):
-        """The line's text (no newline): slim heartbeat + extras + counters."""
+        """The line's text (no newline): slim heartbeat + extras + build
+        stamp + counters."""
         doc = self.build()
         slim = udp_heartbeat_doc(doc)
         body = doc.get("body") if isinstance(doc.get("body"), dict) else {}
         slim["body"].update(_pick(body, SERIAL_BODY_EXTRA))
+        slim["body"].update(self.stamp)
         slim["via"] = SERIAL_VIA
         slim["serial"] = self.counters()
         return self.dumps(slim)
