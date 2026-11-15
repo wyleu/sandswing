@@ -44,3 +44,7 @@ def live_clients(now=None):
     return 0
 def undelivered_strokes():
     return []
+def set_rx_hook(fn):
+    pass
+def send_to(client_id, obj):
+    return None

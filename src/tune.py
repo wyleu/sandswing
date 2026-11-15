@@ -174,6 +174,7 @@ class Tuner:
         self._idle = survey_idle
         self.overrides = {}      # ch -> laser duty (RAM; passed to Ring.start)
         self.ma = {}             # ch -> last measured mA
+        self.pt = {}             # ch -> (volts, spread) of the last PT level (pt_level.py)
         self.last_adj = {}       # ch -> clock_ms of last successful adjust
         self.errors = 0
         self.last_error = None
@@ -288,7 +289,17 @@ class Tuner:
             dark = (r.get("m") or {}).get("dark", dark)
         ma = round(max(0, counts - dark) / COUNTS_PER_MA, 1)
         self.ma[ch] = ma
+        self.read_pt(ch)
         return ma
+
+    def read_pt(self, ch):
+        """The raw PT level (GP27, no mux) when ch is the wired channel; no
+        other channel has one.  -> (volts, spread) or None."""
+        pt = getattr(self.host, "pt_level", None)
+        got = pt.for_ch(ch) if pt is not None else None
+        if got is not None:
+            self.pt[ch] = got
+        return got
 
     def _values(self, ch):
         h = self.host
@@ -298,8 +309,11 @@ class Tuner:
             drv = int(h.bells[ch].laser.duty_cycle)
         except Exception:
             drv = self.overrides.get(ch)
+        pt = self.pt.get(ch)
         return {"ch": ch + 1, "thr": thr, "rb": rb, "drv": drv,
-                "ma": self.ma.get(ch)}
+                "ma": self.ma.get(ch),
+                # volts on the Orange/White wire; null: not fitted on this channel
+                "pt": pt[0] if pt else None, "pt_span": pt[1] if pt else None}
 
     def _ack(self, what, ch, ok, why, typ=TUNE_ACK_TYPE):
         body = {"t": typ, "cmd": what, "ok": bool(ok), "why": why}

@@ -332,4 +332,22 @@ def test_open_serial_tune_none_without_a_port():
     assert any("settings.json" in x and "not written" in x for x in said)
 
 
+@case
+def test_tune_get_carries_the_pt_level_only_on_the_wired_channel():
+    from pt_level import PtLevel
+
+    class ADC:
+        value = 31000
+    h = make_host()
+    h.pt_level = PtLevel(ADC(), 0, 27)
+    t = tune.Tuner(h, None, clock_ms=lambda: 0)
+    a = t.handle("tune_get", 0, None, None)
+    assert a["pt"] == round(31000 * 3.3 / 65535, 3) and a["pt_span"] == 0.0, a
+    b = t.handle("tune_get", 1, None, None)
+    assert b["pt"] is None and b["pt_span"] is None
+    h2 = make_host()                              # no pt_level at all (off in settings)
+    c = tune.Tuner(h2, None, clock_ms=lambda: 0).handle("tune_get", 0, None, None)
+    assert c["pt"] is None and c["ok"]
+
+
 finish()

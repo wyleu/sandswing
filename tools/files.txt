@@ -9,6 +9,8 @@ midi_stamp.py
 midi_ports.py
 serial_status.py
 tune.py
+pt_level.py
+align_scope.py
 sense_keys.py
 tower_watch.py
 tower_build.py

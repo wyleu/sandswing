@@ -90,6 +90,7 @@ def child_finish(out, fh):
     out["claims"] = counts
     out["errors"] = ["GP%d %s (held as %s)" % e for e in fh.errors]
     out["gp27"] = 27 in counts
+    out["gp27_kinds"] = [k for gp, k in fh.history if gp == 27]   # pt_level: AnalogIn only
     print("@@" + json.dumps(out))
 
 

@@ -757,7 +757,10 @@ def main():
               and all(k[0] == "DigitalInOut" and k[-1] == "keypad.Keys"
                       and all(a != b for a, b in zip(k, k[1:])) for k in seq.values()),
               seq)
-        check(t + " GP27 never claimed", not r["gp27"])
+        # GP27 is the PT level (pt_level.py, Orange/White of ch1): one
+        # AnalogIn, never the legacy threshold_mux.common
+        check(t + " GP27 claimed once, as the PT-level AnalogIn only",
+              r.get("gp27_kinds") == ["AnalogIn"], r.get("gp27_kinds"))
         check(t + " heads all 'empty' (ch5-8 no_board)", r.get("heads") == ["empty"] * 8
               and r.get("heads_after") == ["empty"] * 8, r.get("heads"))
         check(t + " threshold PWM 20 kHz on slice 2B", r.get("thr_pwm_hz") == 20000

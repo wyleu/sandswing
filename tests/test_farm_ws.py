@@ -1451,4 +1451,66 @@ def test_notes_for_the_log_say_what_the_model_decided():
     assert farm_ws.link_status()["send_state"] == "SEND_DEGRADED"
 
 
+# ---- sandheads scope: inbound align frames to a hook, replies to one client --
+
+@case
+def test_align_frames_go_to_the_hook_with_the_client_id_and_nothing_else_does():
+    a, b = fresh(2)
+    got = []
+    farm_ws.set_rx_hook(lambda cid, text: got.append((cid, text)))
+    a.on_receive = ['{"cmd":"align","ch":1,"scope":true}', '{"schema":"sand.hello/v1"}']
+    b.on_receive = ['{"ack_seq": 3}']
+    with fake_clock() as clock:
+        run_polls(clock, 0.2)
+    assert got == [(id(a), '{"cmd":"align","ch":1,"scope":true}')], got
+    assert farm_ws.align_stats["rx"] == 1
+
+
+@case
+def test_a_hook_that_raises_never_drops_the_client():
+    a, = fresh(1)
+
+    def boom(cid, text):
+        raise RuntimeError("bad")
+    farm_ws.set_rx_hook(boom)
+    a.on_receive = ['{"cmd":"align","info":true}']
+    with fake_clock() as clock:
+        run_polls(clock, 0.2)
+    assert farm_ws._clients == [a] and farm_ws.align_stats["hook_errors"] == 1
+
+
+@case
+def test_send_to_queues_for_that_client_only_and_the_poll_writes_it():
+    a, b = fresh(2)
+    with fake_clock() as clock:
+        run_polls(clock, 0.5)                    # handshakes, empty replays done
+        n_a, n_b = len(a.sent), len(b.sent)
+        assert farm_ws.send_to(id(a), {"type": "align", "body": {"ch": 1}}) is True
+        assert len(a.sent) == n_a                # queued, not written by the caller
+        run_polls(clock, 0.3)
+    assert len(a.sent) == n_a + 1 and len(b.sent) == n_b
+    assert json.loads(a.sent[-1])["type"] == "align"
+    assert not farm_ws._recent                   # never kept for replay
+
+
+@case
+def test_send_to_a_gone_client_is_none_and_a_full_queue_is_false():
+    a, = fresh(1)
+    with fake_clock() as clock:
+        run_polls(clock, 0.5)
+    assert farm_ws.send_to(12345, {"x": 1}) is None
+    for _ in range(farm_ws.ALIGN_TODO_MAX):
+        assert farm_ws.send_to(id(a), {"x": 1}) is True
+    assert farm_ws.send_to(id(a), {"x": 1}) is False
+    assert farm_ws.align_stats["dropped"] == 1
+
+
+@case
+def test_reset_state_removes_the_hook():
+    fresh(0)
+    farm_ws.set_rx_hook(lambda cid, text: None)
+    farm_ws.reset_state()
+    assert farm_ws._rx_hook[0] is None
+
+
 finish()

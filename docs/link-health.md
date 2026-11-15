@@ -14,6 +14,7 @@ WebSocket path.  Up to `MAX_WS_CLIENTS` (4) clients.
 | Pico -> all | `sand.event/v1` | `link` | client connected / dropped / refused, wifi_lost, wifi_back, link_dead, reset | yes |
 | Pico -> all | `sand.panel/v1` | `heartbeat` | every 5 s (`PICO_HEARTBEAT_S`) | no: page 3 widget only |
 | client -> Pico | `sand.hello/v1` | `heartbeat` | every 5 s | (Pico only notes "heard") |
+| both | `sand.panel/v1` | `align`, `align_ack`, `align_info` | only while the sandheads page asks; Pico -> that one client only | no: see [align-scope.md](align-scope.md) |
 
 Every frame uses the same envelope: `schema, type, src, id, boot_id, seq,
 tick_ms, utc_ms, err_ms, sync, acc, epoch, session, mode, srv, stratum, body`.

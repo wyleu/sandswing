@@ -64,7 +64,11 @@ def child(variant, settings_variant, scenario):
             out["idempotent"] = build_from_pins(app.pinmap["raw"]) == (app.mux, app.bells)
             out["shared_addr"] = all(b.sense.tower is app.mux and b.drive.tower is app.mux
                                      for b in app.bells)
-            out["thr_common_adc"] = 27 not in _fake_hw.claimed
+            # GP27 may be held only by pt_level (ch1 Orange/White), never as a threshold common
+            pt = getattr(app, "pt_level", None)
+            out["thr_common_adc"] = (27 not in _fake_hw.claimed
+                                     or (pt is not None and pt.gp == 27
+                                         and _fake_hw.claimed[27] == "AnalogIn"))
             out["late_mux_shares"] = (mux_select.get_address(18, 19, 20) is app.mux and
                                       mux_select.get_analog(26) is app.bells[0].sense.adc)
             run_survey(app)                      # while held: borrows, no claim
@@ -84,6 +88,7 @@ def child(variant, settings_variant, scenario):
     out["claims"] = counts
     out["errors"] = ["GP%d %s (held as %s)" % e for e in _fake_hw.errors]
     out["gp27"] = 27 in counts
+    out["gp27_kinds"] = [k for gp, k in _fake_hw.history if gp == 27]
     print("@@" + json.dumps(out))
 
 
@@ -141,7 +146,8 @@ def main():
         multi = dict((g, n) for g, n in r["claims"].items() if g in ("18", "19", "20", "26", "21", "28"))
         check(tag + " A/B/C, GP26, GP21, GP28 each claimed exactly once",
               multi == {"18": 1, "19": 1, "20": 1, "26": 1, "21": 1, "28": 1}, r["claims"])
-        check(tag + " GP27 never claimed", not r["gp27"], r["claims"])
+        check(tag + " GP27 claimed once, only as the PT-level AnalogIn",
+              r.get("gp27_kinds") == ["AnalogIn"], r.get("gp27_kinds"))
         check(tag + " threshold PWM at 20 kHz", r.get("thr_pwm_hz") == 20000, r.get("thr_pwm_hz"))
         check(tag + " build_from_pins idempotent (was claim_muxes/claim_threshold)", r.get("idempotent"))
         check(tag + " one Tower shared by sense+drive, no thr common pin",

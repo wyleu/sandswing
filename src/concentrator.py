@@ -85,6 +85,8 @@ from ring import Ring, FULL, MIN_STROKE_GAP_MS
 from midi_ports import open_outputs
 from serial_status import open_serial_status
 from tune import Tuner, open_serial_tune
+from pt_level import open_pt_level
+from align_scope import Aligner
 import panel
 import report
 
@@ -366,6 +368,9 @@ class Concentrator:
             except (ImportError, AttributeError):
                 port = None
         self.serial_tune = open_serial_tune(port, self.tune)
+        # channel 1's Orange/White PT level on GP27 (pins.pt_level; no mux)
+        self.pt_level = open_pt_level(cfg, self.mux.pins, self.n, log=emit)
+        self._setup_align()
         
         # early boot indication — before the long self-test
         self.kinds = {i: "examining" for i in range(min(4, self.n))}
@@ -391,6 +396,30 @@ class Concentrator:
         self.kinds = {}
         self.fitted = set()
         # the ring starts when the boot survey settles (_sense_step)
+
+    def _setup_align(self):
+        """The sandheads page's scope (docs/align-scope.md): idle until a
+        page asks over /ws.  Whatever goes wrong here, the tower runs on."""
+        self.align = None
+        try:
+            mem_free = None
+            try:
+                import gc
+                mem_free = gc.mem_free
+            except (ImportError, AttributeError):
+                pass
+            send_to = getattr(farm_ws, "send_to", None)
+            hook = getattr(farm_ws, "set_rx_hook", None)
+            if send_to is None or hook is None:
+                return
+            self.align = Aligner(
+                self, send_to, self.ticks.now,
+                (self.events.src, self.events.device_id, self.events.boot_id),
+                mem_free=mem_free, log=emit, survey_idle=SURVEY_IDLE)
+            hook(self.align.on_message)
+        except Exception as e:
+            self.align = None
+            emit("align scope off: %r" % e)
 
     def _setup_sense(self):
         self.sense_gps = self.pinmap["sense_gp"]
@@ -572,6 +601,9 @@ class Concentrator:
         current level (ring window, STOOD, trigger timers, tower report).
         """
         now = time.monotonic()
+        al = getattr(self, "align", None)        # the sandheads scope, when one runs
+        if al is not None and al.ch is None:
+            al = None
         for _ in range(DRAIN_ROUNDS):
             edges = self.sense.drain()
             if not edges:
@@ -582,8 +614,12 @@ class Concentrator:
                 # lwIP's ERR_MEM loop: docs/link-health.md "Ringing mode")
                 self.ring.edge(i, held, self._edge_ms(raw))
                 self._channel(i, held, now, raw)
+                if al is not None:
+                    al.edge(i, held)      # one compare; after MIDI and the stroke
         for i in range(self.n):
             self._channel(i, self._prev_held[i], now)
+        if al is not None:
+            al.sample()                   # scoped head's level (never raises)
         self.ring.clock()             # MIDI stamp clock when quiet (cheap when not due)
 
     def _edge_ms(self, raw):
@@ -857,6 +893,10 @@ class Concentrator:
         self.ring.stop()
         release(self.lasers)
         self.sense.deinit()
+        if getattr(self, "pt_level", None) is not None:
+            self.pt_level.close()
+        if getattr(self, "align", None) is not None and hasattr(farm_ws, "set_rx_hook"):
+            farm_ws.set_rx_hook(None)
         if self.thr_pwm is not None:
             release([self.thr_pwm])
         mux_select.reset_registry()
@@ -1065,6 +1105,24 @@ class Concentrator:
                                print, emit, size=_udp_last_b if _net_udp() else None)
                 self.pump_edges()
             diag.stats(now, farm_ws.stats, print)
+
+    async def align_task(self):
+        """The sandheads scope: commands, frames, auto-stop.  IDLE_S wakeups
+        and nothing else until a page asks; tick() catches everything."""
+        while True:
+            period = 1.0
+            try:
+                if self.align is not None:
+                    self.align.tick()
+                    period = self.align.period_s()
+                else:
+                    return                       # no /ws hook: nothing will ever ask
+            except Exception as e:
+                try:
+                    emit("align_task: %r" % e)
+                except Exception:
+                    pass
+            await asyncio.sleep(period)
 
     async def serial_status_task(self):
         """The heartbeat as a JSON line on usb_cdc.data (serial_status.py).
@@ -1396,6 +1454,7 @@ async def main():
         app.link_task(),
         app.mem_task(),
         app.serial_status_task(),
+        app.align_task(),
         ]
     
     if app.sntp is not None:

@@ -20,7 +20,8 @@ claim_threshold are retired; see RETIRE.md.)
     }
 
 threshold_mux.common is ignored (the output 4051 COMMON is driven by the
-filtered GP21 PWM and monitored by GP28; GP27 is unused).  There is no
+filtered GP21 PWM and monitored by GP28).  GP27 is channel 1's Orange/White
+PT level, claimed by pt_level.py ("pt_level": {"gp": 27, "ch": 1}).  There is no
 "fitted" list: heads are found by the survey.
 """
 

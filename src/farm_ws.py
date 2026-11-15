@@ -179,6 +179,15 @@ stats = {"connects": 0, "drops": 0, "refused": 0, "send_timeouts": 0,
          "hb_seen": False, "last_rx_at": None}
 
 
+# Inbound "align" frames (docs/align-scope.md) go to one optional hook,
+# fn(client_id, text), which only queues them; replies go back to that one
+# client through send_to(), queued for the poll task (never written from the
+# caller).  Counters kept apart from stats (the heartbeat carries stats).
+_rx_hook = [None]
+ALIGN_TODO_MAX = 2             # align frames waiting for one client; more: dropped
+align_stats = {"rx": 0, "hook_errors": 0, "queued": 0, "dropped": 0, "gone": 0}
+
+
 def wifi_candidates(cfg):
     nets = (cfg.raw.get("wifi") or {}).get("networks") or []
     if nets:
@@ -1790,6 +1799,12 @@ def _receive(ws, now):
             if isinstance(msg, str) and '"ack_seq"' in msg:
                 _ack(ws, m, msg)
             _event(ws, "heard")
+        if _rx_hook[0] is not None and isinstance(msg, str) and '"align"' in msg:
+            align_stats["rx"] += 1
+            try:
+                _rx_hook[0](id(ws), msg)     # queues only; its errors never drop the client
+            except Exception:
+                align_stats["hook_errors"] += 1
 
 
 def _ack(ws, m, msg):
@@ -2105,6 +2120,35 @@ def send(obj, keep=True, udp_fit=None):
     return sent
 
 
+def set_rx_hook(fn):
+    """fn(client_id, text) for each inbound text frame carrying "align";
+    None removes it.  It must only queue work (no send, no hardware)."""
+    _rx_hook[0] = fn
+
+
+def send_to(client_id, obj):
+    """One frame (not kept, not replayed) for ONE client, queued behind
+    whatever it already has; the poll task writes it inside its budget.
+    True: queued.  False: not now (lagging, replaying, its queue full, or
+    the network is not writing).  None: no such client (gone)."""
+    ws = None
+    for c in _clients:
+        if id(c) == client_id:
+            ws = c
+            break
+    if ws is None:
+        align_stats["gone"] += 1
+        return None
+    m = _meta.get(client_id)
+    if (m is None or not _net.writes() or not m["path"].writes() or m["left"] > 0
+            or len(m["todo"]) >= ALIGN_TODO_MAX):
+        align_stats["dropped"] += 1
+        return False
+    m["todo"].append(json.dumps(obj))
+    align_stats["queued"] += 1
+    return True
+
+
 def _queue_all(msg, keep):
     """Every client's queue, in order, for the poll task.  Shed: nothing
     (no client is left; strokes are in _strokes for the replay).  Batched:
@@ -2255,6 +2299,9 @@ def reset_state():
     _answered[0] = 0
     _path.reset()
     _meta.clear()
+    _rx_hook[0] = None
+    for k in align_stats:
+        align_stats[k] = 0
     for k in stats:
         stats[k] = 0
     stats["last_drop_reason"] = None
