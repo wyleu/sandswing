@@ -78,17 +78,37 @@ def get_start_program():
 
 start_file = get_start_program()
 
+PY_SUFFIX = ".py"
+RUN_ENTRY = "run"     # the program's entry point (concentrator.run)
+LAUNCH_PAUSE_S = 0.5  # let messages appear cleanly
+
+
+def launch(start_file):
+    """Import the program as a module and call its run(), if it has one.
+    Not exec(f.read()): that held the whole source text (concentrator.py,
+    68 kB) as a string in the VM heap for the entire run, and compiled the
+    program from that string.  An import reads the file in pieces and keeps
+    only the compiled code.  A program without run() runs at import (its
+    'if __name__ == "__main__"' block does not)."""
+    name = start_file[:-len(PY_SUFFIX)] if start_file.endswith(PY_SUFFIX) else start_file
+    mod = __import__(name)
+    entry = getattr(mod, RUN_ENTRY, None)
+    if entry is not None:
+        entry()
+
+
 if start_file:
     print(f"Launching: {start_file}")
-    time.sleep(0.5)  # let messages appear cleanly
+    time.sleep(LAUNCH_PAUSE_S)
+    try:
+        del config                # the launcher's copy of settings.json: not needed now
+    except NameError:
+        pass
 
     try:
-        with open(start_file, "r") as f:
-            code = f.read()
-        
-        exec(code, globals())
+        launch(start_file)
         print(f"→ {start_file} completed (or running in background)")
-    
+
     except SyntaxError as e:
         print(f"Syntax error in {start_file}: {e}")
     except Exception as e:

@@ -60,6 +60,20 @@ Public API
             free_mem: int or None
 """
 
+# link.ring_send and the numbers ring_settings() needs live in ring_mode.py
+# (concentrator reads the mode before any network import); the slim
+# heartbeat's fields and helpers in hb_slim.py (serial_status and tune use
+# them with no Wi-Fi).  Imported back: same names, same values, one place.
+from ring_mode import (RING_SEND_LIVE, RING_SEND_BATCHED, RING_SEND_SHED,   # noqa: F401
+                       RING_SEND_OFF, RING_SEND_UDP, RING_SEND_MODES, RING_SEND,
+                       MS_PER_S, MIN_SLICE_S, SLOWEST_TOLL_S, RING_QUIET_S,
+                       BATCH_PERIOD_S, ring_settings)
+from hb_slim import (HB_UDP_STR_MAX, HB_UDP_FLOAT_DP, HB_UDP_ENVELOPE,       # noqa: F401
+                     HB_UDP_BODY, HB_UDP_NET, HB_UDP_WIFI, HB_UDP_TIME,
+                     HB_UDP_TIME_LAST, HB_UDP_CHAN_WHY, dumps_compact, _slim,
+                     _pick, udp_heartbeat_doc)
+
+
 DOWN = "DOWN"
 UP = "UP"
 CLIENT_LIVE = "CLIENT_LIVE"
@@ -105,7 +119,6 @@ REPLY_BOUND_S = 0.3          # the library sending a reply / handshake / 503 (ws
 FRAME_BOUND_S = 0.3          # the rest of a started client frame (ws_bounds)
 SEND_TIMEOUT_S = 0.4         # one frame to one client (replay or live)
 CLOSE_TIMEOUT_S = 0.1        # a close frame to a stuck peer
-MIN_SLICE_S = 0.05           # not worth starting a send with less budget than this
 
 # A call that took this long counts as a bad send, whether or not it raised.
 SLOW_S = {"replay": 0.2, "live": 0.3, "server": 1.0, "close": 0.15, "poll": 1.5,
@@ -484,7 +497,6 @@ def reset_decision(wanted_at, now, pending, live, hold_s=RESET_HOLD_S):
 # the most this loop can afford).  The floor is MIN_SLICE_S.  NOT covered,
 # whatever the setting: lwip_tcp_send's ERR_MEM sleep (LWIP_ERR_MEM_S), which is
 # C code that a Python deadline cannot interrupt.
-MS_PER_S = 1000
 SEND_BLOCK_MS = int(SEND_TIMEOUT_S * MS_PER_S)
 
 
@@ -663,13 +675,6 @@ class StatusGate:
 # funeral toll can be further apart than that; the network must not come back
 # (and stall) between two tolls.
 # ---------------------------------------------------------------------------
-RING_SEND_LIVE = "live"
-RING_SEND_BATCHED = "batched"
-RING_SEND_SHED = "shed"
-RING_SEND_OFF = "off"
-RING_SEND_UDP = "udp"
-RING_SEND_MODES = (RING_SEND_LIVE, RING_SEND_BATCHED, RING_SEND_SHED, RING_SEND_OFF,
-                   RING_SEND_UDP)
 # Tiers (the user's, 2026-11-01): 1 = MIDI by PIO, no Wi-Fi (not built yet:
 # "off" until it is); 2 = MIDI first, no Wi-Fi ("off"); 3 = MIDI first plus
 # best-effort strokes to Sandbells ("udp").
@@ -701,16 +706,6 @@ UDP_MAX_B = 1472                    # one Ethernet frame (1500 - IP 20 - UDP 8):
 # HB_UDP_STR_MAX, compact separators where json.dumps takes them.  Still too
 # big: HB_UDP_DROP, in order, until it fits; anything that cannot is
 # udp_send's too_big.  Same schema and type: Sandbells needs no change.
-HB_UDP_STR_MAX = 40                 # any string in the UDP heartbeat is cut to this many chars
-HB_UDP_FLOAT_DP = 1                 # ...and any float rounded to this many places
-HB_UDP_ENVELOPE = ("schema", "type", "src", "id", "boot_id", "seq")
-HB_UDP_BODY = ("panel", "panel_state", "sync", "uid", "chan", "link", "tower",
-               "last_seq", "uptime_s", "last_reset")
-HB_UDP_NET = ("drops", "last_drop_reason")
-HB_UDP_WIFI = ("ip", "rssi")
-HB_UDP_TIME = ("srv", "stratum", "peer")
-HB_UDP_TIME_LAST = ("ok", "why")
-HB_UDP_CHAN_WHY = ("body", "chan", "why")    # pseudo path: every chan why -> None
 # dropped first to last while the datagram is still too big (the worst case
 # fits without: test_ring_send); never dropped: the envelope, body.uid,
 # panel, panel_state, sync, chan kinds, time.srv/stratum/peer, wifi.rssi,
@@ -721,52 +716,6 @@ HB_UDP_DROP = (
     ("body", "time", "last"), ("body", "net", "last_drop_reason"),
     HB_UDP_CHAN_WHY,
 )
-
-
-def dumps_compact(obj):
-    """json.dumps without spaces where CircuitPython's json takes
-    separators (MICROPY_PY_JSON_SEPARATORS), else the plain one."""
-    import json
-    try:
-        return json.dumps(obj, separators=(",", ":"))
-    except TypeError:
-        return json.dumps(obj)
-
-
-def _slim(v):
-    """Strings cut to HB_UDP_STR_MAX, floats rounded, lists/dicts walked."""
-    if isinstance(v, str):
-        return v[:HB_UDP_STR_MAX]
-    if isinstance(v, float):
-        return round(v, HB_UDP_FLOAT_DP)
-    if isinstance(v, (list, tuple)):
-        return [_slim(x) for x in v]
-    if isinstance(v, dict):
-        return dict((k, _slim(x)) for k, x in v.items())
-    return v
-
-
-def _pick(d, keys):
-    d = d if isinstance(d, dict) else {}
-    return dict((k, _slim(d[k])) for k in keys if k in d)
-
-
-def udp_heartbeat_doc(doc):
-    """The slim copy of a heartbeat_doc() (doc is not changed)."""
-    out = _pick(doc, HB_UDP_ENVELOPE)
-    body = doc.get("body") if isinstance(doc.get("body"), dict) else {}
-    b = _pick(body, HB_UDP_BODY)
-    b["net"] = _pick(body.get("net"), HB_UDP_NET)
-    b["wifi"] = _pick(body.get("wifi"), HB_UDP_WIFI)
-    t = body.get("time")
-    if isinstance(t, dict):
-        b["time"] = _pick(t, HB_UDP_TIME)
-        if isinstance(t.get("last"), dict):
-            b["time"]["last"] = _pick(t["last"], HB_UDP_TIME_LAST)
-    else:
-        b["time"] = None
-    out["body"] = b
-    return out
 
 
 def _drop(doc, path):
@@ -920,7 +869,6 @@ def cmd_check(doc, peer, allowed, uid, boot_id, last_seq):
     if last_seq is not None and seq <= last_seq:
         return False, "seq %d not above %d (replay)" % (seq, last_seq)
     return True, None
-RING_SEND = RING_SEND_LIVE          # default: behaviour as before this table
 
 
 # --- back chat: Sandbells acks each heartbeat (udp) -------------------------
@@ -1039,17 +987,12 @@ class AckWatch:
                 "silent_s": None if self.since is None else round(now - self.since, 1),
                 "rejoin_tries": self.tries, "dead_s": self.dead_s}
 
-# A minute bell tolls once per 60 s at the slowest; twice that bridges one
-# missed or late stroke without the network coming back between tolls.
-SLOWEST_TOLL_S = 60.0
-RING_QUIET_S = 2 * SLOWEST_TOLL_S   # link.ring_quiet_s
 # One batch per client per BATCH_PERIOD_S.  A stroke frame is ~320 B
 # (sand.event/v1, 4 B WS header), so one TCP_MSS segment holds
 # BATCH_MAX_B // 320 = 4.  Eight bells in changes strike ~3.7 times a second
 # (5040 changes x 8 strokes in ~3 h); 1 s gathers about that many: one
 # segment per second instead of ~4.  Shorter periods gather fewer and save
 # less; the price is up to one period of delay on the display (not on MIDI).
-BATCH_PERIOD_S = 1.0                # link.batch_ms
 BATCH_MAX_B = TCP_MSS               # one segment (one pbuf) per batch write
 N_QUIET = "QUIET"                   # no stroke for ring_quiet_s: the network as configured
 N_RINGING = "RINGING"               # ringing: link.ring_send applies
@@ -1073,24 +1016,6 @@ NET_PLAN[(N_RINGING, RING_SEND_OFF)] = (False, False, False, False)
 NET_PLAN[(N_QUIET, RING_SEND_UDP)] = (False, False, False, True)
 NET_PLAN[(N_RINGING, RING_SEND_UDP)] = (False, False, False, False)
 del _m
-
-
-def ring_settings(cfg):
-    """settings.json link.ring_send / batch_ms / ring_quiet_s ->
-    (mode, batch_s, quiet_s); anything unusable gives the default."""
-    sec = (cfg.get("link", {}) if cfg is not None else {}) or {}
-    mode = sec.get("ring_send", RING_SEND)
-    if mode not in RING_SEND_MODES:
-        mode = RING_SEND
-    try:
-        batch_s = max(MIN_SLICE_S, float(sec.get("batch_ms", BATCH_PERIOD_S * MS_PER_S)) / MS_PER_S)
-    except (TypeError, ValueError):
-        batch_s = BATCH_PERIOD_S
-    try:
-        quiet_s = max(0.0, float(sec.get("ring_quiet_s", RING_QUIET_S)))
-    except (TypeError, ValueError):
-        quiet_s = RING_QUIET_S
-    return mode, batch_s, quiet_s
 
 
 class NetMode:

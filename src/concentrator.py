@@ -55,7 +55,6 @@ import time
 import asyncio
 import board
 import neopixel
-import wifi
 import os
 
 try:
@@ -65,6 +64,18 @@ except ImportError:
 
 
 from config_loader import load_config
+from ring_mode import net_off as ring_send_off
+
+# link.ring_send picks the network modules, so settings.json is read first.
+# "off" (no Wi-Fi this boot): net_none stands in for farm_ws, and farm_ws,
+# its web server library, link_health, ws_bounds, status_doc and wifi are
+# never imported (about 90 kB of the Pico's RAM).  "live" / "udp": as before.
+cfg = load_config()
+NET_OFF = ring_send_off(cfg)
+if NET_OFF:
+    import net_none as farm_ws
+else:
+    import farm_ws
 from tower_watch import (
     TowerWatch,
     RINGING,
@@ -72,8 +83,7 @@ from tower_watch import (
     IDLE,
 )
 from pins_from_settings import load_pinmap
-from farm_ws import connect_wifi, start_server, send
-import farm_ws
+connect_wifi, start_server, send = farm_ws.connect_wifi, farm_ws.start_server, farm_ws.send
 from lastline import print        # print as before, and remember the line
 import lastline
 from tower_build import build_from_pins
@@ -89,7 +99,6 @@ from pt_level import open_pt_level, brief as pt_brief
 from align_scope import Aligner, SERIAL_CID
 from heads_cc import open_cc
 import panel
-import report
 
 from board_pins import release
 import watchdog_guard
@@ -100,8 +109,16 @@ from survey_state import SurveyState, SURVEYING, SETTLED, IDLE as SURVEY_IDLE
 from mux_errors import ChannelBusy
 from laser_measure import counts_to_ma
 from adc_avg import avg as _avg
-from link_health import LinkHealth, PICO_RESET_S, STALL_WINDOW_S, RESET_HOLD_S, reset_decision
-from link_health import HeartbeatDiag, udp_heartbeat, HB_UDP_NET
+from hb_slim import HB_UDP_NET
+if NET_OFF:
+    # no link to supervise: no LinkHealth, heartbeat datagram, radio or Pico
+    # reset for the link (link_step returns at once on "off")
+    LinkHealth = HeartbeatDiag = reset_decision = udp_heartbeat = None
+    PICO_RESET_S = STALL_WINDOW_S = RESET_HOLD_S = None
+else:
+    from link_health import LinkHealth, PICO_RESET_S, STALL_WINDOW_S, RESET_HOLD_S, reset_decision
+    from link_health import HeartbeatDiag, udp_heartbeat
+    import report                 # /status (sand_status); "off" has no server
 from sense_keys import SenseKeys, settings as sense_settings, late_drain_ms
 import heap_watch                 # VM heap size: it grows into the RAM lwIP needs
 
@@ -156,8 +173,7 @@ EMPTY_CHECK_S = 1.0          # gap between checks
 EMPTY_SETTLE_S = 0.02        # laser on -> read the sense ADC
 EMPTY_HEAD_MA = 5.0          # laser current that means a head is now fitted
 
-cfg = load_config()
-cfg.banner()
+cfg.banner()                     # cfg: read at the top (link.ring_send picks the imports)
 
 def short_why(w, n=WHY_HB_CHARS):
     """Cut a why line to n chars, keeping its trailing "(measurements)"."""
@@ -198,6 +214,7 @@ def setup_net(rounds=WIFI_ROUNDS):
 def setup_sntp(ip):
     """SntpClock on the GPS servers by IP (spec T4), or None."""
     t = cfg.get("time", {}) or {}
+    import wifi                          # here, not at the top: never on "off"
     from time_servers import candidates
     ips = candidates(t.get("ntp_ips"), ip, wifi.radio.ipv4_subnet, log=emit)
     if ip is None or not ips:
@@ -298,11 +315,14 @@ class Concentrator:
         self.pinmap = load_pinmap(cfg)
         self.sense_gps = self.pinmap["sense_gp"]
         
-        self.link_health = LinkHealth()
+        self.link_health = None if NET_OFF else LinkHealth()   # "off": no link to supervise
         self._reset_wanted_at = None     # LinkHealth asked for a Pico reset (held: strokes)
         self._reset_said = None
-        self.reset_hold_s = max(0.0, cfg.get_float("link.reset_hold_s", RESET_HOLD_S)) \
-            if hasattr(cfg, "get_float") else RESET_HOLD_S
+        if NET_OFF:
+            self.reset_hold_s = None     # "off": never a Pico reset for the link
+        else:
+            self.reset_hold_s = max(0.0, cfg.get_float("link.reset_hold_s", RESET_HOLD_S)) \
+                if hasattr(cfg, "get_float") else RESET_HOLD_S
         
         self.n = len(self.sense_gps)          # set n first
         self.link = "no_wifi"
@@ -536,6 +556,8 @@ class Concentrator:
     def status_payload(self, parts=True):
         """parts=False (farm_ws: deltas and Sandbells' first full document,
         which never show them): only the watchdog part, for last_reset."""
+        import report                      # loaded at the top unless "off" (no /status)
+        import wifi
         if parts:
             parts = {"mux": report.part(self.mux), "gate": report.part(self.gate),
                      "refresh": report.part(self.refresher),
@@ -1113,7 +1135,9 @@ class Concentrator:
 
     async def heartbeat_task(self):
         last = time.monotonic()
-        diag = HeartbeatDiag(last)               # log only: first heartbeats, udp stats
+        # "off": no client and no datagram, so nothing is built or sent (the
+        # serial line has its own task); only the late-loop check runs
+        diag = None if NET_OFF else HeartbeatDiag(last)   # log only: first heartbeats, udp stats
         while True:
             await asyncio.sleep(PICO_HEARTBEAT_S)
             now = time.monotonic()
@@ -1123,6 +1147,8 @@ class Concentrator:
                 # the whole loop was held this long: say what else was going on
                 emit("loop late %.1f s (survey %s, clients %d)" % (
                     late, self.survey_state.phase, farm_ws.ws_clients()))
+            if diag is None:
+                continue
             if diag.gate(now, farm_ws.ws_clients(), _net_udp(), print):   # "udp": one datagram, no wait
                 self.pump_edges()
                 # never raises (never kills main()): console lines by print,
@@ -1434,7 +1460,7 @@ def start_app():
     """Everything up to the steady loop: net, Concentrator (survey,
     classify, self-test, ring), first time sync, server.  The watchdog is
     armed last."""
-    from link_health import ring_settings, RING_SEND_OFF, RING_SEND_UDP
+    from ring_mode import ring_settings, RING_SEND_OFF, RING_SEND_UDP
     mode = ring_settings(cfg)[0]
     net_off = mode == RING_SEND_OFF
     no_tcp = mode in (RING_SEND_OFF, RING_SEND_UDP)
@@ -1458,7 +1484,11 @@ def start_app():
     app.link = "wifi_only" if ip else "no_wifi"   # panel_task: ws_client when /ws connected
     app.wifi_up = bool(ip)                        # link_task rejoins if not
 
-    app.sntp = setup_sntp(ip)
+    if net_off:
+        app.sntp = None                           # no IP: as setup_sntp(None), without wifi
+        emit("No time sync (no IP or no time.ntp_ips)")
+    else:
+        app.sntp = setup_sntp(ip)
     
     if app.sntp is not None:
         try:

@@ -6,7 +6,7 @@ The heartbeat, one line of JSON at a time, on the Pico's USB data port
 REPL console being ttyACM0).  No Wi-Fi: Sandbells' ingest_serial reads it
 and fills the sandswing status page from it.
 
-The line is the slim UDP heartbeat (link_health.udp_heartbeat_doc, the
+The line is the slim UDP heartbeat (hb_slim.udp_heartbeat_doc, the
 same fields Sandbells already knows) plus a few memory / sense counters
 (SERIAL_BODY_EXTRA, including thr: per-channel threshold target and last
 GP28 readback), the build stamp (body "build", "project", "built": GIT,
@@ -47,7 +47,7 @@ settings.json (optional; these are the defaults):
 
 import time
 
-from link_health import udp_heartbeat_doc, dumps_compact, _pick
+from hb_slim import udp_heartbeat_doc, dumps_compact, _pick   # no Wi-Fi module (ring_send "off")
 
 SERIAL_PERIOD_S = 10.0         # a line this often (settings serial_status.period_s)
 SERIAL_PERIOD_MIN_S = 2.0      # never more often than this

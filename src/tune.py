@@ -520,7 +520,7 @@ class SerialTune:
 
 def _dumps(obj):
     try:
-        from link_health import dumps_compact
+        from hb_slim import dumps_compact     # no Wi-Fi module (ring_send "off")
         return dumps_compact(obj)
     except ImportError:
         return json.dumps(obj, separators=(",", ":"))
