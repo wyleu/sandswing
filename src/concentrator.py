@@ -1287,9 +1287,11 @@ class Concentrator:
                 n += 1
                 total, free = heap_watch.check(emit, "mem check")
                 if n % MEM_LOG_EVERY == 0:
-                    emit("mem free %d kB%s, VM heap %d kB" % (
+                    kept = getattr(farm_ws, "strokes_kept", None)
+                    emit("mem free %d kB%s, VM heap %d kB, strokes kept %s" % (
                         free // heap_watch.KB, "" if quiet else " (busy)",
-                        total // heap_watch.KB))
+                        total // heap_watch.KB,
+                        "?" if kept is None else kept()))
             except Exception as e:
                 emit("mem_task: %r" % e)
 

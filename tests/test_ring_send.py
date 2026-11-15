@@ -1044,4 +1044,36 @@ def test_link_brief_is_just_the_asked_counters():
         assert farm_ws.link_brief(("nope",)) == {"nope": None}
 
 
+
+@case
+def test_off_builds_and_keeps_nothing_so_strokes_cannot_fill_the_heap():
+    # 2026-11-15 bench: "off", 14 kB free idle; a run of strokes on ch1 and
+    # main() died "MemoryError ... 296 bytes" (each stroke was json.dumps'd
+    # into the replay buffer, which nobody can ever be sent in "off")
+    with rig("off"):
+        farm_ws.drop_all("test")                           # "off" never has a client
+        farm_ws._strokes.append((99, "{}"))                # left from an earlier tier this boot
+        farm_ws._recent.append("{}")
+        _, out = logged(lambda: [farm_ws.send(stroke(q + 1)) for q in range(farm_ws.STROKE_KEEP + 5)])
+        assert not farm_ws._strokes and not farm_ws._recent and not farm_ws.undelivered_strokes()
+        assert farm_ws.strokes_kept() == 0
+        assert "UNCONFIRMED" not in out, out
+        assert farm_ws.stats["strokes_kept"] == 0 and farm_ws.stats["replay_freed"] == 2
+        assert farm_ws.net_ringing()                       # NetMode still follows the strokes
+        # nothing is serialised at all: an object json cannot encode is not an error
+        assert farm_ws.send({"type": "link", "body": {"x": {1, 2}}}) is False
+        assert farm_ws.send({"type": "heartbeat"}, keep=False) is False
+
+
+@case
+def test_wifi_off_command_frees_what_the_udp_tier_held():
+    with udp_rig("udp") as r:
+        r.pool.inbox.append((cmd(7), (SB, 40000)))
+        farm_ws.poll()
+        farm_ws.poll()
+        assert farm_ws.net_off()
+        farm_ws._strokes.append((5, "{}"))
+        farm_ws.send(stroke(6))
+        assert farm_ws.strokes_kept() == 0 and not farm_ws._recent
+
 finish()

@@ -686,9 +686,10 @@ def _keep_stroke(seq, msg):
 
 
 def _drop_replay():
-    """The "udp" tier: nothing is ever confirmed or replayed there (no /ws
-    client), so the replay buffers only held heap (STROKE_KEEP strokes,
-    about 350 B each) and logged every stroke UNCONFIRMED.  Empty them."""
+    """The "udp" and "off" tiers: nothing is ever confirmed or replayed there
+    (no /ws client), so the replay buffers only held heap (STROKE_KEEP
+    strokes, about 350 B each) and logged every stroke UNCONFIRMED.  Empty
+    them."""
     if _strokes or _recent or _confirmed:
         stats["replay_freed"] += len(_strokes) + len(_recent)
         del _strokes[:]
@@ -701,6 +702,11 @@ def _confirm(seqs):
         if q not in _confirmed and any(q == k for k, _ in _strokes):
             _confirmed.add(q)
             stats["strokes_confirmed"] += 1
+
+
+def strokes_kept():
+    """How many strokes the replay buffer holds now (heap, ~0.35 kB each)."""
+    return len(_strokes)
 
 
 def undelivered_strokes():
@@ -2064,6 +2070,17 @@ def send(obj, keep=True, udp_fit=None):
                 print("%.3f udp heartbeat trimmed to %d B: dropped %s, %d this boot" % (
                     time.monotonic(), len(msg.encode("utf-8")), ",".join(dropped), n))
         return udp_send(msg)
+    if _net.off():
+        # "off" (link.ring_send, or the wifi_off command): no client and no
+        # datagram for the rest of this boot, so nothing is built or kept.
+        # 2026-11-15: every stroke went through json.dumps into _strokes and
+        # _recent for a replay that could never happen.  A full buffer is
+        # STROKE_KEEP x ~0.35 kB (~22 kB); the idle Pico had 14 kB free, and
+        # after a run of strokes main() died "MemoryError ... 296 bytes".
+        _drop_replay()
+        if keep and isinstance(obj, dict) and obj.get("type") == "stroke":
+            _net_stroke(time.monotonic())        # NetMode still follows the ringing
+        return False
     msg = json.dumps(obj)
     if isinstance(obj, dict) and obj.get("boot_id"):
         _event_boot[0] = obj.get("boot_id")      # this boot (acks and commands must name it)
