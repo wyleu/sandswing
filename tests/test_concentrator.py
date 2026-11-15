@@ -338,6 +338,10 @@ def link(app):
         "info": [o.get("type") for o in got] == [align_scope.T_INFO]
         and got[0]["body"]["frame_ms"] == align_scope.SERIAL_FRAME_MS,
         "pt_key": "pt" in app.heartbeat_doc(count=False)["body"]}
+    # the reader's counters ride the heartbeat (the align line above: align 1)
+    hb_tune = app.heartbeat_doc(count=False)["body"]["tune"]
+    res["heads_serial"]["tune_key"] = (tuple(hb_tune) == tune.BRIEF_KEYS
+                                       and hb_tune["align"] == 1 and hb_tune["errors"] == 0)
     # ring_send "off": the heartbeat's net is the brief (HB_UDP_NET), not a
     # copy of every link counter (heap) -- the serial line keeps only those
     import link_health
@@ -1005,8 +1009,9 @@ def main():
           S.get("seq_kept") and S.get("whole") and S.get("fits") and S.get("panel")
           and S.get("extra") and S.get("host_none"), S or r.get("exc"))
     H = L.get("heads_serial") or {}
-    check("link: sandheads over the USB data port: wired to SerialTune, info line back, heartbeat has pt, off: net brief",
-          H.get("wired") and H.get("info") and H.get("pt_key") and H.get("off_net"),
+    check("link: sandheads over the USB data port: wired to SerialTune, info line back, heartbeat has pt and tune counters, off: net brief",
+          H.get("wired") and H.get("info") and H.get("pt_key") and H.get("off_net")
+          and H.get("tune_key"),
           H or r.get("exc"))
     check("link: heartbeat_task sends the whole doc, keep=False, udp_fit=udp_heartbeat",
           L.get("hb_sends") == [["heartbeat", ["keep", "udp_fit"], False, True]],

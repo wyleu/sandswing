@@ -9,7 +9,8 @@ and fills the sandswing status page from it.
 The line is the slim UDP heartbeat (hb_slim.udp_heartbeat_doc, the
 same fields Sandbells already knows) plus a few memory / sense counters
 (SERIAL_BODY_EXTRA, including thr: per-channel threshold target and last
-GP28 readback), the build stamp (body "build", "project", "built": GIT,
+GP28 readback, and tune: the data port's command reader, tune.SerialTune
+.brief), the build stamp (body "build", "project", "built": GIT,
 PROJECT, BUILT from build_info.py, which tools/deploy.sh writes; GIT ends
 in "+" when deployed from uncommitted files; SERIAL_BUILD_UNKNOWN when
 there is no build_info.py or no such field) and this writer's own
@@ -57,7 +58,7 @@ SERIAL_ERR_CHARS = 40          # last error kept, cut to this
 SERIAL_VIA = "usb_cdc"         # the line's "via": Sandbells knows it came by serial
 # heartbeat body fields the UDP heartbeat leaves out (memory, sense queue)
 SERIAL_BODY_EXTRA = ("mem_free", "gc_heap_kb", "edges_lost", "late_drains",
-                     "strokes_undelivered", "watchdog", "thr", "pt")
+                     "strokes_undelivered", "watchdog", "thr", "pt", "tune")
 NEWLINE = b"\n"
 # the build stamp: build_info.py name -> heartbeat body key (read once, at start)
 SERIAL_BUILD_FIELDS = (("GIT", "build"), ("PROJECT", "project"), ("BUILT", "built"))

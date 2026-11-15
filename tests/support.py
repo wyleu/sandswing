@@ -112,6 +112,22 @@ NEW_STYLE = {
     "threshold_mux": {"select": "tower", "pwm_gp": 21, "sense_gp": 28},
 }
 
+class CPBytearray(bytearray):
+    """bytearray as CircuitPython 10.0.3 has it: no slice deletion; slices
+    stay CPBytearray so a second use is checked too."""
+
+    def __delitem__(self, k):
+        raise TypeError("'bytearray' object doesn't support item deletion")
+
+    def __getitem__(self, k):
+        v = bytearray.__getitem__(self, k)
+        return CPBytearray(v) if isinstance(k, slice) else v
+
+    def __iadd__(self, other):
+        self.extend(other)
+        return self
+
+
 results = []
 
 

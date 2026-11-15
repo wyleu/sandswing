@@ -350,4 +350,66 @@ def test_tune_get_carries_the_pt_level_only_on_the_wired_channel():
     assert c["pt"] is None and c["ok"]
 
 
+
+class CPBuffers:
+    """with CPBuffers(): every bytearray tune.py makes is a CPBytearray."""
+
+    def __enter__(self):
+        tune.bytearray = CPBytearray       # module global shadows the builtin
+        return self
+
+    def __exit__(self, *exc):
+        del tune.bytearray
+        return False
+
+
+def cp_serial_tune(port):
+    s = tune.SerialTune(port, tune.Tuner(make_host(), clock_ms=lambda: 0))
+    assert isinstance(s._buf, CPBytearray)
+    return s
+
+
+@case
+def test_serial_tune_reads_lines_with_cp_bytearray():
+    with CPBuffers():
+        p = Port()
+        s = cp_serial_tune(p)
+        # two lines in one read, then a line split across reads, CRLF on one
+        p.feed('{"cmd":"tune_get","ch":1}\n{"cmd":"tune","ch":1,"thr":40000}\r\n{"cmd":"tu')
+        s.poll(1.0, busy=False)
+        assert isinstance(s._buf, CPBytearray) and bytes(s._buf) == b'{"cmd":"tu'
+        p.feed('ne_get","ch":1}\n')
+        s.poll(1.1, busy=False)
+        s.poll(1.2, busy=False)
+    assert s.errors == 0, s.last_error
+    assert s.lines == 3 and s.bad == 0, s.counters()
+    acks = [json.loads(x) for x in bytes(p.out).split(b"\n") if x.strip()]
+    assert [a["t"] for a in acks] == ["tune", "tune_ack", "tune"], acks
+    assert acks[1]["ok"] is True and acks[1]["thr"] == 40000
+
+
+@case
+def test_serial_tune_old_slice_delete_is_what_cp_refuses():
+    # the pre-fix line, on a CircuitPython-like buffer: TypeError
+    b = CPBytearray(b"ab\ncd")
+    expect(TypeError, b.__delitem__, slice(None, 3))
+    assert bytes(b[3:]) == b"cd" and isinstance(b[3:], CPBytearray)
+
+
+@case
+def test_brief_is_the_small_counter_set():
+    with CPBuffers():
+        p = Port()
+        s = cp_serial_tune(p)
+        b = s.brief()
+        assert tuple(b) == tune.BRIEF_KEYS or sorted(b) == sorted(tune.BRIEF_KEYS)
+        assert set(b.values()) == {0, None}
+        seen = []
+        s.align_rx = seen.append
+        p.feed(b'not json\n{"cmd":"tune_get","ch":1}\n{"cmd":"align","ch":1,"scope":true}\n')
+        s.poll(1.0, busy=False)
+    b = s.brief()
+    assert (b["lines"], b["align"], b["bad"], b["errors"]) == (1, 1, 1, 0), b
+    assert len(seen) == 1 and b["last_error"] is None
+
 finish()

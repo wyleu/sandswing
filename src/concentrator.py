@@ -1113,6 +1113,10 @@ class Concentrator:
             "strokes_undelivered": len(farm_ws.undelivered_strokes()),
             "thr": self.refresher.serial_thr(self.n),
         })
+        st = getattr(self, "serial_tune", None)
+        # the USB data port's command reader (tune.SerialTune.brief): lines
+        # handled, bad, errors, last error; None: no data port
+        body["tune"] = st.brief() if st is not None else None
         try:
             # [ch, volts, spread] of the PT wire now (GP27, no mux), for the
             # serial line: Sandbells logs it for day / night drift

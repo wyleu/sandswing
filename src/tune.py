@@ -52,6 +52,10 @@ TUNE_ACK_TYPE = "tune_ack"
 TUNE_GET_TYPE = "tune"
 NEWLINE = b"\n"
 ERR_CHARS = 80
+# SerialTune counters on the serial heartbeat (body "tune"; strings there are
+# cut to hb_slim.HB_UDP_STR_MAX): tune commands handled, sandheads align lines
+# handed on, bad lines, poll errors and the last error
+BRIEF_KEYS = ("lines", "align", "bad", "errors", "last_error")
 
 KNOWN_CMDS = ("tune", "drive", "tune_get")
 ALIGN_MARK = '"align"'          # a line naming it goes to align_scope (cmd "align")
@@ -401,6 +405,12 @@ class SerialTune:
                 "dropped_ack": self.dropped_ack, "errors": self.errors,
                 "last_error": self.last_error, "align": self.aligned}
 
+    def brief(self):
+        """BRIEF_KEYS of counters(), for the serial heartbeat (body "tune"):
+        a failing reader shows on the page instead of only here."""
+        c = self.counters()
+        return dict((k, c[k]) for k in BRIEF_KEYS)
+
     def busy(self):
         """True while an ack / frame is part-written (SerialStatus waits)."""
         return self._ack is not None
@@ -506,7 +516,10 @@ class SerialTune:
                     if i < 0:
                         break
                     raw = bytes(self._buf[:i]).rstrip(b"\r")
-                    del self._buf[:i + 1]
+                    # a new bytearray, not `del self._buf[:i + 1]`: CircuitPython
+                    # 10.0.3 bytearrays have no slice deletion (TypeError, so
+                    # every command line was dropped; tests/test_cp_buffers.py)
+                    self._buf = self._buf[i + 1:]
                     if raw:
                         self._one_line(raw, now_ms, busy)
         except Exception as e:
