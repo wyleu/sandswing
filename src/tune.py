@@ -28,7 +28,7 @@ import time
 
 from mux_errors import ChannelBusy
 from signal_bands import COUNTS_PER_MA, FLOOR_COUNTS
-from adc_avg import avg as _avg
+from adc_avg import paced_avg
 from threshold_refresh import clamp_duty, threshold_settings, _int
 from ring import FULL
 
@@ -44,7 +44,26 @@ ACTIVE_KINDS = ("head_new", "head_old")
 NO_THRESHOLD_KINDS = ("head_old",)
 
 TUNE_MIN_GAP_MS = 200          # at most one adjustment per head per this
-TUNE_ADC_N = 32                # GP26 samples (~ one 1 kHz PWM period)
+# Laser mA: the laser current is chopped by its PWM (1 kHz), so a quick
+# burst of reads catches a random part of on / off and the value jumps (at
+# 25 % duty: 0.2-1 mA, now and then 22 mA).  So GP26 is read at TUNE_ADC_N
+# points spread evenly over TUNE_ADC_PERIODS whole PWM periods (adc_avg
+# .paced_avg): the mean is the average current; / duty: the on-current.
+TUNE_ADC_N = 131               # GP26 reads per burst, prime (coprime with the
+                               # period count).  time.monotonic_ns steps in
+                               # 1/32768 s on the RP2350: 131 is one read per step
+                               # over 4 ms, as fine as the pacing clock allows
+TUNE_ADC_PERIODS = 4           # whole laser PWM periods per burst (4 ms at 1 kHz)
+TUNE_BURST_MAX_MS = 5          # blocking cap (5-pin MIDI, the loop): fewer whole
+                               # periods if the PWM is slow, never under one
+TUNE_MA_BURSTS = 4             # mA is the mean of this many bursts at one duty
+                               # (a drive change starts afresh): steadier, as each
+                               # burst starts at a different PWM phase
+LASER_HZ = 1000                # if the PWM cannot say: pins.laser_pwm_hz's default
+MA_DP = 2                      # mA decimals (heads_cc.MA_UNITS is 0.01 mA)
+NS_PER_S = 1000000000
+NS_PER_MS = 1000000
+NS_PER_US = 1000
 TUNE_LINE_MAX_B = 256          # one inbound command line
 TUNE_BUF_MAX_B = 512           # inbound reassembly cap; over: drop and resync
 TUNE_POLL_S = 0.05             # how often poll() wants to be called
@@ -54,8 +73,9 @@ NEWLINE = b"\n"
 ERR_CHARS = 80
 # SerialTune counters on the serial heartbeat (body "tune"; strings there are
 # cut to hb_slim.HB_UDP_STR_MAX): tune commands handled, sandheads align lines
-# handed on, bad lines, poll errors and the last error
-BRIEF_KEYS = ("lines", "align", "bad", "errors", "last_error")
+# handed on, bad lines, poll errors and the last error; burst_us: the last
+# laser-mA burst (Tuner.burst_us), to see its cost on the Pico
+BRIEF_KEYS = ("lines", "align", "bad", "errors", "last_error", "burst_us")
 
 KNOWN_CMDS = ("tune", "drive", "tune_get")
 ALIGN_MARK = '"align"'          # a line naming it goes to align_scope (cmd "align")
@@ -175,13 +195,17 @@ class Tuner:
     survey_state.phase, survey_state.last_result, and the survey-idle
     name (default 'idle').  Nothing is written to a file."""
 
-    def __init__(self, host, cfg=None, clock_ms=None, survey_idle="idle"):
+    def __init__(self, host, cfg=None, clock_ms=None, survey_idle="idle", now_ns=None):
         self.host = host
+        self.now_ns = now_ns or _now_ns
         self.settings = tune_settings(cfg)
         self.clock = clock_ms or _now_ms
         self._idle = survey_idle
         self.overrides = {}      # ch -> laser duty (RAM; passed to Ring.start)
-        self.ma = {}             # ch -> last measured mA
+        self.ma = {}             # ch -> last average laser mA (above dark)
+        self.ma_on = {}          # ch -> that / duty: the current while on (None: duty 0)
+        self.burst_us = None     # how long the last GP26 burst took
+        self._bursts = {}        # ch -> [duty, [burst means, newest last]]
         self.pt = {}             # ch -> (volts, spread) of the last PT level (pt_level.py)
         self.last_adj = {}       # ch -> clock_ms of last successful adjust
         self.errors = 0
@@ -270,6 +294,10 @@ class Tuner:
             if ma is False:
                 return self._ack("drive", ch, False, "busy")
             cap = s["max_ma"]
+            # the on-current, as laser_measure's "over" (DC, full duty)
+            on = self.ma_on.get(ch)
+            if on is not None:
+                ma = on
             if ma is not None and ma >= cap:
                 return self._ack("drive", ch, False,
                                  "laser current over %s mA" % _ma_str(cap))
@@ -278,16 +306,46 @@ class Tuner:
         self.last_adj[ch] = now
         return self._ack("drive", ch, True, None)
 
+    def burst_ns(self, laser):
+        """The GP26 burst: TUNE_ADC_PERIODS whole periods of the laser PWM,
+        fewer if that is over TUNE_BURST_MAX_MS, never under one."""
+        try:
+            hz = int(laser.frequency)
+        except Exception:
+            hz = 0
+        period = NS_PER_S // (hz if hz > 0 else LASER_HZ)
+        k = min(TUNE_ADC_PERIODS, TUNE_BURST_MAX_MS * NS_PER_MS // period)
+        return max(1, k) * period
+
+    def _mean_of_bursts(self, ch, duty, counts):
+        """Mean of the last TUNE_MA_BURSTS burst means at this duty."""
+        rec = self._bursts.get(ch)
+        if rec is None or rec[0] != duty:
+            rec = self._bursts[ch] = [duty, []]
+        got = rec[1]
+        got.append(counts)
+        if len(got) > TUNE_MA_BURSTS:
+            got.pop(0)
+        return sum(got) // len(got)
+
     def _measure(self, ch):
-        """Laser mA at the current duty, or last reading.  False if the
-        mux is held (do not raise a drive without a reading)."""
+        """Average laser mA at the current duty (self.ma; above dark) and
+        the on-current (self.ma_on = average / duty).  -> the average, or
+        False if the mux is held (do not raise a drive without a reading)."""
         h = self.host
         bell = h.bells[ch]
         try:
             with h.mux.select(bell):
-                counts = _avg(bell.sense.adc, TUNE_ADC_N)
+                counts, _, took = paced_avg(bell.sense.adc, TUNE_ADC_N,
+                                            self.burst_ns(bell.laser), self.now_ns)
         except ChannelBusy:
             return False
+        self.burst_us = took // NS_PER_US
+        try:
+            duty = int(bell.laser.duty_cycle)
+        except Exception:
+            duty = 0
+        counts = self._mean_of_bursts(ch, duty, counts)
         dark = FLOOR_COUNTS
         r = None
         last = getattr(h, "survey_state", None)
@@ -295,8 +353,9 @@ class Tuner:
             r = (last.last_result or {}).get(ch)
         if r:
             dark = (r.get("m") or {}).get("dark", dark)
-        ma = round(max(0, counts - dark) / COUNTS_PER_MA, 1)
+        ma = round(max(0, counts - dark) / COUNTS_PER_MA, MA_DP)
         self.ma[ch] = ma
+        self.ma_on[ch] = round(ma * FULL / duty, MA_DP) if duty > 0 else None
         self.read_pt(ch)
         return ma
 
@@ -319,7 +378,7 @@ class Tuner:
             drv = self.overrides.get(ch)
         pt = self.pt.get(ch)
         return {"ch": ch + 1, "thr": thr, "rb": rb, "drv": drv,
-                "ma": self.ma.get(ch),
+                "ma": self.ma.get(ch), "ma_on": self.ma_on.get(ch),
                 # volts on the Orange/White wire; null: not fitted on this channel
                 "pt": pt[0] if pt else None, "pt_span": pt[1] if pt else None}
 
@@ -365,6 +424,10 @@ def _now_ms():
     return int(time.monotonic() * 1000)
 
 
+def _now_ns():
+    return time.monotonic_ns()
+
+
 class SerialTune:
     """Read JSON command lines from usb_cdc.data and write acks, never
     blocking, never raising.  port: the same object SerialStatus writes.
@@ -403,7 +466,8 @@ class SerialTune:
         return {"lines": self.lines, "acks": self.acks,
                 "overflows": self.overflows, "bad": self.bad,
                 "dropped_ack": self.dropped_ack, "errors": self.errors,
-                "last_error": self.last_error, "align": self.aligned}
+                "last_error": self.last_error, "align": self.aligned,
+                "burst_us": self.tuner.burst_us}
 
     def brief(self):
         """BRIEF_KEYS of counters(), for the serial heartbeat (body "tune"):

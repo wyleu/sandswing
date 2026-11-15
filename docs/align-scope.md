@@ -101,7 +101,23 @@ real only on a head with the wire, and `pt_span` shows how noisy it is.
 * Per sample nothing is allocated (128-slot `bytearray` + `array('I')`).
   Per frame: one short hex string and the JSON text.
 * The mux is only taken while the tower is quiet and no survey runs, at most
-  every `MEASURE_MS` (one select + 32 ADC reads, as tune_get).
+  every `MEASURE_MS` (one select, then a ~4 ms GP26 burst, as tune_get).
+
+## Laser current
+
+The laser current is chopped by its 1 kHz PWM, so a quick burst of reads
+lands on a random part of on / off (at 25 % duty: mostly 0.2-1 mA, now and
+then 17-22 mA).  `tune.Tuner._measure` discards the first read after the
+select, then reads GP26 `TUNE_ADC_N` (131, prime) times spread evenly over
+`TUNE_ADC_PERIODS` (4) whole PWM periods (period from the laser PWM's
+frequency; at most `TUNE_BURST_MAX_MS`), paced by `time.monotonic_ns`
+(1/32768 s steps on the RP2350).  The reported `ma` is the mean of the last
+`TUNE_MA_BURSTS` bursts at that duty, above the survey's dark level: the
+**average** current.  `ma_on` = `ma` / duty is the current while the laser
+is on, comparable with the survey's full-duty reading.  The MIDI CC report
+carries only `ma` (`CC_MA`); the host works out `ma_on` from `CC_MA` and
+`CC_DRV` (a full report is 15 of `MAX_MSGS` 16 CCs).  The serial
+heartbeat's `tune.burst_us` is the last burst's length.
 * Every entry point catches everything; `MAX_ERRORS` in a boot switch the
   scope off for that boot.  Stops by itself: `KEEPALIVE_MS` without a
   request, head no longer active, the client gone, free heap under `MEM_MIN`.
@@ -137,7 +153,7 @@ bells' NoteOns are on `midi.usb.channel`, 1).
 | 20 / 52 `CC_THR` | 14 | threshold target duty, scaled 0..16382 (`duty = v * 65535 / 16382`) |
 | 21 / 53 `CC_RB` | 14 | GP28 threshold readback, same scale |
 | 22 / 54 `CC_DRV` | 14 | laser drive duty, same scale |
-| 23 / 55 `CC_MA` | 14 | laser current, 0.01 mA |
+| 23 / 55 `CC_MA` | 14 | average laser current above dark, 0.01 mA (on-current = this / drive duty) |
 | 24 / 56 `CC_PT` | 14 | PT level, mV |
 | 25 / 57 `CC_PT_SPAN` | 14 | PT spread over the burst, mV |
 | 106 `CC_SEQ` | 7 | report count mod 128; **ends** a report |

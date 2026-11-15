@@ -128,6 +128,47 @@ class CPBytearray(bytearray):
         return self
 
 
+class ChopRig:
+    """A laser current chopped by a PWM, as GP26 sees it, with the Pico's
+    clock: time.monotonic_ns steps in 1/32768 s on the RP2350 (port.c
+    port_get_raw_ticks).  value: on_counts + dark while the PWM is high,
+    dark while low; each clock call / ADC read costs time (jittered).
+    phase_ns: where in the PWM period the burst starts.  stale: what the
+    first read returns (the mux has just moved), then normal reads."""
+    PICO_TICK_NS = 1e9 / 32768
+
+    def __init__(self, duty_frac, on_counts, dark, hz=1000, call_ns=8000,
+                 read_ns=12000, jitter=0.2, rng=None, stale=None):
+        self.duty, self.on, self.dark = duty_frac, on_counts, dark
+        self.period = 1e9 / hz
+        self.call_ns, self.read_ns, self.jitter = call_ns, read_ns, jitter
+        self.rng = rng or random.Random(1)
+        self.t = 0.0
+        self.phase_ns = 0.0
+        self.stale = stale
+        self.reads = 0
+
+    def _cost(self, ns):
+        self.t += ns * (1 + self.jitter * self.rng.random())
+
+    def now_ns(self):
+        self._cost(self.call_ns)
+        return int(self.t // self.PICO_TICK_NS * self.PICO_TICK_NS)
+
+    @property
+    def value(self):
+        self._cost(self.read_ns)
+        self.reads += 1
+        if self.stale is not None and self.reads == 1:
+            return self.stale
+        x = ((self.t + self.phase_ns) % self.period) / self.period
+        return self.dark + (self.on if x < self.duty else 0)
+
+    def new_burst(self):
+        self.phase_ns = self.rng.random() * self.period
+        self.t += self.rng.random() * 1e8     # the loop between bursts
+
+
 results = []
 
 

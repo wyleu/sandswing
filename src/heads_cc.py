@@ -31,7 +31,9 @@ CC_SEQ = 106                   # report count mod 128: the report ends
 CC_THR = 20                    # threshold target duty, scaled (duty14)
 CC_RB = 21                     # GP28 threshold readback, scaled (duty14)
 CC_DRV = 22                    # laser drive duty, scaled (duty14)
-CC_MA = 23                     # laser current, MA_UNITS per mA
+CC_MA = 23                     # laser current, MA_UNITS per mA: the AVERAGE (above
+                               # dark).  The on-current is CC_MA / (CC_DRV duty): no
+                               # CC of its own (a full report is 15 of MAX_MSGS)
 CC_PT = 24                     # PT level, mV
 CC_PT_SPAN = 25                # PT spread over the burst, mV
 NONE_14 = 16383                # "no value" (not measured / not wired)
