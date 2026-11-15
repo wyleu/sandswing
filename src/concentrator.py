@@ -85,8 +85,9 @@ from ring import Ring, FULL, MIN_STROKE_GAP_MS
 from midi_ports import open_outputs
 from serial_status import open_serial_status
 from tune import Tuner, open_serial_tune
-from pt_level import open_pt_level
-from align_scope import Aligner
+from pt_level import open_pt_level, brief as pt_brief
+from align_scope import Aligner, SERIAL_CID
+from heads_cc import open_cc
 import panel
 import report
 
@@ -357,7 +358,8 @@ class Concentrator:
         # None: off, or no data port.  Not counted as a heartbeat (hb_seq).
         # LED echo (serial_status.leds): _paint hands it every frame's key
         self.serial_status = open_serial_status(
-            cfg, lambda: self.heartbeat_doc(count=False), render=self._led_render)
+            cfg, lambda: self.heartbeat_doc(count=False), render=self._led_render,
+            log=emit)
         # live threshold / laser-duty commands on the same data port (RAM only)
         self.tune = Tuner(self, cfg, clock_ms=self.ticks.now)
         port = self.serial_status.port if self.serial_status is not None else None
@@ -399,7 +401,9 @@ class Concentrator:
 
     def _setup_align(self):
         """The sandheads page's scope (docs/align-scope.md): idle until a
-        page asks over /ws.  Whatever goes wrong here, the tower runs on."""
+        page asks, over /ws or (ring_send "off": no Wi-Fi) as lines on the
+        USB data port relayed by Sandbells' ingest_serial.  Whatever goes
+        wrong here, the tower runs on."""
         self.align = None
         try:
             mem_free = None
@@ -408,15 +412,31 @@ class Concentrator:
                 mem_free = gc.mem_free
             except (ImportError, AttributeError):
                 pass
-            send_to = getattr(farm_ws, "send_to", None)
+            ws_send = getattr(farm_ws, "send_to", None)
             hook = getattr(farm_ws, "set_rx_hook", None)
-            if send_to is None or hook is None:
+            st = getattr(self, "serial_tune", None)
+            if (ws_send is None or hook is None) and st is None:
                 return
+
+            def send_to(cid, obj):
+                if cid == SERIAL_CID:
+                    return st.send(obj) if st is not None else None
+                return ws_send(cid, obj) if ws_send is not None else None
+            # the USB host's readings / acks: MIDI CC on the USB MIDI out
+            # (heads_cc.py); commands still come in on the data port
+            cc = open_cc(self.ring.outputs, log=emit) if st is not None else None
             self.align = Aligner(
                 self, send_to, self.ticks.now,
                 (self.events.src, self.events.device_id, self.events.boot_id),
-                mem_free=mem_free, log=emit, survey_idle=SURVEY_IDLE)
-            hook(self.align.on_message)
+                mem_free=mem_free, log=emit, survey_idle=SURVEY_IDLE,
+                cc=cc, cc_alive=st._connected if st is not None else None)
+            if hook is not None and ws_send is not None:
+                hook(self.align.on_message)
+            if st is not None:
+                al = self.align
+                st.align_rx = lambda text: al.on_message(SERIAL_CID, text)
+                ss = getattr(self, "serial_status", None)
+                st.other_busy = ss.busy if ss is not None else None
         except Exception as e:
             self.align = None
             emit("align scope off: %r" % e)
@@ -1018,7 +1038,9 @@ class Concentrator:
         HB_UDP_NET, so in udp build just that (link_status copies about 60
         counters every 5 s, heap churn the port heap pays for)."""
         brief = getattr(farm_ws, "link_brief", None)
-        if brief is not None and _net_udp():
+        # "off": nobody gets the whole doc either (only the serial line, which
+        # keeps HB_UDP_NET too), so no 60-key copy every heartbeat
+        if brief is not None and (_net_udp() or _net_off()):
             return brief(HB_UDP_NET)
         return self.link_status()
 
@@ -1069,6 +1091,13 @@ class Concentrator:
             "strokes_undelivered": len(farm_ws.undelivered_strokes()),
             "thr": self.refresher.serial_thr(self.n),
         })
+        try:
+            # [ch, volts, spread] of the PT wire now (GP27, no mux), for the
+            # serial line: Sandbells logs it for day / night drift
+            body["pt"] = pt_brief(getattr(self, "pt_level", None),
+                                  lambda c: self.gate.kind[c])
+        except Exception:
+            body["pt"] = None
         try:
             import gc
             body["mem_free"] = gc.mem_free()
@@ -1134,7 +1163,9 @@ class Concentrator:
             now = time.monotonic()
             wait = 0.05
             if ss is not None:
-                wait = ss.step(now)
+                # never start a heartbeat / LED line across a part-written
+                # tune ack or sandheads frame (one line at a time on the port)
+                wait = ss.step(now, hold=st is not None and st.busy())
             if st is not None:
                 w = st.poll(now, busy=ss is not None and ss.busy())
                 wait = min(wait, w)

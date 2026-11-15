@@ -57,7 +57,7 @@ SERIAL_ERR_CHARS = 40          # last error kept, cut to this
 SERIAL_VIA = "usb_cdc"         # the line's "via": Sandbells knows it came by serial
 # heartbeat body fields the UDP heartbeat leaves out (memory, sense queue)
 SERIAL_BODY_EXTRA = ("mem_free", "gc_heap_kb", "edges_lost", "late_drains",
-                     "strokes_undelivered", "watchdog", "thr")
+                     "strokes_undelivered", "watchdog", "thr", "pt")
 NEWLINE = b"\n"
 # the build stamp: build_info.py name -> heartbeat body key (read once, at start)
 SERIAL_BUILD_FIELDS = (("GIT", "build"), ("PROJECT", "project"), ("BUILT", "built"))
@@ -66,6 +66,11 @@ SERIAL_BUILD_CHARS = 24        # each stamp value cut to this (a hash+"+" is 8, 
 SERIAL_LED_MIN_S = 0.25        # LED echo: at most one line per this; a state shows at least this long
 SERIAL_LED_CHECK_S = 0.05      # LED echo on and a host there: look for a change this often (= panel_task)
 SERIAL_LED_TYPE = "led"        # the LED line's "t"
+# a heartbeat that could not be built (MemoryError on a tight heap, a bug):
+# this short line instead, so the host sees why there is no heartbeat
+# (the error counters otherwise only travel inside the heartbeat itself)
+SERIAL_ERR_TYPE = "serr"
+SERIAL_ERR_LOG_EVERY = 30      # console: the first error, then every this many
 
 
 def serial_settings(cfg):
@@ -168,8 +173,9 @@ class SerialStatus:
     stamp: the body's build fields (default build_stamp(), read once)."""
 
     def __init__(self, port, build, period_s=SERIAL_PERIOD_S, dumps=dumps_compact,
-                 max_b=SERIAL_LINE_MAX_B, now=None, leds=None, stamp=None):
+                 max_b=SERIAL_LINE_MAX_B, now=None, leds=None, stamp=None, log=None):
         self.port = port
+        self.log = log
         self.stamp = build_stamp() if stamp is None else stamp
         self.leds = leds         # LedEcho or None (off)
         self._host = False       # a host had the port open at the last step
@@ -254,10 +260,29 @@ class SerialStatus:
         else:
             self.lines += 1
 
-    def step(self, now):
+    def _err_line(self, e):
+        """The heartbeat could not be built: say so on the console (the
+        first time, then every SERIAL_ERR_LOG_EVERY) and in one short line."""
+        n = self.errors
+        if self.log is not None and (n == 1 or n % SERIAL_ERR_LOG_EVERY == 0):
+            try:
+                self.log("serial status: heartbeat not built (%d so far): %s"
+                         % (n, self.last_error))
+            except Exception:
+                pass
+        try:
+            data = self.dumps({"t": SERIAL_ERR_TYPE, "n": n, "e": self.last_error})
+            self._start(data.encode("utf-8"))
+        except Exception:
+            self._buf = None
+            self._off = 0
+            self._fresh = True
+
+    def step(self, now, hold=False):
         """One turn: push a part-written line, or make the next one when
-        due (heartbeat first, then the LED line).  -> seconds until the
-        next turn.  Never raises."""
+        due (heartbeat first, then the LED line).  hold: another writer
+        (tune.SerialTune) is mid-line, so start nothing new.  -> seconds
+        until the next turn.  Never raises."""
         host = False
         try:
             host = self._connected()
@@ -266,14 +291,25 @@ class SerialStatus:
                     self._give_up()
                 else:
                     self._push()
+            if hold and self._buf is None:
+                self._host = host
+                return SERIAL_PUSH_S
             if self._buf is None and now >= self._due:
                 self._due = now + self.period_s
                 if not host:
                     self.unread += 1
                     self._fresh = True        # whatever was in the FIFO is the host's past
                 else:
-                    data = self.line().encode("utf-8")
-                    if len(data) > self.max_b:
+                    try:
+                        data = self.line().encode("utf-8")
+                    except Exception as e:
+                        self.errors += 1
+                        self.last_error = repr(e)[:SERIAL_ERR_CHARS]
+                        data = None
+                        self._err_line(e)
+                    if data is None:
+                        pass
+                    elif len(data) > self.max_b:
                         self.dropped += 1
                     else:
                         self._start(data)
@@ -316,4 +352,4 @@ def open_serial_status(cfg, build, log=print, render=None):
     leds = LedEcho(render) if render is not None and led_settings(cfg) else None
     log("serial status: a heartbeat line every %d s on the USB data port%s"
         % (period, ", LED echo on" if leds else ""))
-    return SerialStatus(port, build, period, leds=leds)
+    return SerialStatus(port, build, period, leds=leds, log=log)

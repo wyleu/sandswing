@@ -11,6 +11,7 @@ serial_status.py
 tune.py
 pt_level.py
 align_scope.py
+heads_cc.py
 sense_keys.py
 tower_watch.py
 tower_build.py

@@ -17,8 +17,10 @@ pulled-down input near 2 V, and the head's source impedance is unknown), so
 every reading goes out with its spread across the burst and the page says
 plainly that it is real only on a head with the Orange/White wire.
 
-Reads are a short burst of ADC conversions (PT_N, well under 1 ms), only
-called from the alignment scope and tune_get while the tower is quiet.
+Reads are a short burst of ADC conversions (PT_N, well under 1 ms) on
+GP27 alone (no mux, nothing a stroke uses): the alignment scope (also while
+strokes are in progress), tune_get, and the heartbeat's "pt" (one reading
+per heartbeat, so Sandbells can log day / night drift).
 """
 from signal_bands import VREF
 
@@ -28,6 +30,7 @@ PT_N = 16                   # conversions per reading (min, max and mean kept)
 ADC_FULL = 65535            # AnalogIn.value full scale
 PT_DP = 3                   # volts to this many decimals
 ADC_GPS = (26, 27, 28, 29)
+PT_ACTIVE_KINDS = ("head_new", "head_old")   # = tune.ACTIVE_KINDS: a head is there
 
 
 def pt_settings(cfg, n_channels):
@@ -123,3 +126,15 @@ def open_pt_level(cfg, pins, n_channels, log=print):
     log("pt level: ch %d Orange/White on GP%d (direct); real only on a head with that wire"
         % (ch + 1, gp))
     return PtLevel(adc, ch, gp)
+
+
+def brief(pt, kind_of=None):
+    """The heartbeat's "pt": [ch (1-based), volts, spread] read now, or None
+    (not fitted, or the wired channel is not an active head).  kind_of(ch0)
+    -> survey kind; None: do not check."""
+    if pt is None:
+        return None
+    if kind_of is not None and kind_of(pt.ch) not in PT_ACTIVE_KINDS:
+        return None
+    got = pt.read()
+    return None if got is None else [pt.ch + 1, got[0], got[1]]

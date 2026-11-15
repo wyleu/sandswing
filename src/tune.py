@@ -15,6 +15,9 @@ the same port as serial_status).  Acks go back on that port.
     {"cmd":"tune_get"}                      all active heads
     {"cmd":"tune_get","ch":1}               one head
 
+Lines containing "align" are the sandheads scope (align_scope.py, client
+SERIAL_CID): handed to Aligner.on_message, frames back through send().
+
 Channel numbers are 1-based.  Adjustments are refused while the tower
 is not quiet or a survey is running, so they never take the mux or
 change a laser in the middle of stroke detection.  Raising the laser
@@ -51,6 +54,7 @@ NEWLINE = b"\n"
 ERR_CHARS = 80
 
 KNOWN_CMDS = ("tune", "drive", "tune_get")
+ALIGN_MARK = '"align"'          # a line naming it goes to align_scope (cmd "align")
 # keys allowed on a command besides cmd (and ch, which is handled separately)
 _TUNE_KEYS = frozenset(("cmd", "ch", "thr", "thr_step"))
 _DRIVE_KEYS = frozenset(("cmd", "ch", "drive", "drive_step"))
@@ -376,6 +380,7 @@ class SerialTune:
         self._buf = bytearray()
         self._ack = None         # memoryview of an ack being written
         self._off = 0
+        self._next = None        # the newest line waiting behind a part-written one
         self.lines = 0           # commands handled
         self.acks = 0            # ack lines fully written
         self.overflows = 0
@@ -383,12 +388,32 @@ class SerialTune:
         self.dropped_ack = 0
         self.errors = 0
         self.last_error = None
+        # align_scope over this port: align_rx(text) takes a {"cmd":"align"}
+        # line (Aligner.on_message under SERIAL_CID: queue only); other_busy()
+        # True while SerialStatus is mid-line (do not start a frame then)
+        self.align_rx = None
+        self.other_busy = None
+        self.aligned = 0         # align lines handed on
 
     def counters(self):
         return {"lines": self.lines, "acks": self.acks,
                 "overflows": self.overflows, "bad": self.bad,
                 "dropped_ack": self.dropped_ack, "errors": self.errors,
-                "last_error": self.last_error}
+                "last_error": self.last_error, "align": self.aligned}
+
+    def busy(self):
+        """True while an ack / frame is part-written (SerialStatus waits)."""
+        return self._ack is not None
+
+    def send(self, obj):
+        """An align frame / ack for the USB host (Aligner's send_to).  None:
+        no host has the port open (the scope stops); True: written or held
+        (one line in flight; a newer one replaces a held older one)."""
+        if not self._connected():
+            return None
+        ob = self.other_busy
+        self._queue_ack(obj, bool(ob()) if ob is not None else False)
+        return True
 
     def _connected(self):
         return bool(getattr(self.port, "connected", True))
@@ -414,32 +439,28 @@ class SerialTune:
         n = self.port.write(self._ack[self._off:]) or 0
         self._off += n
         if self._off >= len(self._ack):
-            self._ack = None
-            self._off = 0
             self.acks += 1
+            nxt, self._next = self._next, None
+            self._ack = None if nxt is None else memoryview(nxt)
+            self._off = 0
 
     def _queue_ack(self, obj, busy):
+        """One line out: written now if it can be, else held.  A held line
+        not yet started is replaced by a newer one (counted dropped); a
+        part-written one is always finished first (a cut line would spoil
+        both on the host), the newest waiting behind it."""
         data = (self.dumps(obj) + "\n").encode("utf-8")
-        if busy or self._ack is not None:
-            # a heartbeat is mid-write, or an ack is already in flight:
-            # drop the older in-flight ack if we must, keep the newest
-            if self._ack is not None:
-                self.dropped_ack += 1
-            self._ack = memoryview(data)
-            self._off = 0
-            if not busy:
-                self._push_ack()
-            return
-        n = self.port.write(data) or 0
-        if n >= len(data):
-            self.acks += 1
-        elif n > 0:
-            self._ack = memoryview(data)
-            self._off = n
-        else:
-            # USB buffer full: hold and try later
-            self._ack = memoryview(data)
-            self._off = 0
+        if self._ack is not None:
+            if self._off > 0:
+                if self._next is not None:
+                    self.dropped_ack += 1
+                self._next = data
+                return
+            self.dropped_ack += 1
+        self._ack = memoryview(data)
+        self._off = 0
+        if not busy:
+            self._push_ack()
 
     def _one_line(self, raw, now, busy):
         if len(raw) > self.max_line:
@@ -448,6 +469,11 @@ class SerialTune:
             return
         try:
             text = raw.decode("utf-8")
+            if self.align_rx is not None and ALIGN_MARK in text:
+                # the sandheads scope: Aligner parses and acks it (bad ones too)
+                self.aligned += 1
+                self.align_rx(text)
+                return
             cmd, ch, field, value = parse_command(text, self.tuner.host.n)
         except (ValueError, UnicodeError) as e:
             self.bad += 1
@@ -466,27 +492,28 @@ class SerialTune:
         try:
             if self._ack is not None and not busy and self._connected():
                 self._push_ack()
-            if self._connected():
-                chunk = self._read()
-                if chunk:
-                    self._buf += chunk
-                    # a fill to the cap with no newline: drop and resync
-                    if len(self._buf) >= self.buf_max and b"\n" not in self._buf:
-                        self._buf = bytearray()
-                        self.overflows += 1
-                    while True:
-                        i = self._buf.find(b"\n")
-                        if i < 0:
-                            break
-                        raw = bytes(self._buf[:i]).rstrip(b"\r")
-                        del self._buf[:i + 1]
-                        if raw:
-                            self._one_line(raw, now_ms, busy)
+            # read even while the host's DTR is down: a line it wrote is
+            # still a line (the replies wait for connected)
+            chunk = self._read()
+            if chunk:
+                self._buf += chunk
+                # a fill to the cap with no newline: drop and resync
+                if len(self._buf) >= self.buf_max and b"\n" not in self._buf:
+                    self._buf = bytearray()
+                    self.overflows += 1
+                while True:
+                    i = self._buf.find(b"\n")
+                    if i < 0:
+                        break
+                    raw = bytes(self._buf[:i]).rstrip(b"\r")
+                    del self._buf[:i + 1]
+                    if raw:
+                        self._one_line(raw, now_ms, busy)
         except Exception as e:
             self.errors += 1
             self.last_error = repr(e)[:ERR_CHARS]
             self._buf = bytearray()
-            self._ack = None
+            self._ack = self._next = None
             self._off = 0
         return TUNE_POLL_S
 

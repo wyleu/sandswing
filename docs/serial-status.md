@@ -83,3 +83,20 @@ refused if the measured current is at or above `laser.max_ma`.
 Sandbells' `ingest_serial` currently opens the port read-only, so it cannot
 send these commands yet.
 
+## Sandheads and errors on this port
+
+* `{"cmd":"align",…}` lines are the sandheads scope (`docs/align-scope.md`):
+  the page's commands relayed by Sandbells' `ingest_serial`; frames / acks /
+  info come back as `sand.panel/v1` lines of type `align`, `align_ack`,
+  `align_info`.
+* One line at a time: `SerialStatus.step(now, hold=…)` starts nothing while a
+  tune ack / align frame is part-written, and `SerialTune` holds its line
+  while a heartbeat / LED line is part-written.
+* A heartbeat that cannot be built (e.g. `MemoryError`) is replaced by
+  `{"t":"serr","n":<errors so far>,"e":"<repr, cut>"}`, and the console says
+  so (the first time, then every `SERIAL_ERR_LOG_EVERY`).  Before this the
+  error counters only travelled inside the heartbeat itself, so a heartbeat
+  that never got built was invisible.
+* With `link.ring_send` `"off"` the heartbeat's `net` is the brief
+  (`HB_UDP_NET`), as in `"udp"`: the serial line keeps only those keys, so
+  the 60-key `link_status()` copy every heartbeat was heap for nothing.

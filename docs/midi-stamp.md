@@ -17,6 +17,18 @@ each stroke's NoteOn the Pico sends that stroke's own keypad stamp.
 * One preallocated 13-byte `bytearray` filled in place, one
   `port.write` on the same usb_midi port as the notes.  A write that raises
   is counted (`/status` ring.stamp.errors), never raised.
+* Ports in order **5-pin, then USB** (`midi_ports.open_outputs`): a USB
+  host that drops the link cannot delay or skip the DIN note.  Each port's
+  note, stamp and clock writes are guarded (`MidiOut.send` never raises): a
+  failure is counted (`/status` ring.midi.<port>.errors_out) and printed on
+  the 1st and every `OUT_ERR_LOG_EVERY` (100)th.  USB is skipped (counted:
+  `skipped`) while `supervisor.runtime.usb_connected` is False (TinyUSB
+  `tud_ready()`: not mounted, or suspended).  `usb_midi.PortOut.write` does
+  not block on CircuitPython 10.0.3: `tud_midi_stream_write` takes whole
+  messages while the TX FIFO has room and returns, so a host that stops
+  reading loses messages, never the sense loop.  (A SysEx stamp cut by a
+  full FIFO can garble the next message on that host; ingest_midi drops
+  what it cannot parse.)
 
 ## Bytes (version 1)
 

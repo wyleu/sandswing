@@ -9,9 +9,22 @@ and settings limits as the USB tune commands (`docs/serial-status.md`).
 Nothing writes `settings.json`; a reboot returns to the saved values.  A drive
 set here is kept across a re-survey until reboot (`Tuner.drive_map`).
 
-**Needs the /ws server.**  With `link.ring_send` `"udp"` or `"off"` there is
-no TCP server, so the page cannot connect (it shows "retrying…").  The scope
-then costs nothing: no hook is ever called.
+**Over /ws, or over USB serial.**  With `link.ring_send` `"udp"` or `"off"`
+there is no TCP server.  Then the same protocol runs over the USB data port
+(`usb_cdc.data`, host `/dev/ttyACM1`): Sandbells' `ingest_serial` (the one
+owner of that port) writes the page's commands as one JSON line each, and
+the Pico's replies come back as lines among the heartbeat / LED lines.
+`tune.SerialTune` hands any line containing `"align"` to
+`Aligner.on_message("usb", text)` (`align_scope.SERIAL_CID`); `send_to("usb",
+…)` goes to `SerialTune.send` only when there is no USB MIDI out; normally the
+readings and acks for the USB host go out as **MIDI Control Change** (see
+"MIDI CC map" below) and nothing comes back on the data port.  Reports to the USB host are slower:
+`SERIAL_FRAME_MS` 500 ms (1000 ms while the tower is not quiet).  If the host
+closes the port (DTR down) the scope stops at the next frame; if the host just
+goes quiet, the `KEEPALIVE_MS` timeout (10 s) stops it.  Only one line is in
+flight on the port at a time: SerialStatus starts no heartbeat / LED line
+while a frame is part-written and the other way round, and a part-written
+line is always finished before a newer one starts.
 
 ## Active head
 
@@ -27,6 +40,7 @@ no threshold wire: threshold nudges are refused.
 | `{"cmd":"align","ch":N,"scope":false}` | stop |
 | `{"cmd":"align","ch":N,"thr":1}` / `-1` | threshold target one settings step (`threshold.step`) |
 | `{"cmd":"align","ch":N,"drive":1}` / `-1` | laser duty one settings step (`laser.step`) |
+| `{"cmd":"align","ch":N,"thr_mid":true}` | threshold target to the middle of `threshold.min_duty`..`max_duty` (32768 with the defaults; a new head is also seeded at `threshold.default_duty`, 32768) |
 
 Channels are 1-based.  `farm_ws._receive` hands every text frame containing
 `"align"` to `Aligner.on_message(client_id, text)`, which only queues it
@@ -58,7 +72,7 @@ frame for a stroke).
 | `rb` | GP28 threshold readback held by the refresher |
 | `thr`, `drv` | threshold target duty, laser duty now |
 | `pt`, `pt_span` | raw PT level on the Orange/White wire, volts (mean, max-min over `PT_N` reads); `null` on every channel but the wired one |
-| `busy` | true: `ma` / `pt` are older readings (tower not quiet, survey running, mux held) |
+| `busy` | true: `ma` is an older reading (tower not quiet, survey running, mux held).  `pt` is read every frame even then: GP27 alone, no mux, `PT_N` conversions, well under 1 ms |
 
 `type:"align_ack"` after each command (not a keep-alive):
 `{"what":"thr"|"drive"|"scope"|"bad","ch":N,"ok":bool,"why":…,"thr":…,"drv":…,"tower":…}`.
@@ -98,3 +112,55 @@ Tested on the fakes only (`tests/test_align_scope.py`, `test_align_hw.py`,
 `test_pt_level.py`, `test_farm_ws.py`).  Open: TCP load of 5 frames a second
 on the real lwIP (ERR_MEM stalls are C code); real GP26 / GP27 values; what a
 floating GP27 reads.
+
+## PT level on the heartbeat (day / night drift)
+
+The heartbeat body has `"pt": [ch, volts, spread]` read when the heartbeat is
+built (`pt_level.brief`; `null` when not fitted or the wired channel is not an
+active head).  It travels on the serial status line (`SERIAL_BODY_EXTRA`);
+Sandbells' `ingest_serial` stores one reading every few minutes
+(`HeadLevel`, see Sandbells `docs/sandheads-serial.md`).
+
+## MIDI CC map (readings and acks to the USB host, `src/heads_cc.py`)
+
+Commands go host -> Pico on the USB data port; readings and acks go Pico ->
+host as Control Change on the USB MIDI out (one-way, as before), decoded by
+Sandbells' `ingest_midi`.  All on **MIDI channel 16** (`CC_CHANNEL`; the
+bells' NoteOns are on `midi.usb.channel`, 1).
+
+| CC | bits | meaning |
+|---|---|---|
+| 102 `CC_HEAD` | 7 | head (channel) 1-16; **starts** a report |
+| 103 `CC_FLAGS` | 7 | 1 beam clear now, 2 a low sample since the last report, 4 mA is an older reading, 8 tower quiet, 16 scope running on this head |
+| 104 `CC_ACK_WHAT` | 7 | ack reports only: 1 thr, 2 drive, 3 scope, 4 bad, 5 thr_mid |
+| 105 `CC_ACK_WHY` | 7 | ack reports only: 0 ok; 1 not an active head, 2 tower not quiet, 3 survey running, 4 old head has no threshold, 5 too fast, 6 at limit, 7 laser is off, 8 laser current over max_ma, 9 busy, 10 timeout, 11 head gone, 12 low memory, 13 bad command, 127 other |
+| 20 / 52 `CC_THR` | 14 | threshold target duty, scaled 0..16382 (`duty = v * 65535 / 16382`) |
+| 21 / 53 `CC_RB` | 14 | GP28 threshold readback, same scale |
+| 22 / 54 `CC_DRV` | 14 | laser drive duty, same scale |
+| 23 / 55 `CC_MA` | 14 | laser current, 0.01 mA |
+| 24 / 56 `CC_PT` | 14 | PT level, mV |
+| 25 / 57 `CC_PT_SPAN` | 14 | PT spread over the burst, mV |
+| 106 `CC_SEQ` | 7 | report count mod 128; **ends** a report |
+
+14-bit values are the standard MIDI pair: MSB on CC n (0-31), LSB on CC
+n + 32; 16383 means "no value" (not measured, not wired).  Why 14 bits:
+7-bit is 1/128 of full scale, i.e. 26 mV of PT level or about 1.3
+threshold steps, too coarse to see day / night drift or one nudge; the
+RP2350 ADC is 12-bit, so 14 bits lose nothing.
+
+Frame reports: at most every 500 ms (`SERIAL_FRAME_MS`) while the tower is
+quiet (15 messages: head, flags, 6 pairs, seq); every 1000 ms while strokes
+are in progress, and then only head, flags, PT, spread and seq (7
+messages).  Ack reports: one per command (not per keep-alive).
+
+**Never in the way of a stroke:** reports are only sent while a host keeps
+the scope alive (`KEEPALIVE_MS` 10 s; the page sends one every 2 s) and
+stop at once when the host closes the data port; each report is built in a
+preallocated buffer and written with ONE port write from `align_task`,
+never from the sense path, so it cannot split or reorder a stroke's NoteOn
+and stamp SysEx (asyncio is cooperative: a stroke found while a report is
+being written goes out right after that one write, ~60 bytes on USB).
+A report is skipped (counted) while `supervisor.runtime.usb_connected` is
+False, and one the TX FIFO only partly takes is counted `short` (whole
+messages only; the host drops a report without its SEQ).
+Without a USB MIDI out the reports fall back to JSON lines on the data port.

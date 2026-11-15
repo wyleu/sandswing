@@ -36,6 +36,7 @@ HEADS = ("head_new", "head_old")
 # a ringing bell >~1.5 s).  Integer ms: CircuitPython floats are 32-bit.
 MIN_STROKE_GAP_MS = 250
 NS_PER_MS = 1000000
+SEND_ERR_LOG_EVERY = 100   # legacy single-port sends that raised: logged on the 1st and every this many
 
 
 def _ticks_ms():
@@ -96,6 +97,7 @@ class Ring:
         self.running = False
         # midi_stamp.MidiStamp (or None): its SysEx follows each stroke's NoteOn
         self.stamp = stamp
+        self.send_errors = 0             # legacy path (no outputs): sends that raised
 
     def start(self, kinds, duty=None):
         """kinds: {ch: kind} from the survey.  Lasers on for heads only,
@@ -118,18 +120,25 @@ class Ring:
         the NoteOn (t_ms: the stroke's edge stamp; None = now)."""
         now = self.clock_ms() if t_ms is None else t_ms
         if self.outputs:
+            # midi_ports.open_outputs order: 5-pin first.  MidiOut.send never
+            # raises, so one port's failure cannot skip another.
             for out in self.outputs:
                 out.send(ch, on, now)
             note = self.notes[ch] if ch < len(self.notes) else (
                 self.outputs[0].notes[ch] if ch < len(self.outputs[0].notes) else 0)
         else:
             note = self.notes[ch]
-            if self._send_fn is not None:
-                self._send_fn(ch, note, on)
-            elif self.midi is not None:
-                self.midi.send(_note_msg(note, on))
-            if on and self.stamp is not None:
-                self.stamp.stroke(ch + 1, now)
+            try:
+                if self._send_fn is not None:
+                    self._send_fn(ch, note, on)
+                elif self.midi is not None:
+                    self.midi.send(_note_msg(note, on))
+                if on and self.stamp is not None:
+                    self.stamp.stroke(ch + 1, now)
+            except Exception as e:          # never out of the sense loop
+                self.send_errors += 1
+                if self.send_errors % SEND_ERR_LOG_EVERY == 1:
+                    print("midi: send failed (%d so far): %r" % (self.send_errors, e))
         has_out = self.outputs or self.midi or self._send_fn
         print("%.3f ch %d %s %d%s" % (time.monotonic(), ch + 1, "ON" if on else "OFF", note,
                                        "" if has_out else " (no midi)"))
@@ -189,9 +198,7 @@ class Ring:
               "heads": dict((c + 1, k) for c, k in self.heads.items()),
               "strokes": list(self.strokes), "sounding": sorted(self.tripped())}
         if self.outputs:
-            st["midi"] = dict(
-                (out.name, out.stamp.status() if out.stamp is not None else {})
-                for out in self.outputs)
+            st["midi"] = dict((out.name, out.status()) for out in self.outputs)
         elif self.stamp is not None:
             st["stamp"] = self.stamp.status()
         return st

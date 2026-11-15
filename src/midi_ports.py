@@ -32,6 +32,15 @@ five_pin.tx_pin is the GP number for DIN UART TX (31250 baud).
 A flat block with no usb/five_pin keys still means USB only; five_pin
 stays off so a board whose LED strip is still on GP16 is not driven
 as UART.
+
+Each stroke goes to 5-pin first, then USB: a USB host that has dropped
+the link (the Pi 3's dwc_otg resets) cannot delay or skip the DIN note.
+A send that raises is counted and logged (the first and every
+OUT_ERR_LOG_EVERY-th), never passed on.  USB is skipped (counted) while
+supervisor.runtime.usb_connected is False (tud_ready: not mounted or
+suspended).  usb_midi PortOut.write does not block (CircuitPython 10.0.3:
+tud_midi_stream_write takes what fits in the TX FIFO and returns; a host
+that stops reading loses whole messages, not the ring).
 """
 
 from midi_stamp import open_stamp_from_section
@@ -60,6 +69,7 @@ FIVE_PIN_DEFAULTS = {
     "clock_s": 10,
 }
 SHARED_KEYS = ("enabled", "channel", "notes", "stamp_sysex", "clock_s")
+OUT_ERR_LOG_EVERY = 100           # a port's send errors: logged on the 1st and every this many
 
 
 def _midi_raw(cfg):
@@ -146,22 +156,68 @@ def _note_msg(note, on):
 class MidiOut:
     """One destination: adafruit MIDI port + optional MidiStamp + per-port notes."""
 
-    def __init__(self, name, midi, notes, stamp=None):
+    def __init__(self, name, midi, notes, stamp=None, port=None, ready=None, log=print):
         self.name = name
+        self.port = port                 # the raw port (heads_cc writes CC reports to it)
         self.midi = midi
         self.notes = list(notes)
         self.stamp = stamp
+        self.ready = ready               # () -> bool; False: host gone, skip (USB only)
+        self.log = log
+        self.errors = 0                  # sends that raised (not passed on)
+        self.skipped = 0                 # sends skipped while not ready
+
+    def _err(self, what, e):
+        self.errors += 1
+        if self.errors % OUT_ERR_LOG_EVERY == 1:
+            try:
+                self.log("midi %s: %s failed (%d so far): %r" % (self.name, what, self.errors, e))
+            except Exception:
+                pass
 
     def send(self, ch, on, t_ms):
+        """-> True if the note went.  Never raises."""
         if self.midi is None or ch < 0 or ch >= len(self.notes):
-            return
-        self.midi.send(_note_msg(self.notes[ch], on))
+            return False
+        if self.ready is not None and not self.ready():
+            self.skipped += 1
+            return False
+        try:
+            self.midi.send(_note_msg(self.notes[ch], on))
+        except Exception as e:
+            self._err("note", e)
+            return False
         if on and self.stamp is not None:
-            self.stamp.stroke(ch + 1, t_ms)
+            try:
+                self.stamp.stroke(ch + 1, t_ms)
+            except Exception as e:       # MidiStamp guards its write; this is belt and braces
+                self._err("stamp", e)
+        return True
 
     def clock(self):
-        if self.stamp is not None:
+        if self.stamp is None or (self.ready is not None and not self.ready()):
+            return
+        try:
             self.stamp.clock()
+        except Exception as e:
+            self._err("clock", e)
+
+    def status(self):
+        st = self.stamp.status() if self.stamp is not None else {}
+        st["errors_out"] = self.errors
+        st["skipped"] = self.skipped
+        return st
+
+
+def usb_ready():
+    """() -> bool: supervisor.runtime.usb_connected (no allocation: a const
+    bool), or None when there is no supervisor (host tests)."""
+    try:
+        import supervisor
+        rt = supervisor.runtime
+    except (ImportError, AttributeError):
+        return None
+    return lambda: rt.usb_connected
 
 
 def open_usb_midi(channel):
@@ -202,15 +258,12 @@ def open_five_pin_midi(tx_pin, channel):
     return adafruit_midi.MIDI(midi_out=uart, out_channel=channel - 1), uart
 
 
-def open_outputs(cfg, clock_ms, neopixel_gp=None):
-    """MidiOut list for every enabled port that opened. Order: USB, then 5-pin."""
+def open_outputs(cfg, clock_ms, neopixel_gp=None, log=print, ready=None):
+    """MidiOut list for every enabled port that opened.  Order: 5-pin, then
+    USB (the order every stroke is sent in).  ready: USB's ready test
+    (default usb_ready())."""
     usb_spec, five_spec = parse_ports(cfg)
     outs = []
-    if usb_spec["enabled"]:
-        midi, port = open_usb_midi(usb_spec["channel"])
-        if midi is not None:
-            stamp = open_stamp_from_section(usb_spec, port, clock_ms, name="usb")
-            outs.append(MidiOut("usb", midi, usb_spec["notes"], stamp))
     if five_spec["enabled"]:
         tx_pin = five_spec["tx_pin"]
         if neopixel_gp is not None and int(tx_pin) == int(neopixel_gp):
@@ -219,5 +272,11 @@ def open_outputs(cfg, clock_ms, neopixel_gp=None):
             midi, port = open_five_pin_midi(tx_pin, five_spec["channel"])
             if midi is not None:
                 stamp = open_stamp_from_section(five_spec, port, clock_ms, name="five_pin")
-                outs.append(MidiOut("five_pin", midi, five_spec["notes"], stamp))
+                outs.append(MidiOut("five_pin", midi, five_spec["notes"], stamp, log=log))
+    if usb_spec["enabled"]:
+        midi, port = open_usb_midi(usb_spec["channel"])
+        if midi is not None:
+            stamp = open_stamp_from_section(usb_spec, port, clock_ms, name="usb")
+            outs.append(MidiOut("usb", midi, usb_spec["notes"], stamp, port=port,
+                                ready=ready if ready is not None else usb_ready(), log=log))
     return outs

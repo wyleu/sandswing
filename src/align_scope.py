@@ -15,6 +15,12 @@ itself after KEEPALIVE_MS without a request) the Pico:
   * carries out {"thr": +-1} / {"drive": +-1} through tune.Tuner (the same
     rules, limits and RAM-only store as the USB tune commands).
 
+The same protocol also runs over the USB data port (ring_send "off", no
+Wi-Fi): Sandbells' ingest_serial relays the page's commands as lines and the
+readings and acks come back as MIDI CC on the USB MIDI out (heads_cc.py;
+JSON lines on the data port only if there is no USB MIDI), at
+SERIAL_FRAME_MS (client SERIAL_CID).
+
 Live only: nothing here writes settings.json.
 
 Reliability: no allocation per sample; on_message only queues (it runs in
@@ -25,6 +31,7 @@ runs, and only every MEASURE_MS.
 """
 import json
 import binascii
+import heads_cc
 from array import array
 
 SCHEMA = "sand.panel/v1"        # ingest ignores it; frames go to one client anyway
@@ -47,9 +54,17 @@ MAX_ERRORS = 10                 # errors in a boot: the scope is off until reboo
 # from CIRCUITPY_HEAP_START_SIZE, so the boot's ~17 kB free is not a limit;
 # this only stops the scope adding JSON garbage when memory really is short.
 MEM_MIN = 8192
+# The USB data port (ring_send "off": no /ws).  tune.SerialTune hands the
+# host's {"cmd":"align"} lines in under this client id and writes our frames
+# back on usb_cdc.data.  Slower than /ws: the port also carries the heartbeat
+# and LED lines, and every frame is a few hundred bytes of JSON garbage on a
+# heap with ~14 kB free.
+SERIAL_CID = "usb"
+SERIAL_FRAME_MS = 500           # one frame this often to the USB host
+SERIAL_FRAME_BUSY_MS = 1000     # ... while the tower is not quiet
 
 ACTIVE_KINDS = ("head_new", "head_old")     # = tune.ACTIVE_KINDS, the page's ACTIVE
-_KEYS = ("cmd", "ch", "scope", "thr", "drive", "info")
+_KEYS = ("cmd", "ch", "scope", "thr", "drive", "info", "thr_mid")
 # page key -> (tune.Tuner command, field)
 _TUNE = {"thr": ("tune", "thr_step"), "drive": ("drive", "drive_step")}
 
@@ -142,6 +157,8 @@ def parse_command(text, n_channels):
         raise ValueError("bad channel")
     if "scope" in d:
         return "scope", ch - 1, bool(d["scope"])
+    if d.get("thr_mid") is True:
+        return "thr_mid", ch - 1, True
     for key in ("thr", "drive"):
         if key in d:
             v = d[key]
@@ -157,8 +174,13 @@ class Aligner:
     pt_level).  send_to(client_id, obj) -> True / False / None (gone)."""
 
     def __init__(self, host, send_to, clock, ident, mem_free=None, log=print,
-                 survey_idle="idle"):
+                 survey_idle="idle", cc=None, cc_alive=None):
         self.host = host
+        # the USB host (SERIAL_CID): readings and acks as MIDI CC (heads_cc.CcOut)
+        # instead of JSON lines; cc_alive() False: the host closed the data port
+        self.cc = cc
+        self.cc_alive = cc_alive
+        self._broke = False         # a low sample since the last CC report
         self.send_to = send_to
         self.clock = clock
         self.mem_free = mem_free
@@ -207,15 +229,23 @@ class Aligner:
         try:
             bit = 0 if (self._low or self.host._prev_held[ch]) else 1
             self._low = False
+            if not bit:
+                self._broke = True
             self.ring.add(bit, self.clock())
         except Exception:
             self._error()
 
     # ---- align_task ---------------------------------------------------------
+    def _frame_ms(self):
+        quiet = self._quiet()
+        if self.cid == SERIAL_CID:
+            return SERIAL_FRAME_MS if quiet else SERIAL_FRAME_BUSY_MS
+        return FRAME_MS if quiet else FRAME_BUSY_MS
+
     def period_s(self):
         if self.ch is None or self.dead:
             return IDLE_S
-        return (FRAME_MS if self._quiet() else FRAME_BUSY_MS) / 1000
+        return self._frame_ms() / 1000
 
     def tick(self):
         try:
@@ -232,7 +262,7 @@ class Aligner:
                 self._stop(why)
                 return
             if now - self.next_frame >= 0:
-                self.next_frame = now + (FRAME_MS if self._quiet() else FRAME_BUSY_MS)
+                self.next_frame = now + self._frame_ms()
                 self._frame(now)
         except Exception:
             self._error()
@@ -313,9 +343,28 @@ class Aligner:
         self._ack(cid, "scope", ch, True, None)
 
     def _nudge(self, cid, key, ch, sign, now):
-        cmd, field = _TUNE[key]
-        a = self.host.tune.handle(cmd, ch, field, sign, now)
+        t = self.host.tune
+        if key == "thr_mid":
+            # mid-range of the threshold limits (32768 with the defaults)
+            s = t.settings["threshold"]
+            a = t.handle("tune", ch, "thr", (s["min_duty"] + s["max_duty"] + 1) // 2, now)
+        else:
+            cmd, field = _TUNE[key]
+            a = t.handle(cmd, ch, field, sign, now)
         self._ack(cid, key, ch, a.get("ok"), a.get("why"))
+
+    def _cc_flags(self, ch):
+        h = self.host
+        f = 0
+        if ch is not None and 0 <= ch < h.n and not h._prev_held[ch]:
+            f |= heads_cc.FLAG_CLEAR
+        if self._broke:
+            f |= heads_cc.FLAG_BROKE
+        if self._quiet():
+            f |= heads_cc.FLAG_QUIET
+        if self.ch is not None and self.ch == ch:
+            f |= heads_cc.FLAG_SCOPE
+        return f
 
     def _values(self, ch):
         h = self.host
@@ -335,12 +384,18 @@ class Aligner:
         thr = drv = None
         if ch is not None and 0 <= ch < self.host.n:
             thr, drv = self._values(ch)
+        if cid == SERIAL_CID and self.cc is not None:
+            self.cc.ack(None if ch is None else ch + 1, what, None if ok else (why or "bad"),
+                        thr, drv, self._cc_flags(ch))
+            return
         self.send_to(cid, self._env(T_ACK, {
             "what": what, "ch": None if ch is None else ch + 1, "ok": bool(ok),
             "why": why, "thr": thr, "drv": drv, "tower": self.host.tower.tower}))
 
     def _info(self, cid):
         h = self.host
+        if cid == SERIAL_CID and self.cc is not None:
+            return                  # the host has the kinds from the serial heartbeat
         s = h.tune.settings
         pt = getattr(h, "pt_level", None)
         self.send_to(cid, self._env(T_INFO, {
@@ -350,7 +405,8 @@ class Aligner:
             "step": {"thr": s["threshold"]["step"], "drv": s["laser"]["step"]},
             "limits": {"thr": [s["threshold"]["min_duty"], s["threshold"]["max_duty"]],
                        "drv": [s["laser"]["min_duty"], s["laser"]["max_duty"]]},
-            "frame_ms": FRAME_MS, "keepalive_ms": KEEPALIVE_MS,
+            "frame_ms": SERIAL_FRAME_MS if cid == SERIAL_CID else FRAME_MS,
+            "keepalive_ms": KEEPALIVE_MS,
             "pt": pt.info() if pt is not None else None}))
 
     def _frame(self, now):
@@ -364,9 +420,25 @@ class Aligner:
                 fresh = t._measure(ch) is not False      # also reads the PT level
             else:
                 fresh = True
-        k, dt, gap = self.ring.window()
+        else:
+            # strokes in progress: no mux, no laser mA; the PT level is its
+            # own ADC pin (GP27, PT_N conversions, well under 1 ms), so it
+            # stays live while a stepper or a ringer breaks the beam
+            t.read_pt(ch)
         thr, drv = self._values(ch)
         pt = t.pt.get(ch)
+        if self.cid == SERIAL_CID and self.cc is not None:
+            if self.cc_alive is not None and not self.cc_alive():
+                self._stop(None)                     # the host closed the data port
+                return
+            quiet = self._quiet()
+            f = self._cc_flags(ch) | (0 if fresh else heads_cc.FLAG_BUSY)
+            self._broke = False
+            self.cc.frame(ch + 1, f, thr, h.refresher.readback.get(ch), drv, t.ma.get(ch),
+                          pt[0] if pt else None, pt[1] if pt else None, full=quiet)
+            self.frames += 1
+            return
+        k, dt, gap = self.ring.window()
         b = self._body
         b["ch"] = ch + 1
         b["n"] = k

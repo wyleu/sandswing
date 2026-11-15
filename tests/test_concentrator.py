@@ -306,6 +306,47 @@ def link(app):
                                and led[0]["p"] == app._mimic()["panel"]
                                and led[0]["s"] == app._mimic()["panel_state"]
                                and len(led[0]["p"]) == 6)
+    # sandheads over the USB data port: SerialTune lines -> Aligner (SERIAL_CID)
+    # -> frames back on the same port; the heartbeat carries the PT level key
+    import tune
+    import align_scope
+
+    class _DataPort(_Port):
+        timeout = write_timeout = None
+
+        def __init__(self):
+            self.out, self.inq = bytearray(), bytearray()
+
+        @property
+        def in_waiting(self):
+            return len(self.inq)
+
+        def read(self, n):
+            got = bytes(self.inq[:n])
+            del self.inq[:n]
+            return got
+    dp = _DataPort()
+    app.serial_tune = tune.SerialTune(dp, app.tune)
+    app._setup_align()
+    dp.inq += b'{"cmd":"align","info":true}\n'
+    app.serial_tune.poll(0.0)
+    app.align.tick()
+    got = [json.loads(l) for l in bytes(dp.out).split(b"\n") if l.strip()]
+    res["heads_serial"] = {
+        "wired": app.serial_tune.align_rx is not None
+        and app.serial_tune.other_busy == app.serial_status.busy,
+        "info": [o.get("type") for o in got] == [align_scope.T_INFO]
+        and got[0]["body"]["frame_ms"] == align_scope.SERIAL_FRAME_MS,
+        "pt_key": "pt" in app.heartbeat_doc(count=False)["body"]}
+    # ring_send "off": the heartbeat's net is the brief (HB_UDP_NET), not a
+    # copy of every link counter (heap) -- the serial line keeps only those
+    import link_health
+    farm_ws.net_off = lambda: True
+    farm_ws.link_brief = lambda keys: {k: 0 for k in keys}
+    res["heads_serial"]["off_net"] = (sorted(app.heartbeat_doc(count=False)["body"]["net"])
+                                      == sorted(link_health.HB_UDP_NET))
+    del farm_ws.net_off, farm_ws.link_brief
+    app.serial_tune = None
     app.serial_status = None
     # Wi-Fi lost -> link event, LED1 no_wifi; rejoin after WIFI_REJOIN_S
     wifi = {"ok": True}
@@ -963,6 +1004,10 @@ def main():
     check("link: serial status line of the real doc: whole, fits, same panel, hb_seq kept, off on host",
           S.get("seq_kept") and S.get("whole") and S.get("fits") and S.get("panel")
           and S.get("extra") and S.get("host_none"), S or r.get("exc"))
+    H = L.get("heads_serial") or {}
+    check("link: sandheads over the USB data port: wired to SerialTune, info line back, heartbeat has pt, off: net brief",
+          H.get("wired") and H.get("info") and H.get("pt_key") and H.get("off_net"),
+          H or r.get("exc"))
     check("link: heartbeat_task sends the whole doc, keep=False, udp_fit=udp_heartbeat",
           L.get("hb_sends") == [["heartbeat", ["keep", "udp_fit"], False, True]],
           L.get("hb_sends") or r.get("exc"))
