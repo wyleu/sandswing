@@ -52,6 +52,10 @@ FLAG_BROKE = 2                 # a low sample since the last report
 FLAG_BUSY = 4                  # mA is an older reading (tower not quiet / mux held)
 FLAG_QUIET = 8                 # tower quiet: adjustments allowed
 FLAG_SCOPE = 16                # the scope is running on this head
+FLAG_LIT_LOW = 64              # comparator low (held) = light on the PT (heads.pt_light
+                               # "lowers"); without it, low = no light
+FLAG_STUCK = 32                # not quiet only because of stuck heads (stuck.py):
+                               # thr / drive adjustments allowed anyway
 WHAT = {"thr": 1, "drive": 2, "scope": 3, "bad": 4, "thr_mid": 5, "sweep": 6,
         "sweep_end": 7, "use": 8, "save": 9, "forget": 10, "saved": 11}
 # refusal text (tune.Tuner / align_scope) -> code, by prefix; 127: anything else
@@ -60,7 +64,7 @@ WHY = (("bad label", 19), ("not an active head", 1), ("tower not quiet", 2), ("s
        ("laser is off", 7), ("laser current over", 8), ("busy", 9), ("timeout", 10),
        ("head gone", 11), ("low memory", 12), ("bad", 13), ("unknown key", 13),
        ("nothing to do", 13), ("not an align command", 13), ("too long", 13),
-       ("beam broken", 14), ("stopped", 15), ("no PT wire", 16), ("sweep running", 17),
+       ("no light", 14), ("stopped", 15), ("no PT wire", 16), ("sweep running", 17),
        ("not saved", 18), ("near threshold", 20))
 WHY_OTHER = 127
 MAX_MSGS = 16                  # CCs in one report (a full one, and a slot one, is 15)

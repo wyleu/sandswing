@@ -406,7 +406,8 @@ def test_brief_is_the_small_counter_set():
         s = cp_serial_tune(p)
         b = s.brief()
         assert tuple(b) == tune.BRIEF_KEYS or sorted(b) == sorted(tune.BRIEF_KEYS)
-        assert set(b.values()) == {0, None}
+        assert b["stuck"] == []         # no head stuck (stuck.py)
+        assert set(v for k, v in b.items() if k != "stuck") == {0, None}
         seen = []
         s.align_rx = seen.append
         p.feed(b'not json\n{"cmd":"tune_get","ch":1}\n{"cmd":"align","ch":1,"scope":true}\n')

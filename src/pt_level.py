@@ -31,6 +31,27 @@ ADC_FULL = 65535            # AnalogIn.value full scale
 PT_DP = 3                   # volts to this many decimals
 ADC_GPS = (26, 27, 28, 29)
 PT_ACTIVE_KINDS = ("head_new", "head_old")   # = tune.ACTIVE_KINDS: a head is there
+# Which way the PT moves with light (settings "heads": {"pt_light": ...}).
+# "lowers" (default, measured on head 5: reflector 0.16 V, blocked ~2 V): the
+# PT has a 10 k collector load, so more light pulls it DOWN; the LM393 output
+# then goes low, which the keypad sees as "held".  So with "lowers", held =
+# light on the PT (a reflective head: the strip seen); with "raises" held =
+# no light.  The stroke path does not use this (a stroke is a held edge, the
+# tower's "return" on the strip); the sandheads scope, sweep and page do.
+PT_LIGHT_LOWERS = "lowers"
+PT_LIGHT_RAISES = "raises"
+PT_LIGHT = PT_LIGHT_LOWERS
+
+
+def light_lowers(cfg):
+    """settings "heads"."pt_light": True for "lowers" (the default; anything
+    else unknown is the default too), False for "raises"."""
+    try:
+        sec = cfg.get("heads") if cfg is not None and hasattr(cfg, "get") else None
+        v = sec.get("pt_light", PT_LIGHT) if isinstance(sec, dict) else PT_LIGHT
+    except Exception:
+        v = PT_LIGHT
+    return v != PT_LIGHT_RAISES
 
 
 def pt_settings(cfg, n_channels):

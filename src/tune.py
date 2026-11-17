@@ -20,7 +20,10 @@ SERIAL_CID): handed to Aligner.on_message, frames back through send().
 
 Channel numbers are 1-based.  Adjustments are refused while the tower
 is not quiet or a survey is running, so they never take the mux or
-change a laser in the middle of stroke detection.  Raising the laser
+change a laser in the middle of stroke detection.  Except: when the only
+heads keeping the tower awake are stuck (stuck.py: held or flickering,
+no clear gap for tune.stuck_after_s), threshold and drive go through, or
+a head sitting on its threshold could never be cured (a lockout).  Raising the laser
 duty is refused if the measured current is at or above laser.max_ma.
 """
 import json
@@ -31,6 +34,8 @@ from signal_bands import COUNTS_PER_MA, FLOOR_COUNTS
 from adc_avg import paced_avg
 from threshold_refresh import clamp_duty, threshold_settings, _int
 from ring import FULL
+from stuck import StuckWatch
+from pt_level import light_lowers
 
 # Laser drive defaults (settings "laser"; the one place they are set).
 # The floor is low (2 %): the sandheads sweep (sweep.py) finds how little
@@ -82,8 +87,9 @@ ERR_CHARS = 80
 # SerialTune counters on the serial heartbeat (body "tune"; strings there are
 # cut to hb_slim.HB_UDP_STR_MAX): tune commands handled, sandheads align lines
 # handed on, bad lines, poll errors and the last error; burst_us: the last
-# laser-mA burst (Tuner.burst_us), to see its cost on the Pico
-BRIEF_KEYS = ("lines", "align", "bad", "errors", "last_error", "burst_us")
+# laser-mA burst (Tuner.burst_us), to see its cost on the Pico; stuck: the
+# 1-based channels stuck.py calls stuck now (held / flickering, not a bell)
+BRIEF_KEYS = ("lines", "align", "bad", "errors", "last_error", "burst_us", "stuck")
 
 KNOWN_CMDS = ("tune", "drive", "tune_get")
 ALIGN_MARK = '"align"'          # a line naming it goes to align_scope (cmd "align")
@@ -232,6 +238,9 @@ class Tuner:
         self.last_adj = {}       # ch -> clock_ms of last successful adjust
         self.sweep_ch = None     # a sweep (sweep.py) owns this head's drive
         self.saved_thr = {}      # ch -> threshold saved in NVM (head_store), for the seed
+        # stuck heads (fed by the concentrator's sense edges); tick ms like clock
+        self.stuck = StuckWatch(host.n, cfg, born_ms=self.clock())
+        self.light_lowers = light_lowers(cfg)   # heads.pt_light: held = light?
         self.errors = 0
         self.last_error = None
 
@@ -294,6 +303,17 @@ class Tuner:
     def kind_of(self, ch):
         return self.host.gate.kind[ch]
 
+    def lit(self, held):
+        """Is there light on the PT, from the comparator level (held = low)?"""
+        return bool(held) == self.light_lowers
+
+    def unlocked(self, now=None):
+        """True while the tower is not quiet only because of stuck heads
+        (thr / drive allowed; the scope's FLAG_STUCK)."""
+        if self.host.tower.tower == "inactive":
+            return False
+        return self.stuck.allows(self.clock() if now is None else now)
+
     def _refuse(self, cmd, ch, now):
         h = self.host
         if ch is None or not 0 <= ch < h.n:
@@ -302,7 +322,9 @@ class Tuner:
         if k not in ACTIVE_KINDS:
             return "not an active head (%s)" % k
         if h.tower.tower != "inactive":
-            return "tower not quiet (%s): strokes in progress" % h.tower.tower
+            if not self.stuck.allows(now):
+                return "tower not quiet (%s): strokes in progress" % h.tower.tower
+            self.stuck.unlocks += 1
         if h.survey_state.phase != self._idle:
             return "survey running"
         if self.sweep_ch == ch:
@@ -524,7 +546,8 @@ class SerialTune:
                 "overflows": self.overflows, "bad": self.bad,
                 "dropped_ack": self.dropped_ack, "errors": self.errors,
                 "last_error": self.last_error, "align": self.aligned,
-                "burst_us": self.tuner.burst_us}
+                "burst_us": self.tuner.burst_us,
+                "stuck": self.tuner.stuck.stuck_list(self.tuner.clock())}
 
     def brief(self):
         """BRIEF_KEYS of counters(), for the serial heartbeat (body "tune"):

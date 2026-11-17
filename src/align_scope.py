@@ -261,9 +261,9 @@ class Aligner:
         if held:
             if i == self.ch:
                 self._low = True
-            sw = self.sweep
-            if sw is not None and i == sw.ch:
-                sw.low = True
+        sw = self.sweep
+        if sw is not None and i == sw.ch and not self.host.tune.lit(held):
+            sw.dark = True              # light lost on the swept head (heads.pt_light)
 
     def sample(self):
         ch = self.ch
@@ -337,6 +337,24 @@ class Aligner:
     def _quiet(self):
         h = self.host
         return h.tower.tower == "inactive" and h.survey_state.phase == self._idle
+
+    def _stuck(self):
+        """Not quiet only because of stuck heads (tune.Tuner.unlocked): thr /
+        drive go through, so the scope measures and sends full reports."""
+        h = self.host
+        try:
+            return h.survey_state.phase == self._idle and h.tune.unlocked()
+        except Exception:
+            return False
+
+    def _lit_low(self):
+        try:
+            return bool(self.host.tune.light_lowers)
+        except Exception:
+            return True
+
+    def _adjustable(self):
+        return self._quiet() or self._stuck()
 
     def kind_of(self, ch):
         return self.host.gate.kind[ch]
@@ -469,8 +487,8 @@ class Aligner:
                 why = "no PT wire on this channel"
             elif h.survey_state.phase != self._idle:
                 why = "survey running"
-            elif h._prev_held[ch]:
-                why = "beam broken"
+            elif not h.tune.lit(h._prev_held[ch]):
+                why = "no light on the PT"
             elif self.mem_free is not None and self.mem_free() < MEM_MIN:
                 why = "low memory"
         if why is None:
@@ -542,6 +560,10 @@ class Aligner:
             f |= heads_cc.FLAG_BROKE
         if self._quiet():
             f |= heads_cc.FLAG_QUIET
+        elif self._stuck():
+            f |= heads_cc.FLAG_STUCK
+        if self._lit_low():
+            f |= heads_cc.FLAG_LIT_LOW
         if self.ch is not None and self.ch == ch:
             f |= heads_cc.FLAG_SCOPE
         return f
@@ -570,7 +592,8 @@ class Aligner:
             return
         self.send_to(cid, self._env(T_ACK, {
             "what": what, "ch": None if ch is None else ch + 1, "ok": bool(ok),
-            "why": why, "thr": thr, "drv": drv, "tower": self.host.tower.tower}))
+            "why": why, "thr": thr, "drv": drv, "tower": self.host.tower.tower,
+            "stuck": self._stuck(), "lit_low": self._lit_low()}))
 
     def _info(self, cid):
         h = self.host
@@ -596,7 +619,7 @@ class Aligner:
         fresh = False
         if self.sweep is not None and self.sweep.ch == ch:
             fresh = True                             # the sweep measures this head
-        elif self._quiet():
+        elif self._adjustable():
             if self.last_measure is None or now - self.last_measure >= MEASURE_MS:
                 self.last_measure = now
                 fresh = t._measure(ch) is not False      # also reads the PT level
@@ -613,7 +636,7 @@ class Aligner:
             if self.cc_alive is not None and not self.cc_alive():
                 self._stop(None)                     # the host closed the data port
                 return
-            quiet = self._quiet()
+            quiet = self._adjustable()
             f = self._cc_flags(ch) | (0 if fresh else heads_cc.FLAG_BUSY)
             self._broke = False
             self.cc.frame(ch + 1, f, thr, h.refresher.readback.get(ch), drv, t.ma.get(ch),
@@ -635,6 +658,8 @@ class Aligner:
         b["pt"] = pt[0] if pt else None             # volts; null: not wired on this channel
         b["pt_span"] = pt[1] if pt else None
         b["tower"] = h.tower.tower
+        b["stuck"] = self._stuck()
+        b["lit_low"] = self._lit_low()          # held (bit 0) = light: heads.pt_light
         b["busy"] = not fresh
         self._doc["tick_ms"] = now
         got = self.send_to(self.cid, self._doc)

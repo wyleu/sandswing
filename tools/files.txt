@@ -12,6 +12,7 @@ midi_stamp.py
 midi_ports.py
 serial_status.py
 tune.py
+stuck.py
 pt_level.py
 align_scope.py
 heads_cc.py

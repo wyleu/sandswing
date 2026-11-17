@@ -727,6 +727,11 @@ class Concentrator:
             self.tower.report(i, IDLE, False)
             return IDLE, held
     
+        # stuck heads (stuck.py): every edge, stamped, so the tune gate can tell
+        # a head sitting on its threshold from a ringing bell
+        sw = getattr(getattr(self, "tune", None), "stuck", None)
+        if sw is not None and (became or released):
+            sw.edge(i, held, self._edge_ms(raw))
         stroke = False
         if self.head[i] == "trigger":
             stroke = self._trigger_edge(i, held, now, self._edge_ms(raw))
@@ -735,7 +740,10 @@ class Concentrator:
             self.edge_at[i] = now
             t_ms, last = self._edge_ms(raw), self.stroke_ms[i]
             if last is not None and t_ms - last < MIN_STROKE_GAP_MS:
-                print("%.3f ch %d DOUBLE %dms (ignored)" % (now, i + 1, t_ms - last))
+                if sw is not None and sw.flagged[i]:
+                    sw.hushed += 1               # a stuck head: no console flood
+                else:
+                    print("%.3f ch %d DOUBLE %dms (ignored)" % (now, i + 1, t_ms - last))
             else:
                 self.stroke_ms[i] = t_ms
                 self.stroke_n[i] += 1

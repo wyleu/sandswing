@@ -64,6 +64,22 @@ class LitADC:
         return int(self.top * d / (d + self.knee))
 
 
+class DimADC(LitADC):
+    """Head 5's real PT (heads.pt_light "lowers"): ~2 V dark, falling with
+    light to ~0.16 V on the reflector at full drive."""
+
+    def __init__(self, laser, dark=40000, lit=3200, knee=8000):
+        LitADC.__init__(self, laser, dark - lit, knee)
+        self.dark = dark
+
+    @property
+    def value(self):
+        return self.dark - LitADC.value.fget(self)
+
+
+RAISES = {"heads": {"pt_light": "raises"}}   # the bench fake above: PT up with light
+
+
 class MidiPort:
     def __init__(self):
         self.writes = []
@@ -93,7 +109,11 @@ def v14(r, cc):
     return None if v == CC.NONE_14 else v
 
 
-def make(kinds=None, nvm=None, cc=False, cfg=None):
+def make(kinds=None, nvm=None, cc=False, cfg=None, lowers=False):
+    """lowers: head 5 as measured (DimADC, held = light, default polarity);
+    else the older fake (LitADC) with cfg heads.pt_light "raises"."""
+    if cfg is None and not lowers:
+        cfg = RAISES
     mux_select.reset_registry()
     bank = FakePinBank()
     tower, bells = tower_build.build_from_pins(PINS, bank)
@@ -120,8 +140,8 @@ def make(kinds=None, nvm=None, cc=False, cfg=None):
     h = Host()
     h.bells, h.mux, h.tower, h.gate, h.refresher = bells, tower, Tower(), gate, r
     h.survey_state = Survey()
-    h._prev_held = [False] * 4
-    h.pt_level = PtLevel(LitADC(bells[0].laser), 0, 27)
+    h._prev_held = [lowers, False, False, False]     # ch1 lit (the strip seen)
+    h.pt_level = PtLevel((DimADC if lowers else LitADC)(bells[0].laser), 0, 27)
     h.head_store = HS.HeadStore(nvm if nvm is not None else CPNvm())
     h.tune = tune.Tuner(h, cfg, clock_ms=clock)
     sent = []
@@ -360,10 +380,10 @@ def test_sweep_aborts_and_restores_on_stroke_beam_stop_timeout():
     assert acks(sent, "sweep_end")[-1]["why"] == "tower not quiet"
     assert h.bells[0].laser.duty_cycle == 40000 and al.sweep is None
     h, al, sent, clock = start()
-    al.edge(0, True)                         # the sense pass saw a break
+    al.edge(0, True)                         # "raises": held = the light lost
     clock.t += 50
     al.tick()
-    assert acks(sent, "sweep_end")[-1]["why"] == "beam broken"
+    assert acks(sent, "sweep_end")[-1]["why"] == SW.END_DARK
     assert h.bells[0].laser.duty_cycle == 40000
     h, al, sent, clock = start()
     say(al, ch=1, sweep=False)
@@ -393,7 +413,7 @@ def test_sweep_refused_without_pt_wire_busy_or_broken():
     h.tower.tower = "inactive"
     h._prev_held[0] = True
     say(al, ch=1, sweep=True)
-    assert acks(sent, "sweep")[-1]["why"] == "beam broken"
+    assert acks(sent, "sweep")[-1]["why"] == SW.END_DARK
     h._prev_held[0] = False
     h.bells[0].laser.duty_cycle = 0
     say(al, ch=1, sweep=True)
@@ -497,6 +517,67 @@ def test_new_modules_are_lean_and_deployed():
     src = open(os.path.join(SRC, "align_scope.py")).read()
     top = [n for n in ast.parse(src).body if isinstance(n, (ast.Import, ast.ImportFrom))]
     assert not any("sweep" in ast.unparse(n) for n in top)
+
+
+# ---- heads.pt_light "lowers" (default; head 5: reflector 0.16 V, dark ~2 V) ----
+@case
+def test_polarity_setting_default_lowers():
+    from pt_level import light_lowers
+    assert light_lowers(None) and light_lowers({}) and light_lowers({"heads": {"pt_light": "x"}})
+    assert not light_lowers(RAISES)
+    h, al, sent, clock = make(lowers=True)
+    assert h.tune.light_lowers and h.tune.lit(True) and not h.tune.lit(False)
+    assert al._cc_flags(0) & CC.FLAG_LIT_LOW
+    h2, al2, _, _ = make()
+    assert not al2._cc_flags(0) & CC.FLAG_LIT_LOW
+
+
+@case
+def test_lowers_sweep_runs_with_the_strip_seen_held():
+    h, al, sent, clock = make(lowers=True)
+    h.refresher.target[0] = 64000                # ~3.2 V: far above the dark PT, no early stop
+    say(al, ch=1, sweep=True)
+    assert acks(sent, "sweep")[-1]["ok"], acks(sent, "sweep")
+    run_sweep(al, clock)
+    pts = of(sent, A.T_SWEEP)
+    assert len(pts) == SW.SWEEP_POINTS
+    assert pts[0]["pt"] < pts[-1]["pt"]          # less light: the PT rises
+    assert acks(sent, "sweep_end")[-1]["why"] is None
+
+
+@case
+def test_lowers_sweep_refused_and_aborted_when_the_light_goes():
+    h, al, sent, clock = make(lowers=True)
+    h._prev_held[0] = False                      # comparator high: no light
+    say(al, ch=1, sweep=True)
+    assert acks(sent, "sweep")[-1]["why"] == SW.END_DARK
+    h._prev_held[0] = True
+    h.refresher.target[0] = 64000
+    say(al, ch=1, sweep=True)
+    assert acks(sent, "sweep")[-1]["ok"]
+    al.edge(0, True)                             # held = light: not a loss
+    clock.t += 50
+    al.tick()
+    assert al.sweep is not None
+    al.edge(0, False)                            # released: the light lost
+    clock.t += 50
+    al.tick()
+    assert acks(sent, "sweep_end")[-1]["why"] == SW.END_DARK
+    assert h.bells[0].laser.duty_cycle == 65535
+
+
+@case
+def test_lowers_sweep_stops_before_the_pt_rises_to_the_threshold():
+    h, al, sent, clock = make(lowers=True)
+    h.refresher.target[0] = 32768                # 1.65 V: mid-rail, as head 5 now
+    say(al, ch=1, sweep=True)
+    run_sweep(al, clock)
+    end = acks(sent, "sweep_end")[-1]
+    assert end["why"] == SW.END_NEAR, end
+    pts = of(sent, A.T_SWEEP)
+    tv = 32768 * 3.3 / 65535
+    assert all(p["pt"] < tv for p in pts), pts   # never past the threshold
+    assert len(pts) < SW.SWEEP_POINTS
 
 
 finish()

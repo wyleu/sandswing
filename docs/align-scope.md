@@ -152,9 +152,9 @@ bells' NoteOns are on `midi.usb.channel`, 1).
 | CC | bits | meaning |
 |---|---|---|
 | 102 `CC_HEAD` | 7 | head (channel) 1-16; **starts** a report |
-| 103 `CC_FLAGS` | 7 | 1 beam clear now, 2 a low sample since the last report, 4 mA is an older reading, 8 tower quiet, 16 scope running on this head |
+| 103 `CC_FLAGS` | 7 | 1 comparator high now, 2 a low sample since the last report, 4 mA is an older reading, 8 tower quiet, 16 scope running on this head, 32 not quiet only because of stuck heads (stuck.py: thr / drive allowed), 64 comparator low = light on the PT (settings heads.pt_light "lowers", the default) |
 | 104 `CC_ACK_WHAT` | 7 | ack reports only: 1 thr, 2 drive, 3 scope, 4 bad, 5 thr_mid, 6 sweep, 7 sweep_end, 8 use, 9 save, 10 forget, 11 saved |
-| 105 `CC_ACK_WHY` | 7 | ack reports only: 0 ok; 1 not an active head, 2 tower not quiet, 3 survey running, 4 old head has no threshold, 5 too fast, 6 at limit, 7 laser is off, 8 laser current over max_ma, 9 busy, 10 timeout, 11 head gone, 12 low memory, 13 bad command, 14 beam broken, 15 stopped, 16 no PT wire, 17 sweep running, 18 not saved, 19 bad label, 20 near threshold, 127 other |
+| 105 `CC_ACK_WHY` | 7 | ack reports only: 0 ok; 1 not an active head, 2 tower not quiet, 3 survey running, 4 old head has no threshold, 5 too fast, 6 at limit, 7 laser is off, 8 laser current over max_ma, 9 busy, 10 timeout, 11 head gone, 12 low memory, 13 bad command, 14 no light on the PT, 15 stopped, 16 no PT wire, 17 sweep running, 18 not saved, 19 bad label, 20 near threshold, 127 other |
 | 107 `CC_SWEEP` | 7 | sweep point reports only: the point's index (0 = max drive) |
 | 108 `CC_SLOT` | 7 | saved-values reports only: 1 saved, 0 empty (CC_HEAD is the channel) |
 | 109-116 `CC_LABEL` | 7 each | saved-values reports only: the head's label, one ASCII character per CC, 0 = none |
@@ -225,3 +225,18 @@ NVM layout (`head_store.py`): offset `NVM_OFFSET` 0, `NVM_SIZE` 128 reserved,
 CRC-16/CCITT.  A wrong magic, version, count or CRC: every slot empty
 (ignored).  `watchdog_guard` keeps its reset note in the NVM's last 4 bytes;
 nothing else uses the NVM (`tests/test_lineup.py`).
+
+## Stuck heads and PT polarity
+
+- **Stuck head** (`stuck.py`): a channel with no clear gap of `tune.stuck_clear_ms`
+  (default `ring.MIN_STROKE_GAP_MS`, 250) for `tune.stuck_after_s` (default
+  `tower_watch.RINGDOWN_S`, 10) is held or flickering, not a bell.  When every
+  channel keeping the tower awake is stuck, `tune` / `drive` (and "Use this")
+  go through; sweep and NVM save still need a quiet tower.  Strokes are not
+  suppressed; the heartbeat's `tune.stuck` lists the channels, and their
+  DOUBLE console lines are hushed (`hushed` count).
+- **PT polarity** (`heads.pt_light`, `pt_level.py`): `"lowers"` (default,
+  head 5: reflector 0.16 V, blocked ~2 V) = more light pulls the PT down and
+  the LM393 output low (held).  `"raises"` the other way.  The sweep's
+  light check, its near-threshold guard, and the page's colours and
+  suggestion follow it; the stroke path does not (a stroke is a held edge).

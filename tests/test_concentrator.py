@@ -99,6 +99,68 @@ def strokes(app, fh):
             "events": [[e["body"]["ch"], e["session"], e["mode"]] for e in sent]}
 
 
+def stuck_head(app, fh):
+    """ch1 flickers on its threshold (held 3 ms, clear 2 ms) for ever: after
+    tune.stuck_after_s the tune gate lets thr / drive through, its DOUBLE lines
+    are hushed; a real stroke on ch2 shuts the gate again."""
+    import concentrator
+    import stuck
+    from sntp_pico import TickClock
+    level = {0: True, 1: True}                   # True = beam clear (not held)
+    fh.din_fn[0] = lambda: level[0]
+    fh.din_fn[1] = lambda: level[1]
+    app.head[0] = app.head[1] = "new"
+    app.gate.set_kind(0, "head_new")
+    app.bells[0].laser.duty_cycle = 65535
+    t = [1000000]
+    app.ticks = TickClock(lambda: t[0])
+    keypad_clock(t)
+    app.ring.clock_ms = app.ticks.now
+    app.tune.clock = app.ticks.now               # one tick clock, as on the Pico
+    logs = []
+    app.tune.stuck = stuck.StuckWatch(app.n, None, born_ms=app.ticks.now(), log=logs.append)
+    sent = []
+    concentrator.send = lambda obj, keep=True: sent.append(obj)
+    app.sntp = SessionSntp()
+    app.poll_sense()
+
+    def flicker(ms):
+        end = t[0] + ms
+        while t[0] < end:
+            level[0] = False
+            app.poll_sense()
+            t[0] += 3
+            level[0] = True
+            app.poll_sense()
+            t[0] += 2
+        app.tower.poll()
+        app._tower_step()
+
+    def thr():
+        return app.tune.handle("tune", 0, "thr_step", -1)
+    after_ms = stuck.STUCK_AFTER_S * stuck.MS_PER_S
+    out = {}
+    flicker(after_ms // 2)
+    out["tower_mid"], out["thr_mid"] = app.tower.tower, thr()
+    flicker(after_ms // 2 + 500)
+    out["tower_late"], out["stuck_late"] = app.tower.tower, app.tune.stuck.stuck_list(t[0])
+    out["thr_late"] = thr()
+    flicker(app.tune.settings["min_gap_ms"])
+    out["drv_late"] = app.tune.handle("drive", 0, "drive_step", -1)
+    out["hushed"] = app.tune.stuck.hushed
+    out["logs"] = logs
+    out["brief"] = app.serial_tune.brief().get("stuck") if getattr(app, "serial_tune", None) else None
+    level[1] = False                             # a real stroke on ch2
+    app.poll_sense()
+    t[0] += 60
+    level[1] = True
+    app.poll_sense()
+    flicker(app.tune.settings["min_gap_ms"])
+    out["thr_after_ch2"] = thr()
+    out["strokes"] = len([e for e in sent if e.get("type") == "stroke"])
+    return out
+
+
 def midi_first(app, fh):
     """A laser-head stroke: its USB MIDI NoteOn is sent before the stroke goes
     to the network (a live send can sit 10 s in lwIP's ERR_MEM loop)."""
@@ -702,6 +764,8 @@ def child(scenario, src, extra):
             out.update(stamps(app, fh))
         if scenario == "midi_first":
             out.update(midi_first(app, fh))
+        if scenario == "stuck":
+            out.update(stuck_head(app, fh))
         if scenario == "watch":
             out.update(watch_empty(app, fh, plug_head))
         if scenario == "udp_dead":
@@ -853,6 +917,21 @@ def main():
     check("strokes: other channel independent of ch1's gap", ev[-1:] == [[2, 1, "ringing"]], ev)
     check("strokes: one session for the whole ring (one wake)",
           r.get("wakes") == 1 and all(e[1] == 1 for e in ev), (r.get("wakes"), ev))
+    r = spawn(me, "stuck")
+    check("stuck head: flickering %s s, the tower is awake and thr is refused" % 5,
+          r["ok"] and r.get("tower_mid") != "inactive"
+          and (r.get("thr_mid") or {}).get("why", "").startswith("tower not quiet"),
+          r.get("exc") or (r.get("tower_mid"), r.get("thr_mid")))
+    check("stuck head: after tune.stuck_after_s it is stuck, thr and drive go through",
+          r.get("tower_late") != "inactive" and r.get("stuck_late") == [1]
+          and (r.get("thr_late") or {}).get("ok") and (r.get("drv_late") or {}).get("ok"),
+          (r.get("tower_late"), r.get("stuck_late"), r.get("thr_late"), r.get("drv_late")))
+    check("stuck head: logged once, its DOUBLE lines hushed, its strokes still sent",
+          len(r.get("logs") or []) == 1 and (r.get("hushed") or 0) > 0 and (r.get("strokes") or 0) > 1,
+          (r.get("logs"), r.get("hushed"), r.get("strokes")))
+    check("stuck head: a real stroke on ch2 shuts the gate again",
+          (r.get("thr_after_ch2") or {}).get("why", "").startswith("tower not quiet"),
+          r.get("thr_after_ch2"))
     r = spawn(me, "midi_first")
     order = [o for o in (r.get("order") or []) if o[0] == "midi" or o[1] == "stroke"]
     check("midi first: each head stroke's NoteOn goes out before its network send",

@@ -9,12 +9,14 @@ Cooperative: Aligner.tick calls step() every SWEEP_TICK_S; each call does
 at most one ~4 ms GP26 burst (tune.Tuner._measure), never a wait.  The
 stroke path and 5-pin MIDI are not touched.  RAM only: the drive at the
 start is put back at the end, on Stop, and on every abort (a stroke or
-survey, the beam broken on this head, the head gone, the timeout).
+survey, the light lost on this head, the head gone, the timeout).
 
-The descent also ends early, as a normal finish ("near threshold"), when
-the PT level comes within sweep.guard_frac of the threshold (only when the
-first point shows the PT above it), so the beam is not lowered into a
-break that would ring as a stroke.
+"Light" follows settings heads.pt_light (pt_level.py): "lowers" (default,
+head 5) means more light pulls the PT DOWN and the comparator low (held)
+is light; "raises" the other way.  The descent also ends early, as a normal
+finish ("near threshold"), when the PT level comes within sweep.guard_frac
+of the threshold from the light side (only when the first point is on the
+light side of it), so the light is not lowered past the threshold.
 
 Settings ("sweep"): points, settle_ms, timeout_s, guard_frac.
 """
@@ -32,7 +34,8 @@ SWEEP_GUARD_FRAC = 0.1          # stop when the PT is within this of the thresho
 SWEEP_TICK_S = 0.05             # Aligner tick while a sweep runs (one burst per tick)
 MS_PER_S = 1000
 END_DONE = None                 # finished: every point
-END_NEAR = "near threshold"     # finished early: the next step could break the beam
+END_NEAR = "near threshold"     # finished early: the next step could lose the light
+END_DARK = "no light on the PT" # aborted: the comparator says no light (heads.pt_light)
 
 
 def sweep_settings(cfg):
@@ -96,8 +99,8 @@ class Sweep:
         self.k = 0
         self.pt_sum = 0.0
         self.span = 0.0
-        self.low = False            # set from the sense pass (Aligner.edge)
-        self.thr_v = None           # the threshold, volts, if the PT starts above it
+        self.dark = False           # a no-light edge from the sense pass (Aligner.edge)
+        self.thr_v = None           # the threshold, volts, if the PT starts on its light side
         self.done = False
         t.sweep_ch = ch
         self._next(now)
@@ -121,8 +124,8 @@ class Sweep:
             return "survey running"
         if h.gate.kind[self.ch] not in ACTIVE_KINDS:
             return "head gone"
-        if self.low or h._prev_held[self.ch]:
-            return "beam broken"
+        if self.dark or not h.tune.lit(h._prev_held[self.ch]):
+            return END_DARK
         if now - self.started > self.s["timeout_ms"]:
             return "timeout"
         return None
@@ -179,8 +182,14 @@ class Sweep:
         if pv is None or thr is None:
             return False
         tv = thr * VREF / FULL
+        g = self.s["guard_frac"]
+        lowers = self.host.tune.light_lowers
         if self.i == 0:
-            if pv > tv:
-                self.thr_v = tv     # the PT rises with light here: guard on
+            if (pv < tv) if lowers else (pv > tv):
+                self.thr_v = tv     # the PT starts on the light side: guard on
             return False
-        return self.thr_v is not None and pv <= self.thr_v * (1 + self.s["guard_frac"])
+        if self.thr_v is None:
+            return False
+        if lowers:                  # light pulls the PT down: it rises as the light goes
+            return pv >= self.thr_v * (1 - g)
+        return pv <= self.thr_v * (1 + g)

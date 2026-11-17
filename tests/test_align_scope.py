@@ -298,7 +298,7 @@ def test_bad_frames_ack_and_flooding_is_bounded():
     say(al, ch=1, thr="x")
     assert of(sent, "align_ack")[-1]["body"] == {
         "what": "bad", "ch": None, "ok": False, "why": "bad step", "thr": None,
-        "drv": None, "tower": "inactive"}
+        "drv": None, "tower": "inactive", "stuck": False, "lit_low": True}
     for _ in range(A.MAX_PENDING + 3):
         al.on_message(1, '{"cmd":"align","info":true}')
     assert len(al.pending) == A.MAX_PENDING and al.dropped == 3
