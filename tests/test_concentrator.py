@@ -161,6 +161,78 @@ def stuck_head(app, fh):
     return out
 
 
+def repwm(app, fh):
+    """Laser PWM speed live (tune.Tuner.set_pwm -> Concentrator.set_laser_hz):
+    every laser PWMOut re-created at the new frequency with its duty (the
+    lasers share RP2350 slices in pairs: no variable_frequency), and the dark
+    spell's edges are not strokes; a real net change in the window still
+    goes through once the window is over."""
+    import concentrator
+    import tune
+    from sntp_pico import TickClock
+    level = {0: True, 1: True}                   # True = beam clear (not held)
+    fh.din_fn[0] = lambda: level[0]
+    fh.din_fn[1] = lambda: level[1]
+    app.head[0] = app.head[1] = "new"
+    app.gate.set_kind(0, "head_new")
+    app.gate.set_kind(1, "head_new")
+    app.bells[0].laser.duty_cycle = 65535
+    app.bells[1].laser.duty_cycle = 30000
+    t = [2000000]
+    app.ticks = TickClock(lambda: t[0])
+    keypad_clock(t)
+    app.ring.clock_ms = app.ticks.now
+    app.tune.clock = app.ticks.now
+    sent = []
+    concentrator.send = lambda obj, keep=True: sent.append(obj)
+    app.sntp = SessionSntp()
+    app.poll_sense()
+    out = {"hz0": app.laser_hz, "boot_hz": [fh.pwm[g].frequency for g in range(8, 16)]}
+    try:
+        app.lasers[0].frequency = 20000          # what variable_frequency would need
+        out["writable"] = True
+    except AttributeError:
+        out["writable"] = False
+    out["low"] = app.tune.set_pwm(0, tune.LASER_PWM_HZ_MIN - 1)
+    out["high"] = app.tune.set_pwm(0, tune.LASER_PWM_HZ_MAX + 1)
+    lasers_list = app.lasers
+    old0 = app.lasers[0]
+    out["ack"] = app.tune.set_pwm(0, 20000)
+    out["hz"] = [fh.pwm[g].frequency for g in range(8, 16)]
+    out["duty"] = [fh.pwm[8].duty_cycle, fh.pwm[9].duty_cycle]
+    out["same_list"] = app.ring.lasers is lasers_list is app.lasers
+    out["new_objs"] = app.lasers[0] is not old0 and app.bells[0].laser is app.lasers[0]
+    out["tune_hz"] = app.tune.pwm_hz()
+    # the dark spell: ch1 breaks and comes back inside the settle window
+    level[0] = False
+    t[0] += 1
+    app.poll_sense()
+    level[0] = True
+    t[0] += 1
+    app.poll_sense()
+    # ch2 changes for real inside the window and stays
+    level[1] = False
+    t[0] += 1
+    app.poll_sense()
+    out["blank_mid"] = app._blank_end is not None
+    t[0] += concentrator.LASER_REPWM_SETTLE_MS
+    app.poll_sense()
+    out["blanked"] = app.blanked
+    out["blank_end"] = app._blank_end
+    out["prev_held"] = list(app._prev_held[:2])
+    out["strokes"] = [e["body"]["ch"] for e in sent if e.get("type") == "stroke"]
+    out["woke"] = app.tower.tower            # ch2's real stroke woke the tower
+    app.tower.tower = "inactive"
+    out["too_fast"] = app.tune.set_pwm(0, 1000)
+    t[0] += app.tune.settings["min_gap_ms"]
+    app.tower.tower = "active"
+    out["busy"] = app.tune.set_pwm(0, 1000)
+    app.tower.tower = "inactive"
+    out["back"] = app.tune.set_pwm(0, 1000)
+    out["hz_back"] = fh.pwm[8].frequency
+    return out
+
+
 def midi_first(app, fh):
     """A laser-head stroke: its USB MIDI NoteOn is sent before the stroke goes
     to the network (a live send can sit 10 s in lwIP's ERR_MEM loop)."""
@@ -766,6 +838,8 @@ def child(scenario, src, extra):
             out.update(midi_first(app, fh))
         if scenario == "stuck":
             out.update(stuck_head(app, fh))
+        if scenario == "repwm":
+            out.update(repwm(app, fh))
         if scenario == "watch":
             out.update(watch_empty(app, fh, plug_head))
         if scenario == "udp_dead":
@@ -932,6 +1006,29 @@ def main():
     check("stuck head: a real stroke on ch2 shuts the gate again",
           (r.get("thr_after_ch2") or {}).get("why", "").startswith("tower not quiet"),
           r.get("thr_after_ch2"))
+    r = spawn(me, "repwm")
+    check("laser PWM: boot 1 kHz on all 8; .frequency not writable (shared slices)",
+          r["ok"] and r.get("hz0") == 1000 and r.get("boot_hz") == [1000] * 8
+          and r.get("writable") is False, r.get("exc") or (r.get("hz0"), r.get("boot_hz")))
+    check("laser PWM: outside the named limits refused",
+          not (r.get("low") or {}).get("ok", True) and not (r.get("high") or {}).get("ok", True)
+          and (r.get("low") or {}).get("why", "").startswith("pwm out of range"),
+          (r.get("low"), r.get("high")))
+    check("laser PWM: 20 kHz on all 8, duties kept, Ring / bells see the new PWMOuts",
+          (r.get("ack") or {}).get("ok") and r.get("hz") == [20000] * 8
+          and r.get("duty") == [65535, 30000] and r.get("same_list") and r.get("new_objs")
+          and r.get("tune_hz") == 20000 and (r.get("ack") or {}).get("pwm_hz") == 20000,
+          (r.get("ack"), r.get("hz"), r.get("duty"), r.get("same_list"), r.get("new_objs")))
+    check("laser PWM: the dark spell's edges are skipped (no stroke); a real change in "
+          "the window goes through after it",
+          r.get("blank_mid") and r.get("blanked") == 3 and r.get("blank_end") is None
+          and r.get("prev_held") == [False, True] and r.get("strokes") == [2],
+          (r.get("blanked"), r.get("prev_held"), r.get("strokes")))
+    check("laser PWM: too fast / tower not quiet refused; back to 1 kHz",
+          (r.get("too_fast") or {}).get("why") == "too fast"
+          and (r.get("busy") or {}).get("why", "").startswith("tower not quiet")
+          and (r.get("back") or {}).get("ok") and r.get("hz_back") == 1000,
+          (r.get("too_fast"), r.get("busy"), r.get("back"), r.get("hz_back")))
     r = spawn(me, "midi_first")
     order = [o for o in (r.get("order") or []) if o[0] == "midi" or o[1] == "stroke"]
     check("midi first: each head stroke's NoteOn goes out before its network send",

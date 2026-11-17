@@ -32,6 +32,7 @@ CC_SLOT = 108                  # a saved-values report (head_store): 1 saved, 0 
 CC_LABEL = 109                 # .. CC_LABEL + LABEL_MAX - 1: the head's label, one
                                # ASCII character each, 0 = none (109-116, all in
                                # the undefined 102-119 range, below the mode CCs)
+CC_CHATTER = 117               # a chatter-test report (chatter.py): 1 counting, 0 stopped
 # 14-bit controllers (MSB; LSB on +CC_LSB)
 CC_THR = 20                    # threshold target duty, scaled (duty14)
 CC_RB = 21                     # GP28 threshold readback, scaled (duty14)
@@ -41,6 +42,16 @@ CC_MA = 23                     # laser current, MA_UNITS per mA: the AVERAGE (ab
                                # CC of its own (a full report is 15 of MAX_MSGS)
 CC_PT = 24                     # PT level, mV
 CC_PT_SPAN = 25                # PT spread over the burst, mV
+CC_PWM = 14                    # laser PWM frequency, PWM_HZ_UNITS (every ack)
+# a chatter report (CC_CHATTER), per channel since "chatter start":
+CC_CH_TRANS = 26               # transitions (bursts that changed the level)
+CC_CH_CLEAN = 27               # ... of them with exactly one edge
+CC_CH_MAX = 28                 # most edges in one transition
+CC_CH_MEAN10 = 29              # mean edges per transition x10 (NONE_14: no transition)
+CC_CH_BURST = 30               # longest transition burst, ms
+CC_CH_SPUR = 31                # spurious edges (bursts that left the level as it was)
+CHATTER_CCS = (CC_CH_TRANS, CC_CH_CLEAN, CC_CH_MAX, CC_CH_MEAN10, CC_CH_BURST, CC_CH_SPUR)
+PWM_HZ_UNITS = 10              # CC_PWM counts 10 Hz (to 163.82 kHz > tune.LASER_PWM_HZ_MAX)
 NONE_14 = 16383                # "no value" (not measured / not wired)
 MAX_14 = 16382
 SEVEN = 127
@@ -57,7 +68,8 @@ FLAG_LIT_LOW = 64              # comparator low (held) = light on the PT (heads.
 FLAG_STUCK = 32                # not quiet only because of stuck heads (stuck.py):
                                # thr / drive adjustments allowed anyway
 WHAT = {"thr": 1, "drive": 2, "scope": 3, "bad": 4, "thr_mid": 5, "sweep": 6,
-        "sweep_end": 7, "use": 8, "save": 9, "forget": 10, "saved": 11}
+        "sweep_end": 7, "use": 8, "save": 9, "forget": 10, "saved": 11, "pwm": 12,
+        "chatter": 13}
 # refusal text (tune.Tuner / align_scope) -> code, by prefix; 127: anything else
 WHY = (("bad label", 19), ("not an active head", 1), ("tower not quiet", 2), ("survey running", 3),
        ("old head has no threshold", 4), ("too fast", 5), ("at limit", 6),
@@ -65,7 +77,8 @@ WHY = (("bad label", 19), ("not an active head", 1), ("tower not quiet", 2), ("s
        ("head gone", 11), ("low memory", 12), ("bad", 13), ("unknown key", 13),
        ("nothing to do", 13), ("not an align command", 13), ("too long", 13),
        ("no light", 14), ("stopped", 15), ("no PT wire", 16), ("sweep running", 17),
-       ("not saved", 18), ("near threshold", 20))
+       ("not saved", 18), ("near threshold", 20), ("pwm out of range", 21),
+       ("pwm not changed", 22), ("no chatter test", 23))
 WHY_OTHER = 127
 MAX_MSGS = 16                  # CCs in one report (a full one, and a slot one, is 15)
 LABEL_MAX = 8                  # = head_store.LABEL_MAX (test_head_store checks)
@@ -84,6 +97,10 @@ def duty14(d):
     """0..DUTY_FULL -> 0..MAX_14 (so full duty is not NONE_14); the host
     turns it back with value * DUTY_FULL / MAX_14, rounded."""
     return None if d is None else (int(d) * MAX_14 + DUTY_FULL // 2) // DUTY_FULL
+
+
+def hz14(hz):
+    return None if hz is None else (int(hz) + PWM_HZ_UNITS // 2) // PWM_HZ_UNITS
 
 
 def ma14(ma):
@@ -161,7 +178,8 @@ class CcOut:
         self._cc14(CC_PT_SPAN, mv14(span))
         self._send()
 
-    def ack(self, ch, what, why, thr, drv, flags):
+    def ack(self, ch, what, why, thr, drv, flags, pwm_hz=None):
+        """11 CCs: head, flags, what, why, threshold, drive, laser PWM Hz."""
         self.n = 0
         self._cc(CC_HEAD, ch or 0)
         self._cc(CC_FLAGS, flags)
@@ -169,8 +187,18 @@ class CcOut:
         self._cc(CC_ACK_WHY, why_code(why))
         self._cc14(CC_THR, duty14(thr))
         self._cc14(CC_DRV, duty14(drv))
+        self._cc14(CC_PWM, hz14(pwm_hz))
         self._send()
 
+    def chatter(self, ch, on, summary):
+        """One channel's chatter counts (15 CCs): head, state, then
+        chatter.Chatter.summary's six values (14-bit, saturating)."""
+        self.n = 0
+        self._cc(CC_HEAD, ch)
+        self._cc(CC_CHATTER, 1 if on else 0)
+        for j in range(len(CHATTER_CCS)):
+            self._cc14(CHATTER_CCS[j], summary[j])
+        self._send()
 
     def point(self, ch, flags, i, drv, ma, pt, span):
         """One sweep point (12 CCs): head, flags, index, drive, average mA,

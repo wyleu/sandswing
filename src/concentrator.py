@@ -94,7 +94,7 @@ from threshold_refresh import refresher_from_cfg, threshold_settings
 from ring import Ring, FULL, MIN_STROKE_GAP_MS
 from midi_ports import open_outputs
 from serial_status import open_serial_status
-from tune import Tuner, open_serial_tune
+from tune import Tuner, open_serial_tune, laser_pwm_hz
 from pt_level import open_pt_level, brief as pt_brief
 from align_scope import Aligner, SERIAL_CID
 from heads_cc import open_cc
@@ -172,6 +172,9 @@ WHY_LINES_MAX = 3            # /status + events: at most this many why lines
 # empty-socket check (_watch_empty): tower inactive + survey idle only
 EMPTY_CHECK_S = 1.0          # gap between checks
 EMPTY_SETTLE_S = 0.02        # laser on -> read the sense ADC
+# after a laser PWM change (set_laser_hz): the comparators settle in this
+# (the same laser-on settle as above); edges stamped before are skipped
+LASER_REPWM_SETTLE_MS = int(EMPTY_SETTLE_S * 1000)
 EMPTY_HEAD_MA = 5.0          # laser current that means a head is now fitted
 
 cfg.banner()                     # cfg: read at the top (link.ring_send picks the imports)
@@ -520,11 +523,67 @@ class Concentrator:
 
     def _setup_lasers(self):
         pins = self.mux.pins
-        self.lasers = [pins.pwm_out(gp, frequency=self.pinmap["laser_hz"], duty_cycle=0)
+        # laser.pwm_hz (else pins.laser_pwm_hz, else 1 kHz); live: set_laser_hz
+        self.laser_hz = laser_pwm_hz(self.cfg)
+        self.lasers = [pins.pwm_out(gp, frequency=self.laser_hz, duty_cycle=0)
                        for gp in self.pinmap["laser_gp"]]
         for b in self.bells:
             b.laser = self.lasers[b.index]
             b.sense_pin = self.inputs[b.index]
+
+    def set_laser_hz(self, hz):
+        """Every laser's PWM frequency, live (tune.Tuner.set_pwm, RAM only).
+        The lasers share RP2350 PWM slices in pairs and a slice has one
+        frequency (CircuitPython refuses variable_frequency on a shared
+        slice), so each PWMOut is re-created at hz with its duty: the lasers
+        are dark for about a millisecond.  Edges stamped in the next
+        LASER_REPWM_SETTLE_MS are not edges (poll_sense skips them, then
+        passes on any net change of level).  Tuner._refuse lets this
+        through only while the tower is quiet or awake only because of stuck
+        heads.  Nothing waits here.  -> None, or why not."""
+        from pwm_slices import check_pwm_slices, pwm_pins_from_cfg
+        from mux_errors import PwmSliceError
+        old = self.laser_hz
+        raw = dict(self.pinmap["raw"])
+        raw["laser_pwm"] = self.pinmap["laser_gp"]
+        raw["laser_pwm_hz"] = hz
+        try:
+            check_pwm_slices(pwm_pins_from_cfg(raw))
+        except PwmSliceError:
+            return "pwm slice clash"
+        self.poll_sense()                    # real edges first, as normal
+        pins = self.mux.pins
+        duties = [int(l.duty_cycle) for l in self.lasers]
+
+        def rebuild(f):
+            release(self.lasers)
+            self.lasers[:] = [pins.pwm_out(gp, frequency=f, duty_cycle=d)
+                              for gp, d in zip(self.pinmap["laser_gp"], duties)]
+        why = None
+        try:
+            rebuild(hz)
+            self.laser_hz = hz
+        except Exception as e:
+            why = repr(e)[:WHY_HB_CHARS]
+            rebuild(old)                     # never leave the heads dark
+        for b in self.bells:
+            b.laser = self.lasers[b.index]   # Ring holds the same list (changed in place)
+        self._blank_end = self.ticks.now() + LASER_REPWM_SETTLE_MS
+        emit("laser PWM %s Hz (asked %d)%s" % (
+            self.lasers[0].frequency if self.lasers else "-", hz,
+            "" if why is None else ": " + why))
+        return why
+
+    def _unblank(self):
+        """The settle after set_laser_hz is over: a level that differs from
+        the one last handled changed for real (a net change); pass it on."""
+        self._blank_end = None
+        now = time.monotonic()
+        for i in range(self.n):
+            held = self.sense.held[i]
+            if held != self._prev_held[i]:
+                self.ring.edge(i, held, self.ticks.now())
+                self._channel(i, held, now)
 
     def _boards(self):
         return self.pinmap["raw"].get("connector_boards") or DEFAULT_BOARDS
@@ -547,6 +606,8 @@ class Concentrator:
         self.stroke_ms = [None] * self.n     # tick ms of the last accepted stroke
         self.stroke_n = [0] * self.n         # accepted strokes this boot (status page)
         self._prev_held = list(self.sense.held)   # level as of the edges handled
+        self._blank_end = None           # set_laser_hz: skip edges stamped before this
+        self.blanked = 0                 # edges skipped so (the lasers' dark spell)
         self.trig_armed = [False] * self.n   # trigger plug: next press counts
         self.trig_open_ms = [None] * self.n  # tick ms the switch was seen open
         self.trig_low_ms = [None] * self.n   # tick ms the press began
@@ -651,11 +712,15 @@ class Concentrator:
         al = getattr(self, "align", None)        # the sandheads scope, when one runs
         if al is not None and al.ch is None and al.sweep is None:
             al = None
+        be = getattr(self, "_blank_end", None)  # None but just after a laser PWM change
         for _ in range(DRAIN_ROUNDS):
             edges = self.sense.drain()
             if not edges:
                 break
             for i, held, raw in edges:
+                if be is not None and (raw is None or self._edge_ms(raw) < be):
+                    self.blanked += 1           # the lasers' dark spell (set_laser_hz)
+                    continue
                 # MIDI first: the note must never wait behind the stroke's
                 # network send in _channel (a live send can sit 10 s in
                 # lwIP's ERR_MEM loop: docs/link-health.md "Ringing mode")
@@ -663,6 +728,8 @@ class Concentrator:
                 self._channel(i, held, now, raw)
                 if al is not None:
                     al.edge(i, held)      # one compare; after MIDI and the stroke
+        if be is not None and self.ticks.now() >= be:
+            self._unblank()
         for i in range(self.n):
             self._channel(i, self._prev_held[i], now)
         if al is not None:
@@ -729,9 +796,14 @@ class Concentrator:
     
         # stuck heads (stuck.py): every edge, stamped, so the tune gate can tell
         # a head sitting on its threshold from a ringing bell
-        sw = getattr(getattr(self, "tune", None), "stuck", None)
+        tn = getattr(self, "tune", None)
+        sw = getattr(tn, "stuck", None)
         if sw is not None and (became or released):
-            sw.edge(i, held, self._edge_ms(raw))
+            t_e = self._edge_ms(raw)
+            sw.edge(i, held, t_e)
+            cw = getattr(tn, "chatter", None)   # the chatter test (chatter.py): counters only
+            if cw is not None and cw.on:
+                cw.edge(i, t_e)
         stroke = False
         if self.head[i] == "trigger":
             stroke = self._trigger_edge(i, held, now, self._edge_ms(raw))

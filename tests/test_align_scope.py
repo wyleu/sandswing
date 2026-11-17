@@ -298,7 +298,8 @@ def test_bad_frames_ack_and_flooding_is_bounded():
     say(al, ch=1, thr="x")
     assert of(sent, "align_ack")[-1]["body"] == {
         "what": "bad", "ch": None, "ok": False, "why": "bad step", "thr": None,
-        "drv": None, "tower": "inactive", "stuck": False, "lit_low": True}
+        "drv": None, "pwm_hz": h.tune.pwm_hz(), "tower": "inactive", "stuck": False,
+        "lit_low": True}
     for _ in range(A.MAX_PENDING + 3):
         al.on_message(1, '{"cmd":"align","info":true}')
     assert len(al.pending) == A.MAX_PENDING and al.dropped == 3
@@ -343,6 +344,19 @@ def test_sample_allocates_nothing_per_call():
     grew = sum(d.size_diff for d in s2.compare_to(s1, "filename")
                if d.traceback[0].filename.endswith("align_scope.py"))
     assert grew < 100, grew                   # nothing kept per call (500 calls)
+
+@case
+def test_chatter_over_ws_is_a_json_report():
+    h, al, sent, clock = make()
+    say(al, ch=1, chatter="start")
+    assert of(sent, "align_ack")[-1]["body"]["what"] == "chatter"
+    for t in (2000, 2001, 2002, 3000):
+        h.tune.chatter.edge(0, t)
+    clock.t = 4000
+    say(al, ch=1, chatter="report")
+    b = of(sent, "align_chatter")[-1]["body"]
+    assert b == {"ch": 1, "on": True, "trans": 2, "clean": 1, "max_edges": 3, "mean_x10": 20,
+                 "max_burst_ms": 2, "spurious": 0, "gap_ms": 20, "pwm_hz": 1000}, b
 
 
 finish()

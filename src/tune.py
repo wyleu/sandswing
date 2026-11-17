@@ -15,6 +15,11 @@ the same port as serial_status).  Acks go back on that port.
     {"cmd":"tune_get"}                      all active heads
     {"cmd":"tune_get","ch":1}               one head
 
+The laser PWM frequency (laser.pwm_hz) and the chatter counter (chatter.py)
+are set through the sandheads align commands on the same port
+({"cmd":"align","ch":1,"pwm_hz":20000}, {"cmd":"align","ch":1,"chatter":
+"start"}): Tuner.set_pwm / Tuner.chatter_cmd, RAM only.
+
 Lines containing "align" are the sandheads scope (align_scope.py, client
 SERIAL_CID): handed to Aligner.on_message, frames back through send().
 
@@ -73,6 +78,24 @@ TUNE_MA_BURSTS = 4             # mA is the mean of this many bursts at one duty
                                # (a drive change starts afresh): steadier, as each
                                # burst starts at a different PWM phase
 LASER_HZ = 1000                # if the PWM cannot say: pins.laser_pwm_hz's default
+# Laser PWM frequency (settings laser.pwm_hz; else pins.laser_pwm_hz; else
+# LASER_HZ), changeable live (Tuner.set_pwm, RAM only) within these limits.
+# The lasers are in pairs on RP2350 PWM slices (GP8/9 .. GP14/15) and a
+# slice has one frequency, so CircuitPython's variable_frequency cannot be
+# used (it refuses a shared slice): a change re-creates every laser PWMOut
+# at the new frequency (Concentrator.set_laser_hz).  CircuitPython 10 rp2:
+# below clk/65536 (~2.3 kHz) the divider keeps 16-bit duty; above it TOP =
+# clk/f - 1, so the duty has clk/f levels.
+RP2350_CLK_HZ = 150000000      # CircuitPython's RP2350 system clock
+LASER_PWM_MIN_LEVELS = 1000    # at least 0.1 % duty steps (finer than LASER_FINE_STEP)
+LASER_PWM_HZ_MAX = RP2350_CLK_HZ // LASER_PWM_MIN_LEVELS          # 150 kHz
+MS_PER_S = 1000
+# one whole period must fit in the burst cap, so the mA stays an average
+LASER_PWM_HZ_MIN = MS_PER_S // TUNE_BURST_MAX_MS                  # 200 Hz
+# a fast PWM: as many whole periods as fill TUNE_ADC_PERIODS periods of
+# LASER_HZ (4 ms), so the GP26 reads (paced by a 1/32768 s clock) still
+# spread over the chop
+TUNE_ADC_SPAN_NS = TUNE_ADC_PERIODS * 1000000000 // LASER_HZ
 MA_DP = 2                      # mA decimals (heads_cc.MA_UNITS is 0.01 mA)
 NS_PER_S = 1000000000
 NS_PER_MS = 1000000
@@ -92,6 +115,7 @@ ERR_CHARS = 80
 BRIEF_KEYS = ("lines", "align", "bad", "errors", "last_error", "burst_us", "stuck")
 
 KNOWN_CMDS = ("tune", "drive", "tune_get")
+CHATTER_OPS = ("start", "stop", "report")
 ALIGN_MARK = '"align"'          # a line naming it goes to align_scope (cmd "align")
 # keys allowed on a command besides cmd (and ch, which is handled separately)
 _TUNE_KEYS = frozenset(("cmd", "ch", "thr", "thr_step"))
@@ -130,7 +154,23 @@ def laser_settings(cfg):
     if max_ma <= 0:
         max_ma = LASER_MAX_MA
     return {"min_duty": lo, "max_duty": hi, "step": step, "fine_below": fine_below,
-            "fine_step": fine, "max_ma": max_ma}
+            "fine_step": fine, "max_ma": max_ma, "pwm_hz": laser_pwm_hz(cfg)}
+
+
+def pwm_hz_ok(hz):
+    return (not isinstance(hz, bool) and isinstance(hz, int)
+            and LASER_PWM_HZ_MIN <= hz <= LASER_PWM_HZ_MAX)
+
+
+def laser_pwm_hz(cfg):
+    """The boot laser PWM frequency: laser.pwm_hz, else pins.laser_pwm_hz,
+    else LASER_HZ; one outside LASER_PWM_HZ_MIN..MAX is not used."""
+    for sec, key in (("laser", "pwm_hz"), ("pins", "laser_pwm_hz")):
+        d = cfg.get(sec) if cfg is not None and hasattr(cfg, "get") else None
+        v = d.get(key) if isinstance(d, dict) else None
+        if pwm_hz_ok(v):
+            return v
+    return LASER_HZ
 
 
 def drive_step(cur, sign, s):
@@ -237,6 +277,8 @@ class Tuner:
         self.pt = {}             # ch -> (volts, spread) of the last PT level (pt_level.py)
         self.last_adj = {}       # ch -> clock_ms of last successful adjust
         self.sweep_ch = None     # a sweep (sweep.py) owns this head's drive
+        self.chatter = None      # chatter.Chatter once a chatter test has started
+        self.pwm_set = 0         # live laser PWM changes this boot
         self.saved_thr = {}      # ch -> threshold saved in NVM (head_store), for the seed
         # stuck heads (fed by the concentrator's sense edges); tick ms like clock
         self.stuck = StuckWatch(host.n, cfg, born_ms=self.clock())
@@ -274,6 +316,69 @@ class Tuner:
             self.errors += 1
             self.last_error = repr(e)[:ERR_CHARS]
             return self._ack("use", ch, False, "error")
+
+    def pwm_hz(self):
+        """The lasers' PWM frequency now (the PWM's own, rounded, figure)."""
+        try:
+            return int(self.host.bells[0].laser.frequency)
+        except Exception:
+            return self.settings["laser"]["pwm_hz"]
+
+    def set_pwm(self, ch, hz, now=None):
+        """Every laser's PWM frequency (one per slice, so one for all), live,
+        RAM only.  The same refusals as a drive change on channel ch (the
+        page's head).  -> ack dict (cmd "pwm")."""
+        try:
+            if now is None:
+                now = self.clock()
+            if not pwm_hz_ok(hz):
+                return self._ack("pwm", ch, False, "pwm out of range %d-%d Hz" % (
+                    LASER_PWM_HZ_MIN, LASER_PWM_HZ_MAX))
+            why = self._refuse("pwm", ch, now)
+            if why is None and self.sweep_ch is not None:
+                why = "sweep running"
+            if why is not None:
+                return self._ack("pwm", ch, False, why)
+            setter = getattr(self.host, "set_laser_hz", None)
+            if setter is None:
+                return self._ack("pwm", ch, False, "pwm not changed: no lasers")
+            why = setter(hz)
+            if why is not None:
+                return self._ack("pwm", ch, False, "pwm not changed: %s" % why)
+            self._bursts = {}            # the mA bursts start afresh at the new chop
+            self.pwm_set += 1
+            self.last_adj[ch] = now
+            return self._ack("pwm", ch, True, None)
+        except Exception as e:
+            self.errors += 1
+            self.last_error = repr(e)[:ERR_CHARS]
+            return self._ack("pwm", ch, False, "error")
+
+    def chatter_cmd(self, op, gap_ms=None, now=None):
+        """op "start" (zero every channel's counts and count), "stop" or
+        "report".  -> None, or why not."""
+        if now is None:
+            now = self.clock()
+        if op not in CHATTER_OPS:
+            return "bad chatter"
+        cw = self.chatter
+        if op == "start":
+            try:
+                import chatter as chatter_mod     # loaded only when a test starts
+                gap = chatter_mod.gap_setting(self.cfg, gap_ms)
+                if cw is None:
+                    cw = self.chatter = chatter_mod.Chatter(self.host.n, gap)
+            except MemoryError:
+                return "low memory"
+            except ValueError:
+                return "bad gap"
+            cw.start(now, gap)
+            return None
+        if cw is None:
+            return "no chatter test"
+        if op == "stop" and cw.on:
+            cw.stop(now)
+        return None
 
     def drive_map(self):
         """{ch: duty} for Ring.start, so a re-survey keeps a live drive."""
@@ -319,7 +424,7 @@ class Tuner:
         if ch is None or not 0 <= ch < h.n:
             return "bad channel"
         k = self.kind_of(ch)
-        if k not in ACTIVE_KINDS:
+        if k not in ACTIVE_KINDS and cmd != "pwm":
             return "not an active head (%s)" % k
         if h.tower.tower != "inactive":
             if not self.stuck.allows(now):
@@ -393,7 +498,10 @@ class Tuner:
         except Exception:
             hz = 0
         period = NS_PER_S // (hz if hz > 0 else LASER_HZ)
-        k = min(TUNE_ADC_PERIODS, TUNE_BURST_MAX_MS * NS_PER_MS // period)
+        k = min(max(TUNE_ADC_PERIODS, TUNE_ADC_SPAN_NS // period),
+                TUNE_BURST_MAX_MS * NS_PER_MS // period)
+        if k > 1 and k % TUNE_ADC_N == 0:
+            k -= 1                       # coprime with the reads: phases do not lock
         return max(1, k) * period
 
     def _mean_of_bursts(self, ch, duty, counts):
@@ -459,7 +567,8 @@ class Tuner:
         return {"ch": ch + 1, "thr": thr, "rb": rb, "drv": drv,
                 "ma": self.ma.get(ch), "ma_on": self.ma_on.get(ch),
                 # volts on the Orange/White wire; null: not fitted on this channel
-                "pt": pt[0] if pt else None, "pt_span": pt[1] if pt else None}
+                "pt": pt[0] if pt else None, "pt_span": pt[1] if pt else None,
+                "pwm_hz": self.pwm_hz()}
 
     def _ack(self, what, ch, ok, why, typ=TUNE_ACK_TYPE):
         body = {"t": typ, "cmd": what, "ok": bool(ok), "why": why}

@@ -95,7 +95,8 @@ def test_laser_and_tune_settings_defaults():
     s = tune.laser_settings(None)
     assert s == {"min_duty": tune.LASER_MIN_DUTY, "max_duty": tune.LASER_MAX_DUTY,
                  "step": tune.LASER_STEP, "fine_below": tune.LASER_FINE_BELOW,
-                 "fine_step": tune.LASER_FINE_STEP, "max_ma": tune.LASER_MAX_MA}
+                 "fine_step": tune.LASER_FINE_STEP, "max_ma": tune.LASER_MAX_MA,
+                 "pwm_hz": tune.LASER_HZ}
     s = tune.laser_settings({"laser": {"min_duty": 20000, "max_duty": 10000,
                                        "step": 0, "max_ma": -1}})
     assert s["min_duty"] == 10000 and s["max_duty"] == 20000
@@ -485,8 +486,11 @@ def test_burst_is_whole_pwm_periods_and_short():
     class P:
         pass
     p = P()
-    for hz, periods in ((1000, tune.TUNE_ADC_PERIODS), (20000, tune.TUNE_ADC_PERIODS),
-                        (500, 2), (100, 1)):
+    # a fast PWM: whole periods filling the 1 kHz span (4 ms), so the reads
+    # (paced by a 1/32768 s clock) still spread over the chop
+    span_periods = lambda hz: tune.TUNE_ADC_SPAN_NS // (tune.NS_PER_S // hz)
+    for hz, periods in ((1000, tune.TUNE_ADC_PERIODS), (20000, span_periods(20000)),
+                        (150000, span_periods(150000)), (500, 2), (100, 1)):
         p.frequency = hz
         assert t.burst_ns(p) == periods * (tune.NS_PER_S // hz), (hz, t.burst_ns(p))
     p.frequency = 1000

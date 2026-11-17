@@ -46,6 +46,9 @@ no threshold wire: threshold nudges are refused.
 | `{"cmd":"align","ch":N,"save":M,"label":"12"}` | save head N's live drive and threshold for channel M (1-8) in NVM with the head's label |
 | `{"cmd":"align","forget":M}` | forget channel M's saved values |
 | `{"cmd":"align","saved":true}` | report every channel's saved values (one report a tick) |
+| `{"cmd":"align","ch":N,"pwm_hz":H}` | every laser's PWM frequency to H Hz, live, RAM only (`laser.pwm_hz`; below) |
+| `{"cmd":"align","ch":N,"chatter":"start"}` (`"gap_ms":G` optional) | zero and start the chatter counter on every channel (below) |
+| `{"cmd":"align","ch":N,"chatter":"stop"}` / `"report"` | stop counting / not; either way head N's counts come back (ack, then a chatter report) |
 
 Channels are 1-based.  `farm_ws._receive` hands every text frame containing
 `"align"` to `Aligner.on_message(client_id, text)`, which only queues it
@@ -153,11 +156,19 @@ bells' NoteOns are on `midi.usb.channel`, 1).
 |---|---|---|
 | 102 `CC_HEAD` | 7 | head (channel) 1-16; **starts** a report |
 | 103 `CC_FLAGS` | 7 | 1 comparator high now, 2 a low sample since the last report, 4 mA is an older reading, 8 tower quiet, 16 scope running on this head, 32 not quiet only because of stuck heads (stuck.py: thr / drive allowed), 64 comparator low = light on the PT (settings heads.pt_light "lowers", the default) |
-| 104 `CC_ACK_WHAT` | 7 | ack reports only: 1 thr, 2 drive, 3 scope, 4 bad, 5 thr_mid, 6 sweep, 7 sweep_end, 8 use, 9 save, 10 forget, 11 saved |
-| 105 `CC_ACK_WHY` | 7 | ack reports only: 0 ok; 1 not an active head, 2 tower not quiet, 3 survey running, 4 old head has no threshold, 5 too fast, 6 at limit, 7 laser is off, 8 laser current over max_ma, 9 busy, 10 timeout, 11 head gone, 12 low memory, 13 bad command, 14 no light on the PT, 15 stopped, 16 no PT wire, 17 sweep running, 18 not saved, 19 bad label, 20 near threshold, 127 other |
+| 104 `CC_ACK_WHAT` | 7 | ack reports only: 1 thr, 2 drive, 3 scope, 4 bad, 5 thr_mid, 6 sweep, 7 sweep_end, 8 use, 9 save, 10 forget, 11 saved, 12 pwm, 13 chatter |
+| 105 `CC_ACK_WHY` | 7 | ack reports only: 0 ok; 1 not an active head, 2 tower not quiet, 3 survey running, 4 old head has no threshold, 5 too fast, 6 at limit, 7 laser is off, 8 laser current over max_ma, 9 busy, 10 timeout, 11 head gone, 12 low memory, 13 bad command, 14 no light on the PT, 15 stopped, 16 no PT wire, 17 sweep running, 18 not saved, 19 bad label, 20 near threshold, 21 pwm out of range, 22 pwm not changed, 23 no chatter test, 127 other |
 | 107 `CC_SWEEP` | 7 | sweep point reports only: the point's index (0 = max drive) |
 | 108 `CC_SLOT` | 7 | saved-values reports only: 1 saved, 0 empty (CC_HEAD is the channel) |
 | 109-116 `CC_LABEL` | 7 each | saved-values reports only: the head's label, one ASCII character per CC, 0 = none |
+| 117 `CC_CHATTER` | 7 | chatter reports only: 1 still counting, 0 stopped |
+| 14 / 46 `CC_PWM` | 14 | every ack: the lasers' PWM frequency, 10 Hz units (`PWM_HZ_UNITS`) |
+| 26 / 58 `CC_CH_TRANS` | 14 | chatter: transitions (bursts that changed the level) |
+| 27 / 59 `CC_CH_CLEAN` | 14 | chatter: transitions with exactly one edge |
+| 28 / 60 `CC_CH_MAX` | 14 | chatter: most edges in one transition |
+| 29 / 61 `CC_CH_MEAN10` | 14 | chatter: mean edges per transition x10 (16383: no transition) |
+| 30 / 62 `CC_CH_BURST` | 14 | chatter: longest transition burst, ms (first to last edge) |
+| 31 / 63 `CC_CH_SPUR` | 14 | chatter: spurious edges (bursts that left the level as it was) |
 | 20 / 52 `CC_THR` | 14 | threshold target duty, scaled 0..16382 (`duty = v * 65535 / 16382`) |
 | 21 / 53 `CC_RB` | 14 | GP28 threshold readback, same scale |
 | 22 / 54 `CC_DRV` | 14 | laser drive duty, same scale |
@@ -175,7 +186,9 @@ RP2350 ADC is 12-bit, so 14 bits lose nothing.
 Frame reports: at most every 500 ms (`SERIAL_FRAME_MS`) while the tower is
 quiet (15 messages: head, flags, 6 pairs, seq); every 1000 ms while strokes
 are in progress, and then only head, flags, PT, spread and seq (7
-messages).  Ack reports: one per command (not per keep-alive).
+messages).  Ack reports: one per command (not per keep-alive), 11
+messages.  Chatter reports: 15 messages (head, CC_CHATTER, 6 pairs, seq).
+All the new numbers are in MIDI's undefined ranges (14, 20-31, 102-119).
 
 **Never in the way of a stroke:** reports are only sent while a host keeps
 the scope alive (`KEEPALIVE_MS` 10 s; the page sends one every 2 s) and
@@ -240,3 +253,48 @@ nothing else uses the NVM (`tests/test_lineup.py`).
   the LM393 output low (held).  `"raises"` the other way.  The sweep's
   light check, its near-threshold guard, and the page's colours and
   suggestion follow it; the stroke path does not (a stroke is a held edge).
+
+## Laser PWM speed and the chatter test (`tune.py`, `src/chatter.py`)
+
+The open question: does a laser drive below 100 % (the laser chopped by its
+PWM, full current on each pulse) give comparator chatter at the edges or in
+the steady states?  The 100 nF caps on the inputs may already filter it.
+Proven only by counting, on the bench, with sandtest turning a vane through
+the beam (Sandbells sandheads page, "Chatter test").
+
+- **`laser.pwm_hz`** (default: `pins.laser_pwm_hz`, else 1000 = today).
+  Live over `{"cmd":"align","ch":N,"pwm_hz":H}`, RAM only, for ALL lasers:
+  the lasers sit in pairs on RP2350 PWM slices (GP8/9 .. GP14/15) and a
+  slice has one frequency.  CircuitPython 10.0.3 refuses
+  `variable_frequency` on a slice already in use, and `.frequency` is
+  read-only without it, so `Concentrator.set_laser_hz` re-creates every
+  laser PWMOut at the new frequency with its duty (the lasers are dark for
+  about a millisecond).  Keypad edges stamped in the next
+  `LASER_REPWM_SETTLE_MS` (20) are skipped (`blanked`), then a net change of
+  level in that window goes through as an edge; nothing waits, MIDI is never
+  held.  Same refusals as a drive change (tower quiet, or awake only
+  because of stuck heads; no survey; `too fast`), and never during a sweep.
+- **Limits** (`tune.py`): `LASER_PWM_HZ_MIN` 200 Hz (one whole period inside
+  the 5 ms laser-mA burst cap), `LASER_PWM_HZ_MAX` 150 kHz (CircuitPython rp2
+  above clk/65536 ~ 2.3 kHz sets TOP = clk/f - 1, so the duty has clk/f
+  levels; 150 MHz / 150 kHz = 1000 levels, 0.1 %, finer than the 0.5 % fine
+  nudge).  Below ~2.3 kHz the divider keeps 16-bit duty; the divider has
+  1/16 steps, so 1000 Hz asked is about 990 Hz actual (CircuitPython's
+  `frequency` reports the actual figure; the page shows it).  20 kHz: 7500
+  levels.  The laser-mA burst covers whole PWM periods over 4 ms at any
+  speed (`TUNE_ADC_SPAN_NS`).
+- **Chatter counter** (`chatter.py`, loaded on the first start): fed the
+  same keypad edges as the stroke path (both directions, their own stamps).
+  Edges on a channel closer than `tune.chatter_gap_ms` (default 20, 1..250)
+  are one burst.  Odd edges = a transition (1 = clean); even = spurious
+  edges in a steady state (the level ended as it began).  Per channel:
+  transitions, clean, max edges, mean x10, longest transition burst (ms),
+  spurious edges.  Counters in preallocated lists; no allocation per edge.
+  `start` zeroes every channel; `stop` closes any open burst; `report`
+  counts finished bursts only.  RAM only.
+- **What it cannot see:** keypad scans every `inputs.scan_interval_ms`
+  (1 ms), so a glitch shorter than a scan is missed and a chop faster than
+  the scan is aliased into fewer, slower edges.  The counts are what the
+  stroke path sees, which is what matters for strokes, not what a scope on
+  the LM393 output would show.  Stamps are 1 ms.
+

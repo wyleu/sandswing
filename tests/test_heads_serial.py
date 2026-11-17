@@ -512,5 +512,82 @@ def test_usb_midi_out_keeps_its_raw_port_for_the_cc_reports():
     assert got is not None and got.port == "P" and said
     assert CC.open_cc([], log=said.append) is None
 
+def raw_reports(data):
+    """CC bytes -> [{cc: 7-bit value}] (raw, no pairing)."""
+    out, cur = [], None
+    for i in range(0, len(data), 3):
+        cc, v = data[i + 1], data[i + 2]
+        if cc == CC.CC_HEAD:
+            cur = {}
+        cur[cc] = v
+        if cc == CC.CC_SEQ:
+            out.append(cur)
+    return out
+
+
+def v14(r, cc):
+    return (r[cc] << 7) | r[cc + CC.CC_LSB]
+
+
+@case
+def test_cc_chatter_start_edges_stop_report():
+    h, al, st, port, clock = make(cc=True)
+    say(st, al, port, clock, ch=1, chatter="report")
+    a = last_ack(h)
+    assert a[CC.CC_ACK_WHAT] == CC.WHAT["chatter"] and a[CC.CC_ACK_WHY] == 23   # no test yet
+    say(st, al, port, clock, ch=1, chatter="start", gap_ms=10)
+    a = last_ack(h)
+    assert a[CC.CC_ACK_WHAT] == CC.WHAT["chatter"] and a[CC.CC_ACK_WHY] == 0
+    cw = h.tune.chatter
+    assert cw.on and cw.gap_ms == 10
+    # ch1: a clean transition, then one with 3 edges over 4 ms, then a glitch pair
+    for t in (2000, 3000, 3002, 3004, 4000, 4001):
+        cw.edge(0, t)
+    clock.t = 5000
+    n = len(h.midi.writes)
+    say(st, al, port, clock, ch=1, chatter="stop")
+    reps = [r for w in h.midi.writes[n:] for r in raw_reports(w)]
+    assert len(reps) == 2 and CC.CC_ACK_WHAT in reps[0], reps
+    r = reps[1]
+    assert r[CC.CC_HEAD] == 1 and r[CC.CC_CHATTER] == 0 and not cw.on
+    got = [v14(r, c) for c in CC.CHATTER_CCS]
+    assert got == [2, 1, 3, 20, 4, 2], got
+    assert len(h.midi.writes[-1]) <= 3 * CC.MAX_MSGS and len(r) == 15
+
+
+@case
+def test_cc_pwm_ack_carries_the_frequency_and_refusals_are_coded():
+    h, al, st, port, clock = make(cc=True)
+    asked = []
+
+    def set_laser_hz(hz):
+        asked.append(hz)
+        for b in h.bells:
+            b.laser.frequency = hz
+        return None
+    h.set_laser_hz = set_laser_hz
+    say(st, al, port, clock, ch=1, pwm_hz=20000)
+    a = raw_reports(h.midi.writes[-1])[-1]
+    assert a[CC.CC_ACK_WHAT] == CC.WHAT["pwm"] and a[CC.CC_ACK_WHY] == 0, a
+    assert v14(a, CC.CC_PWM) == 2000 and asked == [20000]          # 10 Hz units
+    clock.t += 1000
+    say(st, al, port, clock, ch=1, pwm_hz=100)
+    a = raw_reports(h.midi.writes[-1])[-1]
+    assert a[CC.CC_ACK_WHY] == 21 and asked == [20000]
+    h.tower.tower = "active"
+    say(st, al, port, clock, ch=1, pwm_hz=1000)
+    a = raw_reports(h.midi.writes[-1])[-1]
+    assert a[CC.CC_ACK_WHY] == 2 and asked == [20000]               # tower not quiet
+    h.tower.tower = "inactive"
+    h.tune.sweep_ch = 0
+    clock.t += 1000
+    say(st, al, port, clock, ch=1, pwm_hz=1000)
+    assert raw_reports(h.midi.writes[-1])[-1][CC.CC_ACK_WHY] == 17   # sweep running
+    h.tune.sweep_ch = None
+    del h.set_laser_hz
+    clock.t += 1000
+    say(st, al, port, clock, ch=1, pwm_hz=1000)
+    assert raw_reports(h.midi.writes[-1])[-1][CC.CC_ACK_WHY] == 22   # not changed
+
 
 finish()

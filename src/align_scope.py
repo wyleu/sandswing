@@ -66,10 +66,12 @@ SERIAL_FRAME_BUSY_MS = 1000     # ... while the tower is not quiet
 
 ACTIVE_KINDS = ("head_new", "head_old")     # = tune.ACTIVE_KINDS, the page's ACTIVE
 _KEYS = ("cmd", "ch", "scope", "thr", "drive", "info", "thr_mid",
-         "sweep", "use", "save", "label", "forget", "saved")
+         "sweep", "use", "save", "label", "forget", "saved", "pwm_hz", "chatter", "gap_ms")
+CHATTER_OPS = ("start", "stop", "report")      # = tune.CHATTER_OPS
 SWEEP_TICK_S = 0.05             # = sweep.SWEEP_TICK_S (sweep.py loads on the first sweep)
 T_SWEEP = "align_sweep"         # a sweep point (the /ws path; USB: heads_cc point)
 T_SLOT = "align_slot"           # one channel's saved line-up values (head_store)
+T_CHATTER = "align_chatter"     # one channel's chatter counts (the /ws path; USB: heads_cc)
 # page key -> (tune.Tuner command, field)
 _TUNE = {"thr": ("tune", "thr_step"), "drive": ("drive", "drive_step")}
 
@@ -159,6 +161,8 @@ def parse_command(text, n_channels):
         return "info", None, True
     if "label" in d and "save" not in d:
         raise ValueError("label without save")
+    if "gap_ms" in d and d.get("chatter") != "start":
+        raise ValueError("bad gap")
     if d.get("saved") is True:
         return "saved", None, True
     if "forget" in d:
@@ -174,6 +178,19 @@ def parse_command(text, n_channels):
         if not isinstance(d["sweep"], bool):
             raise ValueError("bad sweep")
         return "sweep", ch - 1, d["sweep"]
+    if "pwm_hz" in d:
+        v = d["pwm_hz"]
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError("bad pwm")
+        return "pwm", ch - 1, v
+    if "chatter" in d:
+        op = d["chatter"]
+        if op not in CHATTER_OPS:
+            raise ValueError("bad chatter")
+        g = d.get("gap_ms")
+        if g is not None and (isinstance(g, bool) or not isinstance(g, int)):
+            raise ValueError("bad gap")
+        return "chatter", ch - 1, (op, g)
     if "use" in d:
         u = d["use"]
         if (not isinstance(u, list) or len(u) != 2 or not _duty_ok(u[0])
@@ -390,6 +407,11 @@ class Aligner:
             self._lineup(cid, kind, ch, val, now)
         elif kind == "scope":
             self._scope(cid, ch, val, now)
+        elif kind == "pwm":
+            a = self.host.tune.set_pwm(ch, val, now)
+            self._ack(cid, "pwm", ch, a.get("ok"), a.get("why"))
+        elif kind == "chatter":
+            self._chatter(cid, ch, val[0], val[1], now)
         else:
             self._nudge(cid, kind, ch, val, now)
 
@@ -538,6 +560,31 @@ class Aligner:
         self.send_to(cid, self._env(T_SWEEP, {"ch": ch + 1, "i": i, "drv": drv, "ma": ma,
                                               "pt": pt, "pt_span": span}))
 
+    # ---- the chatter test (chatter.py) ----------------------------------------
+    def _chatter(self, cid, ch, op, gap, now):
+        t = self.host.tune
+        why = t.chatter_cmd(op, gap, now)
+        self._ack(cid, "chatter", ch, why is None, why)
+        if why is None and op != "start":
+            self._chatter_report(cid, ch, now)
+
+    def _chatter_report(self, cid, ch, now):
+        cw = self.host.tune.chatter
+        s = cw.summary(ch, now)
+        if cid == SERIAL_CID and self.cc is not None:
+            self.cc.chatter(ch + 1, cw.on, s)
+            return
+        self.send_to(cid, self._env(T_CHATTER, {
+            "ch": ch + 1, "on": cw.on, "trans": s[0], "clean": s[1], "max_edges": s[2],
+            "mean_x10": s[3], "max_burst_ms": s[4], "spurious": s[5],
+            "gap_ms": cw.gap_ms, "pwm_hz": self._pwm()}))
+
+    def _pwm(self):
+        try:
+            return self.host.tune.pwm_hz()
+        except Exception:
+            return None
+
     def _slot_out(self, slot):
         st = self.store
         rec = st.slots[slot] if st is not None else None
@@ -588,11 +635,12 @@ class Aligner:
             thr, drv = self._values(ch)
         if cid == SERIAL_CID and self.cc is not None:
             self.cc.ack(None if ch is None else ch + 1, what, None if ok else (why or "bad"),
-                        thr, drv, self._cc_flags(ch))
+                        thr, drv, self._cc_flags(ch), self._pwm())
             return
         self.send_to(cid, self._env(T_ACK, {
             "what": what, "ch": None if ch is None else ch + 1, "ok": bool(ok),
-            "why": why, "thr": thr, "drv": drv, "tower": self.host.tower.tower,
+            "why": why, "thr": thr, "drv": drv, "pwm_hz": self._pwm(),
+            "tower": self.host.tower.tower,
             "stuck": self._stuck(), "lit_low": self._lit_low()}))
 
     def _info(self, cid):
