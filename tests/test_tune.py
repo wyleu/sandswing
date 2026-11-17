@@ -94,7 +94,8 @@ def test_parse_commands():
 def test_laser_and_tune_settings_defaults():
     s = tune.laser_settings(None)
     assert s == {"min_duty": tune.LASER_MIN_DUTY, "max_duty": tune.LASER_MAX_DUTY,
-                 "step": tune.LASER_STEP, "max_ma": tune.LASER_MAX_MA}
+                 "step": tune.LASER_STEP, "fine_below": tune.LASER_FINE_BELOW,
+                 "fine_step": tune.LASER_FINE_STEP, "max_ma": tune.LASER_MAX_MA}
     s = tune.laser_settings({"laser": {"min_duty": 20000, "max_duty": 10000,
                                        "step": 0, "max_ma": -1}})
     assert s["min_duty"] == 10000 and s["max_duty"] == 20000
@@ -104,9 +105,10 @@ def test_laser_and_tune_settings_defaults():
     assert ts["min_gap_ms"] == tune.TUNE_MIN_GAP_MS
     import json
     ex = json.load(open(os.path.join(ROOT, "settings_example.json")))
-    assert ex["laser"] == config_loader.DEFAULTS["laser"]
-    assert ex["laser"] == {"min_duty": 16384, "max_duty": 65535,
-                           "step": 1311, "max_ma": 60.0}
+    assert ex["laser"] == config_loader.DEFAULTS["laser"] == {}   # defaults: tune.py only
+    assert ex["sweep"] == config_loader.DEFAULTS["sweep"] == {}
+    assert tune.laser_settings(ex) == tune.laser_settings(None)
+    assert tune.LASER_MIN_DUTY == tune.FULL * 2 // 100              # the 2 % floor
     assert ex["threshold"]["step"] == 655
     names = open(os.path.join(ROOT, "tools", "files.txt")).read().split()
     assert "tune.py" in names

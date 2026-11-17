@@ -41,6 +41,11 @@ no threshold wire: threshold nudges are refused.
 | `{"cmd":"align","ch":N,"thr":1}` / `-1` | threshold target one settings step (`threshold.step`) |
 | `{"cmd":"align","ch":N,"drive":1}` / `-1` | laser duty one settings step (`laser.step`) |
 | `{"cmd":"align","ch":N,"thr_mid":true}` | threshold target to the middle of `threshold.min_duty`..`max_duty` (32768 with the defaults; a new head is also seeded at `threshold.default_duty`, 32768) |
+| `{"cmd":"align","ch":N,"sweep":true}` / `false` | start / stop the drive sweep (line-up, below); only the channel with the PT wire |
+| `{"cmd":"align","ch":N,"use":[drive,thr]}` | "Use this": absolute drive and threshold duty (thr `null`: drive only), RAM only, one refusal check |
+| `{"cmd":"align","ch":N,"save":M,"label":"12"}` | save head N's live drive and threshold for channel M (1-8) in NVM with the head's label |
+| `{"cmd":"align","forget":M}` | forget channel M's saved values |
+| `{"cmd":"align","saved":true}` | report every channel's saved values (one report a tick) |
 
 Channels are 1-based.  `farm_ws._receive` hands every text frame containing
 `"align"` to `Aligner.on_message(client_id, text)`, which only queues it
@@ -148,8 +153,11 @@ bells' NoteOns are on `midi.usb.channel`, 1).
 |---|---|---|
 | 102 `CC_HEAD` | 7 | head (channel) 1-16; **starts** a report |
 | 103 `CC_FLAGS` | 7 | 1 beam clear now, 2 a low sample since the last report, 4 mA is an older reading, 8 tower quiet, 16 scope running on this head |
-| 104 `CC_ACK_WHAT` | 7 | ack reports only: 1 thr, 2 drive, 3 scope, 4 bad, 5 thr_mid |
-| 105 `CC_ACK_WHY` | 7 | ack reports only: 0 ok; 1 not an active head, 2 tower not quiet, 3 survey running, 4 old head has no threshold, 5 too fast, 6 at limit, 7 laser is off, 8 laser current over max_ma, 9 busy, 10 timeout, 11 head gone, 12 low memory, 13 bad command, 127 other |
+| 104 `CC_ACK_WHAT` | 7 | ack reports only: 1 thr, 2 drive, 3 scope, 4 bad, 5 thr_mid, 6 sweep, 7 sweep_end, 8 use, 9 save, 10 forget, 11 saved |
+| 105 `CC_ACK_WHY` | 7 | ack reports only: 0 ok; 1 not an active head, 2 tower not quiet, 3 survey running, 4 old head has no threshold, 5 too fast, 6 at limit, 7 laser is off, 8 laser current over max_ma, 9 busy, 10 timeout, 11 head gone, 12 low memory, 13 bad command, 14 beam broken, 15 stopped, 16 no PT wire, 17 sweep running, 18 not saved, 19 bad label, 20 near threshold, 127 other |
+| 107 `CC_SWEEP` | 7 | sweep point reports only: the point's index (0 = max drive) |
+| 108 `CC_SLOT` | 7 | saved-values reports only: 1 saved, 0 empty (CC_HEAD is the channel) |
+| 109-116 `CC_LABEL` | 7 each | saved-values reports only: the head's label, one ASCII character per CC, 0 = none |
 | 20 / 52 `CC_THR` | 14 | threshold target duty, scaled 0..16382 (`duty = v * 65535 / 16382`) |
 | 21 / 53 `CC_RB` | 14 | GP28 threshold readback, same scale |
 | 22 / 54 `CC_DRV` | 14 | laser drive duty, same scale |
@@ -180,3 +188,40 @@ A report is skipped (counted) while `supervisor.runtime.usb_connected` is
 False, and one the TX FIFO only partly takes is counted `short` (whole
 messages only; the host drops a report without its SEQ).
 Without a USB MIDI out the reports fall back to JSON lines on the data port.
+
+## Line-up: the drive sweep and saved values (`src/sweep.py`, `src/head_store.py`)
+
+A new head goes in channel 1 (the Orange/White PT wire on GP27).  The page's
+"Find best brightness" sends `sweep:true`: the drive steps from
+`laser.max_duty` down to `laser.min_duty` (2 % by default) in `sweep.points`
+geometric steps (finer near the floor); at each it waits `sweep.settle_ms`,
+then takes `TUNE_MA_BURSTS` GP26 bursts, one per `align_task` tick
+(`SWEEP_TICK_S`, 50 ms; each burst ~4 ms), and reports one point: index,
+drive, average mA, PT level and spread (CC: 12 messages; /ws:
+`type:"align_sweep"`).  The drive at the start is put back at the end, on
+`sweep:false`, and on any abort: tower not quiet (a stroke), survey, the beam
+broken on this head (the sense pass, `Aligner.edge`), head gone, a step
+raising, or `sweep.timeout_s`.  It finishes early ("near threshold", a
+normal end) when the PT comes within `sweep.guard_frac` of the threshold,
+so the descent does not break the beam (only when the first point shows the
+PT above the threshold).  Nudges on that head are refused while it runs.
+`sweep.py` is imported on the first sweep only.
+
+"Use this" (`use`) sets the drive and threshold the page suggests, RAM only.
+"Save for channel M" (`save`) writes head N's live drive and threshold with
+the label into NVM for channel M; `forget` clears one.  Both are refused
+unless the tower is quiet and no sweep runs: an NVM write is a flash erase +
+program and the chip stalls while it runs.  Nothing else writes the NVM
+store; it is never written from the stroke path.
+
+At boot a channel's saved drive replaces FULL (`Tuner.use_saved` ->
+`Ring.start`) and its saved threshold replaces `threshold.default_duty` in
+the survey's seed (`seed_kinds(saved=...)`); the survey still runs and still
+decides which channels are heads.
+
+NVM layout (`head_store.py`): offset `NVM_OFFSET` 0, `NVM_SIZE` 128 reserved,
+`NVM_USED_B` 110: magic `SH`, version 1, slot count 8; 8 records of flags
+(saved, has threshold), drive u16, threshold u16, label 8 ASCII bytes; then
+CRC-16/CCITT.  A wrong magic, version, count or CRC: every slot empty
+(ignored).  `watchdog_guard` keeps its reset note in the NVM's last 4 bytes;
+nothing else uses the NVM (`tests/test_lineup.py`).

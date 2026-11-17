@@ -129,13 +129,13 @@ DEFAULTS = {
         "max_duty": 65535,
         "step": 655,                  # ~1 %; live tune
     },
-    # live laser-duty limits (tune.py); nothing writes these back to the file
-    "laser": {
-        "min_duty": 16384,            # 25 %; below ~half duty current is on the floor
-        "max_duty": 65535,
-        "step": 1311,                 # ~2 %
-        "max_ma": 60.0,               # refuse a raise at or above this
-    },
+    # live laser-duty limits: min_duty, max_duty, step, fine_below, fine_step,
+    # max_ma.  Defaults in ONE place, tune.py (LASER_*; floor 2 %); a key
+    # set here in settings.json wins.  Nothing writes these back to the file.
+    "laser": {},
+    # the sandheads drive sweep (sweep.py SWEEP_*): points, settle_ms,
+    # timeout_s, guard_frac
+    "sweep": {},
     "ir": {},
     "detection": {},
     "hardware": {},

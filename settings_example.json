@@ -74,12 +74,8 @@
     "max_duty": 65535,
     "step": 655
   },
-  "laser": {
-    "min_duty": 16384,
-    "max_duty": 65535,
-    "step": 1311,
-    "max_ma": 60.0
-  },
+  "laser": {},
+  "sweep": {},
   "probe": {
     "present_delta": 2000,
     "lb_delta": 1000

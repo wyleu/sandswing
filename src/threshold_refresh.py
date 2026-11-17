@@ -165,17 +165,19 @@ class ThresholdRefresher:
         self.last.pop(index, None)
         self.readback.pop(index, None)
 
-    def seed_kinds(self, kinds, default=None):
+    def seed_kinds(self, kinds, default=None, saved=None):
         """After a survey: each new (LM393) head gets a target if it has
-        none yet; any other kind loses its target so we do not drive it.
+        none yet (saved[index], the line-up value in NVM, else default);
+        any other kind loses its target so we do not drive it.
         An already-set target on a still-new head is kept (live tune)."""
         if default is None:
             default = self.default_duty
         default = clamp_duty(default, self.min_duty, self.max_duty)
+        saved = saved or {}
         for b in self.bells:
             if kinds.get(b.index) in SEED_KINDS:
                 if b.index not in self.target:
-                    self.set_target(b, default)
+                    self.set_target(b, saved.get(b.index, default))
             elif b.index in self.target:
                 self.drop_target(b.index)
 

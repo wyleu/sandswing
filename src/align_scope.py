@@ -32,6 +32,7 @@ runs, and only every MEASURE_MS.
 import json
 import binascii
 import heads_cc
+import head_store
 from array import array
 
 SCHEMA = "sand.panel/v1"        # ingest ignores it; frames go to one client anyway
@@ -64,7 +65,11 @@ SERIAL_FRAME_MS = 500           # one frame this often to the USB host
 SERIAL_FRAME_BUSY_MS = 1000     # ... while the tower is not quiet
 
 ACTIVE_KINDS = ("head_new", "head_old")     # = tune.ACTIVE_KINDS, the page's ACTIVE
-_KEYS = ("cmd", "ch", "scope", "thr", "drive", "info", "thr_mid")
+_KEYS = ("cmd", "ch", "scope", "thr", "drive", "info", "thr_mid",
+         "sweep", "use", "save", "label", "forget", "saved")
+SWEEP_TICK_S = 0.05             # = sweep.SWEEP_TICK_S (sweep.py loads on the first sweep)
+T_SWEEP = "align_sweep"         # a sweep point (the /ws path; USB: heads_cc point)
+T_SLOT = "align_slot"           # one channel's saved line-up values (head_store)
 # page key -> (tune.Tuner command, field)
 _TUNE = {"thr": ("tune", "thr_step"), "drive": ("drive", "drive_step")}
 
@@ -152,6 +157,12 @@ def parse_command(text, n_channels):
             raise ValueError("unknown key")
     if d.get("info"):
         return "info", None, True
+    if "label" in d and "save" not in d:
+        raise ValueError("label without save")
+    if d.get("saved") is True:
+        return "saved", None, True
+    if "forget" in d:
+        return "forget", None, _slot(d["forget"])
     ch = d.get("ch")
     if isinstance(ch, bool) or not isinstance(ch, int) or not 1 <= ch <= n_channels:
         raise ValueError("bad channel")
@@ -159,6 +170,18 @@ def parse_command(text, n_channels):
         return "scope", ch - 1, bool(d["scope"])
     if d.get("thr_mid") is True:
         return "thr_mid", ch - 1, True
+    if "sweep" in d:
+        if not isinstance(d["sweep"], bool):
+            raise ValueError("bad sweep")
+        return "sweep", ch - 1, d["sweep"]
+    if "use" in d:
+        u = d["use"]
+        if (not isinstance(u, list) or len(u) != 2 or not _duty_ok(u[0])
+                or not (u[1] is None or _duty_ok(u[1]))):
+            raise ValueError("bad use")
+        return "use", ch - 1, (u[0], u[1])
+    if "save" in d:
+        return "save", ch - 1, (_slot(d["save"]), head_store.check_label(d.get("label")))
     for key in ("thr", "drive"):
         if key in d:
             v = d[key]
@@ -166,6 +189,16 @@ def parse_command(text, n_channels):
                 raise ValueError("bad step")
             return key, ch - 1, 1 if v > 0 else -1
     raise ValueError("nothing to do")
+
+
+def _duty_ok(v):
+    return not isinstance(v, bool) and isinstance(v, int) and 0 <= v <= heads_cc.DUTY_FULL
+
+
+def _slot(v):
+    if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= head_store.SLOTS:
+        raise ValueError("bad channel")
+    return v - 1
 
 
 class Aligner:
@@ -198,6 +231,12 @@ class Aligner:
         self.dropped = 0
         self.frames = 0
         self.dead = False
+        self.sweep = None           # sweep.Sweep while one runs
+        self.sweep_cid = None
+        self.sweep_ch = None
+        self.store = getattr(host, "head_store", None)   # head_store.HeadStore (NVM)
+        self.slots_out = []         # saved-values reports still to send, one a tick
+        self.slots_cid = None
         src, dev, boot = ident
         self._body = {}
         self._doc = {"schema": SCHEMA, "type": T_FRAME, "src": src, "id": dev,
@@ -219,8 +258,12 @@ class Aligner:
 
     # ---- called from the sense pass: no allocation -------------------------
     def edge(self, i, held):
-        if held and i == self.ch:
-            self._low = True
+        if held:
+            if i == self.ch:
+                self._low = True
+            sw = self.sweep
+            if sw is not None and i == sw.ch:
+                sw.low = True
 
     def sample(self):
         ch = self.ch
@@ -243,6 +286,8 @@ class Aligner:
         return FRAME_MS if quiet else FRAME_BUSY_MS
 
     def period_s(self):
+        if not self.dead and (self.sweep is not None or self.slots_out):
+            return SWEEP_TICK_S
         if self.ch is None or self.dead:
             return IDLE_S
         return self._frame_ms() / 1000
@@ -255,6 +300,10 @@ class Aligner:
             while self.pending:
                 cid, text = self.pending.pop(0)
                 self._command(cid, text, now)
+            if self.sweep is not None:
+                self._sweep_step(now)
+            if self.slots_out:
+                self._slot_out(self.slots_out.pop(0))
             if self.ch is None:
                 return
             why = self._stop_why(now)
@@ -270,6 +319,13 @@ class Aligner:
     # ---- inside ---------------------------------------------------------------
     def _error(self):
         self.errors += 1
+        sw = self.sweep
+        if sw is not None:
+            self.sweep = None
+            try:
+                sw.stop("error")    # the drive goes back whatever went wrong
+            except Exception:
+                pass
         if self.errors >= MAX_ERRORS and not self.dead:
             self.dead = True
             self.ch = None
@@ -312,6 +368,8 @@ class Aligner:
             return
         if kind == "info":
             self._info(cid)
+        elif kind in ("sweep", "use", "save", "forget", "saved"):
+            self._lineup(cid, kind, ch, val, now)
         elif kind == "scope":
             self._scope(cid, ch, val, now)
         else:
@@ -352,6 +410,128 @@ class Aligner:
             cmd, field = _TUNE[key]
             a = t.handle(cmd, ch, field, sign, now)
         self._ack(cid, key, ch, a.get("ok"), a.get("why"))
+
+    # ---- line-up: sweep, use, save / forget in NVM ---------------------------
+    def _busy_why(self):
+        if not self._quiet():
+            return "tower not quiet"
+        if self.sweep is not None:
+            return "sweep running"
+        return None
+
+    def _lineup(self, cid, kind, ch, val, now):
+        h = self.host
+        if kind == "sweep":
+            self._sweep_cmd(cid, ch, val, now)
+            return
+        if kind == "use":
+            a = h.tune.use_pair(ch, val[0], val[1], now)
+            self._ack(cid, "use", ch, a.get("ok"), a.get("why"))
+            return
+        if kind == "saved":
+            self.slots_cid = cid
+            self.slots_out = list(range(head_store.SLOTS))
+            self._ack(cid, "saved", None, True, None)
+            return
+        why = self._busy_why()
+        if why is None and self.store is None:
+            why = "not saved: no NVM"
+        if why is None and kind == "save":
+            if self.kind_of(ch) not in ACTIVE_KINDS:
+                why = "not an active head"
+            else:
+                slot, label = val
+                thr, drv = self._values(ch)
+                why = self.store.save(slot, drv, thr, label)
+        elif why is None:
+            slot = val
+            why = self.store.forget(slot)
+        if why is None:
+            self.slots_cid = cid
+            self.slots_out.append(slot)
+        self._ack(cid, kind, ch, why is None, why)
+
+    def _sweep_cmd(self, cid, ch, on, now):
+        h = self.host
+        sw = self.sweep
+        if not on:
+            if sw is not None and sw.ch == ch:
+                self.sweep = None
+                sw.stop("stopped")
+            self._ack(cid, "sweep", ch, True, None)
+            return
+        pt = getattr(h, "pt_level", None)
+        why = self._busy_why()
+        if why is None:
+            if self.kind_of(ch) not in ACTIVE_KINDS:
+                why = "not an active head"
+            elif pt is None or pt.ch != ch:
+                why = "no PT wire on this channel"
+            elif h.survey_state.phase != self._idle:
+                why = "survey running"
+            elif h._prev_held[ch]:
+                why = "beam broken"
+            elif self.mem_free is not None and self.mem_free() < MEM_MIN:
+                why = "low memory"
+        if why is None:
+            try:
+                d = int(h.bells[ch].laser.duty_cycle)
+            except Exception:
+                d = 0
+            if d <= 0:
+                why = "laser is off"
+        if why is not None:
+            self._ack(cid, "sweep", ch, False, why)
+            return
+        self.sweep_cid = cid
+        self.sweep_ch = ch
+        try:
+            import sweep as sweep_mod                # loaded only when a sweep is asked
+            sw = sweep_mod.Sweep(h, ch, now, self._sweep_report,
+                                 sweep_mod.sweep_settings(h.tune.cfg))
+        except Exception as e:
+            h.bells[ch].laser.duty_cycle = d         # as it was
+            h.tune.sweep_ch = None
+            self._ack(cid, "sweep", ch, False, "low memory" if isinstance(e, MemoryError)
+                      else "error")
+            return
+        self.sweep = sw
+        self._ack(cid, "sweep", ch, True, None)
+
+    def _sweep_step(self, now):
+        sw = self.sweep
+        if self.sweep_cid == SERIAL_CID and self.cc_alive is not None and not self.cc_alive():
+            self.sweep = None
+            sw.stop("stopped")                       # the host closed the data port
+            return
+        if not sw.step(now):
+            self.sweep = None
+
+    def _sweep_report(self, kind, *a):
+        ch = self.sweep_ch
+        cid = self.sweep_cid
+        if kind == "end":
+            self._ack(cid, "sweep_end", ch, a[0] is None, a[0])
+            return
+        i, drv, ma, pt, span = a
+        if cid == SERIAL_CID and self.cc is not None:
+            self.cc.point(ch + 1, self._cc_flags(ch), i, drv, ma, pt, span)
+            return
+        self.send_to(cid, self._env(T_SWEEP, {"ch": ch + 1, "i": i, "drv": drv, "ma": ma,
+                                              "pt": pt, "pt_span": span}))
+
+    def _slot_out(self, slot):
+        st = self.store
+        rec = st.slots[slot] if st is not None else None
+        cid = self.slots_cid
+        if cid == SERIAL_CID and self.cc is not None:
+            self.cc.slot(slot + 1, rec)
+            return
+        self.send_to(cid, self._env(T_SLOT, {
+            "ch": slot + 1, "saved": rec is not None,
+            "drv": rec[0] if rec else None, "thr": rec[1] if rec else None,
+            "label": rec[2] if rec else None,
+            "state": st.state if st is not None else "none"}))
 
     def _cc_flags(self, ch):
         h = self.host
@@ -414,7 +594,9 @@ class Aligner:
         ch = self.ch
         t = h.tune
         fresh = False
-        if self._quiet():
+        if self.sweep is not None and self.sweep.ch == ch:
+            fresh = True                             # the sweep measures this head
+        elif self._quiet():
             if self.last_measure is None or now - self.last_measure >= MEASURE_MS:
                 self.last_measure = now
                 fresh = t._measure(ch) is not False      # also reads the PT level

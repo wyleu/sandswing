@@ -32,12 +32,20 @@ from adc_avg import paced_avg
 from threshold_refresh import clamp_duty, threshold_settings, _int
 from ring import FULL
 
-# Laser drive defaults (settings "laser").  25 % floor: README, below about
-# half duty the sense current is still on the floor.  max_ma is the
-# laser_measure "over" / socket_classify fault limit.
-LASER_MIN_DUTY = 16384
+# Laser drive defaults (settings "laser"; the one place they are set).
+# The floor is low (2 %): the sandheads sweep (sweep.py) finds how little
+# drive a head needs, and 25 % was still bright.  Near the floor a nudge is
+# fine_step (below fine_below), else step.  max_ma is the laser_measure
+# "over" / socket_classify fault limit.
+PCT = 100
+LASER_MIN_PCT = 2
+LASER_MIN_DUTY = FULL * LASER_MIN_PCT // PCT      # 1310
 LASER_MAX_DUTY = FULL          # same as PWM_DUTY_MAX / ring.FULL
 LASER_STEP = 1311              # ~2 % of PWM_DUTY_MAX
+LASER_FINE_BELOW_PCT = 20
+LASER_FINE_BELOW = FULL * LASER_FINE_BELOW_PCT // PCT   # 13107: below, a nudge is fine
+LASER_FINE_PER_PCT = 2         # fine step = half a percent
+LASER_FINE_STEP = FULL // (PCT * LASER_FINE_PER_PCT)    # 327
 LASER_MAX_MA = 60.0
 
 ACTIVE_KINDS = ("head_new", "head_old")
@@ -98,7 +106,7 @@ def _float(v, default):
 def laser_settings(cfg):
     """Named laser-drive limits from settings (the state model).
     Missing or bad values become the defaults.  -> min_duty, max_duty,
-    step, max_ma."""
+    step, fine_below, fine_step, max_ma."""
     sec = cfg.get("laser") if cfg is not None and hasattr(cfg, "get") else None
     sec = sec if isinstance(sec, dict) else {}
     lo = _int(sec.get("min_duty"), LASER_MIN_DUTY)
@@ -108,10 +116,23 @@ def laser_settings(cfg):
     step = _int(sec.get("step"), LASER_STEP)
     if step < 1:
         step = LASER_STEP
+    fine_below = _int(sec.get("fine_below"), LASER_FINE_BELOW)
+    fine = _int(sec.get("fine_step"), LASER_FINE_STEP)
+    if fine < 1:
+        fine = LASER_FINE_STEP
     max_ma = _float(sec.get("max_ma"), LASER_MAX_MA)
     if max_ma <= 0:
         max_ma = LASER_MAX_MA
-    return {"min_duty": lo, "max_duty": hi, "step": step, "max_ma": max_ma}
+    return {"min_duty": lo, "max_duty": hi, "step": step, "fine_below": fine_below,
+            "fine_step": fine, "max_ma": max_ma}
+
+
+def drive_step(cur, sign, s):
+    """The next drive for a one-step nudge: fine_step below fine_below
+    (going down: once cur is at or below it), else step."""
+    if (cur < s["fine_below"]) if sign > 0 else (cur <= s["fine_below"]):
+        return cur + sign * s["fine_step"]
+    return cur + sign * s["step"]
 
 
 def tune_settings(cfg):
@@ -199,6 +220,7 @@ class Tuner:
         self.host = host
         self.now_ns = now_ns or _now_ns
         self.settings = tune_settings(cfg)
+        self.cfg = cfg           # sweep.sweep_settings reads it when a sweep starts
         self.clock = clock_ms or _now_ms
         self._idle = survey_idle
         self.overrides = {}      # ch -> laser duty (RAM; passed to Ring.start)
@@ -208,8 +230,41 @@ class Tuner:
         self._bursts = {}        # ch -> [duty, [burst means, newest last]]
         self.pt = {}             # ch -> (volts, spread) of the last PT level (pt_level.py)
         self.last_adj = {}       # ch -> clock_ms of last successful adjust
+        self.sweep_ch = None     # a sweep (sweep.py) owns this head's drive
+        self.saved_thr = {}      # ch -> threshold saved in NVM (head_store), for the seed
         self.errors = 0
         self.last_error = None
+
+    def use_saved(self, store):
+        """At boot: the NVM line-up values (head_store) replace the default
+        drive (FULL) and the seeded threshold, clamped to the limits."""
+        if store is None:
+            return
+        n = self.host.n
+        lim, th = self.settings["laser"], self.settings["threshold"]
+        for ch, d in store.drive_map(n).items():
+            self.overrides[ch] = clamp_duty(d, lim["min_duty"], lim["max_duty"])
+        for ch, d in store.thr_map(n).items():
+            self.saved_thr[ch] = clamp_duty(d, th["min_duty"], th["max_duty"])
+
+    def use_pair(self, ch, drive, thr, now=None):
+        """The page's "Use this": drive and (new heads) threshold in one
+        command, one refusal check, RAM only.  -> ack dict."""
+        try:
+            if now is None:
+                now = self.clock()
+            why = self._refuse("drive", ch, now)
+            if why is not None:
+                return self._ack("use", ch, False, why)
+            a = self._set_drive(ch, "drive", drive, now)
+            if a["ok"] and thr is not None and self.kind_of(ch) not in NO_THRESHOLD_KINDS:
+                a = self._set_thr(ch, "thr", thr, now)
+            a["cmd"] = "use"
+            return a
+        except Exception as e:
+            self.errors += 1
+            self.last_error = repr(e)[:ERR_CHARS]
+            return self._ack("use", ch, False, "error")
 
     def drive_map(self):
         """{ch: duty} for Ring.start, so a re-survey keeps a live drive."""
@@ -250,6 +305,8 @@ class Tuner:
             return "tower not quiet (%s): strokes in progress" % h.tower.tower
         if h.survey_state.phase != self._idle:
             return "survey running"
+        if self.sweep_ch == ch:
+            return "sweep running"
         if cmd == "tune" and k in NO_THRESHOLD_KINDS:
             return "old head has no threshold"
         last = self.last_adj.get(ch)
@@ -284,7 +341,7 @@ class Tuner:
         if cur <= 0:
             return self._ack("drive", ch, False, "laser is off")
         if field == "drive_step":
-            new = clamp_duty(cur + value * s["step"], s["min_duty"], s["max_duty"])
+            new = clamp_duty(drive_step(cur, value, s), s["min_duty"], s["max_duty"])
             if new == cur:
                 return self._ack("drive", ch, False, "at limit")
         else:

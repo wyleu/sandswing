@@ -27,6 +27,11 @@ CC_FLAGS = 103                 # FLAG_* bits
 CC_ACK_WHAT = 104              # WHAT_* (an ack report)
 CC_ACK_WHY = 105               # 0 ok, else WHY_* code
 CC_SEQ = 106                   # report count mod 128: the report ends
+CC_SWEEP = 107                 # a sweep point report: the point's index (0-based)
+CC_SLOT = 108                  # a saved-values report (head_store): 1 saved, 0 empty
+CC_LABEL = 109                 # .. CC_LABEL + LABEL_MAX - 1: the head's label, one
+                               # ASCII character each, 0 = none (109-116, all in
+                               # the undefined 102-119 range, below the mode CCs)
 # 14-bit controllers (MSB; LSB on +CC_LSB)
 CC_THR = 20                    # threshold target duty, scaled (duty14)
 CC_RB = 21                     # GP28 threshold readback, scaled (duty14)
@@ -47,15 +52,19 @@ FLAG_BROKE = 2                 # a low sample since the last report
 FLAG_BUSY = 4                  # mA is an older reading (tower not quiet / mux held)
 FLAG_QUIET = 8                 # tower quiet: adjustments allowed
 FLAG_SCOPE = 16                # the scope is running on this head
-WHAT = {"thr": 1, "drive": 2, "scope": 3, "bad": 4, "thr_mid": 5}
+WHAT = {"thr": 1, "drive": 2, "scope": 3, "bad": 4, "thr_mid": 5, "sweep": 6,
+        "sweep_end": 7, "use": 8, "save": 9, "forget": 10, "saved": 11}
 # refusal text (tune.Tuner / align_scope) -> code, by prefix; 127: anything else
-WHY = (("not an active head", 1), ("tower not quiet", 2), ("survey running", 3),
+WHY = (("bad label", 19), ("not an active head", 1), ("tower not quiet", 2), ("survey running", 3),
        ("old head has no threshold", 4), ("too fast", 5), ("at limit", 6),
        ("laser is off", 7), ("laser current over", 8), ("busy", 9), ("timeout", 10),
        ("head gone", 11), ("low memory", 12), ("bad", 13), ("unknown key", 13),
-       ("nothing to do", 13), ("not an align command", 13), ("too long", 13))
+       ("nothing to do", 13), ("not an align command", 13), ("too long", 13),
+       ("beam broken", 14), ("stopped", 15), ("no PT wire", 16), ("sweep running", 17),
+       ("not saved", 18), ("near threshold", 20))
 WHY_OTHER = 127
-MAX_MSGS = 16                  # CCs in one report (a full one is 15)
+MAX_MSGS = 16                  # CCs in one report (a full one, and a slot one, is 15)
+LABEL_MAX = 8                  # = head_store.LABEL_MAX (test_head_store checks)
 
 
 def why_code(why):
@@ -156,6 +165,33 @@ class CcOut:
         self._cc(CC_ACK_WHY, why_code(why))
         self._cc14(CC_THR, duty14(thr))
         self._cc14(CC_DRV, duty14(drv))
+        self._send()
+
+
+    def point(self, ch, flags, i, drv, ma, pt, span):
+        """One sweep point (12 CCs): head, flags, index, drive, average mA,
+        PT level and spread."""
+        self.n = 0
+        self._cc(CC_HEAD, ch)
+        self._cc(CC_FLAGS, flags)
+        self._cc(CC_SWEEP, i)
+        self._cc14(CC_DRV, duty14(drv))
+        self._cc14(CC_MA, ma14(ma))
+        self._cc14(CC_PT, mv14(pt))
+        self._cc14(CC_PT_SPAN, mv14(span))
+        self._send()
+
+    def slot(self, ch, rec):
+        """One channel's saved line-up values (15 CCs): rec None (empty) or
+        (drive, thr or None, label)."""
+        self.n = 0
+        self._cc(CC_HEAD, ch)
+        self._cc(CC_SLOT, 0 if rec is None else 1)
+        self._cc14(CC_DRV, None if rec is None else duty14(rec[0]))
+        self._cc14(CC_THR, None if rec is None else duty14(rec[1]))
+        lab = "" if rec is None else rec[2]
+        for j in range(LABEL_MAX):
+            self._cc(CC_LABEL + j, ord(lab[j]) if j < len(lab) else 0)
         self._send()
 
 

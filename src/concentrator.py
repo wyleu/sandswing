@@ -98,6 +98,7 @@ from tune import Tuner, open_serial_tune
 from pt_level import open_pt_level, brief as pt_brief
 from align_scope import Aligner, SERIAL_CID
 from heads_cc import open_cc
+from head_store import open_store
 import panel
 
 from board_pins import release
@@ -382,6 +383,10 @@ class Concentrator:
             log=emit)
         # live threshold / laser-duty commands on the same data port (RAM only)
         self.tune = Tuner(self, cfg, clock_ms=self.ticks.now)
+        # line-up values saved per channel in NVM (head_store.py): read once
+        # here, written only by the sandheads page's explicit save / forget
+        self.head_store = open_store(log=emit)
+        self.tune.use_saved(self.head_store)
         port = self.serial_status.port if self.serial_status is not None else None
         if port is None:
             try:
@@ -644,7 +649,7 @@ class Concentrator:
         """
         now = time.monotonic()
         al = getattr(self, "align", None)        # the sandheads scope, when one runs
-        if al is not None and al.ch is None:
+        if al is not None and al.ch is None and al.sweep is None:
             al = None
         for _ in range(DRAIN_ROUNDS):
             edges = self.sense.drain()
@@ -964,8 +969,10 @@ class Concentrator:
             for i, kind in self.survey_state.kinds.items():
                 self.gate.set_kind(i, kind)   # else gate.enforce zeroes the heads
             # new (LM393) heads get a threshold target; old / empty / fault do not
+            # (a threshold saved in NVM for that channel replaces the default)
             self.refresher.seed_kinds(self.survey_state.kinds,
-                                      self.thr_settings["default_duty"])
+                                      self.thr_settings["default_duty"],
+                                      saved=self.tune.saved_thr)
             # write the new targets now, before Ring learns rest
             self.refresher.apply_once()
             # head[] now, not at the next panel pass: _watch_empty reads it
